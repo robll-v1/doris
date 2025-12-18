@@ -330,7 +330,7 @@ Status ExchangeSinkOperatorX::prepare(RuntimeState* state) {
                     vectorized::VExpr::prepare(_tablet_sink_expr_ctxs, state, _child->row_desc()));
         } else {
             auto* output_tuple_desc = state->desc_tbl().get_tuple_descriptor(_output_tuple_id);
-            auto* output_row_desc = _pool->add(new RowDescriptor(output_tuple_desc, false));
+            auto* output_row_desc = _pool->add(new RowDescriptor(output_tuple_desc));
             RETURN_IF_ERROR(
                     vectorized::VExpr::prepare(_tablet_sink_expr_ctxs, state, *output_row_desc));
         }
@@ -350,11 +350,11 @@ void ExchangeSinkOperatorX::_init_sink_buffer() {
 }
 
 template <typename ChannelPtrType>
-void ExchangeSinkOperatorX::_handle_eof_channel(RuntimeState* state, ChannelPtrType channel,
-                                                Status st) {
+Status ExchangeSinkOperatorX::_handle_eof_channel(RuntimeState* state, ChannelPtrType channel,
+                                                  Status st) {
     channel->set_receiver_eof(st);
     // Chanel will not send RPC to the downstream when eof, so close chanel by OK status.
-    static_cast<void>(channel->close(state));
+    return channel->close(state);
 }
 
 Status ExchangeSinkOperatorX::sink(RuntimeState* state, vectorized::Block* block, bool eos) {
