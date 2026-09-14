@@ -38,6 +38,7 @@ namespace doris::io {
 using doris::Status;
 
 // Mock FileReader for testing PackedFileSystem
+namespace {
 class MockFileReader : public FileReader {
 public:
     explicit MockFileReader(std::string content) : _content(std::move(content)) {}
@@ -52,6 +53,8 @@ public:
     size_t size() const override { return _content.size(); }
 
     bool closed() const override { return _closed; }
+
+    int64_t mtime() const override { return 0; }
 
 protected:
     Status read_at_impl(size_t offset, Slice result, size_t* bytes_read,
@@ -72,6 +75,7 @@ private:
     std::string _content;
     bool _closed = false;
 };
+} // anonymous namespace
 
 // Mock FileWriter for testing PackedFileSystem
 class MockFileWriterForMerge : public FileWriter {
@@ -126,7 +130,6 @@ public:
     void set_file_size(int64_t size) { _file_size = size; }
 
     MockFileWriterForMerge* last_writer() const { return _last_writer; }
-    MockFileReader* last_reader() const { return _last_reader; }
 
 protected:
     Status create_file_impl(const Path& file, FileWriterPtr* writer,
@@ -147,7 +150,6 @@ protected:
         }
         // Create a mock reader with some content
         auto mock_reader = std::make_shared<MockFileReader>("mock_content");
-        _last_reader = mock_reader.get();
         *reader = std::move(mock_reader);
         return Status::OK();
     }
@@ -193,7 +195,6 @@ private:
     bool _exists_result = true;
     int64_t _file_size = 0;
     MockFileWriterForMerge* _last_writer = nullptr;
-    MockFileReader* _last_reader = nullptr;
 };
 
 // Test fixture for PackedFileSystem
@@ -230,6 +231,96 @@ TEST_F(PackedFileSystemTest, CreateFileWrapsWithPackedFileWriter) {
     Slice slice(data);
     st = writer->appendv(&slice, 1);
     EXPECT_TRUE(st.ok());
+}
+
+TEST_F(PackedFileSystemTest, FirstSegmentDataFileUsesPackedWriter) {
+    PackedFileSystem merge_fs(_inner_fs, _append_info);
+
+    Path file_path("rowset_1_0.dat");
+    FileWriterPtr writer;
+    ASSERT_TRUE(merge_fs.create_file(file_path, &writer, nullptr).ok());
+    ASSERT_NE(writer, nullptr);
+
+    std::string data = "test";
+    Slice slice(data);
+    ASSERT_TRUE(writer->appendv(&slice, 1).ok());
+
+    ASSERT_NE(_inner_fs->last_writer(), nullptr);
+    EXPECT_EQ(_inner_fs->last_writer()->bytes_appended(), 0);
+    EXPECT_TRUE(writer->is_in_packed_file());
+}
+
+TEST_F(PackedFileSystemTest, LaterSegmentDataFileUsesDirectWriter) {
+    PackedFileSystem merge_fs(_inner_fs, _append_info);
+
+    Path file_path("rowset_1_1.dat");
+    FileWriterPtr writer;
+    ASSERT_TRUE(merge_fs.create_file(file_path, &writer, nullptr).ok());
+    ASSERT_NE(writer, nullptr);
+
+    std::string data = "test";
+    Slice slice(data);
+    ASSERT_TRUE(writer->appendv(&slice, 1).ok());
+
+    ASSERT_NE(_inner_fs->last_writer(), nullptr);
+    EXPECT_EQ(_inner_fs->last_writer()->bytes_appended(), data.size());
+    EXPECT_FALSE(writer->is_in_packed_file());
+}
+
+TEST_F(PackedFileSystemTest, LaterSegmentIndexFileUsesDirectWriter) {
+    PackedFileSystem merge_fs(_inner_fs, _append_info);
+
+    Path file_path("rowset_1_2.idx");
+    FileWriterPtr writer;
+    ASSERT_TRUE(merge_fs.create_file(file_path, &writer, nullptr).ok());
+    ASSERT_NE(writer, nullptr);
+
+    std::string data = "idx";
+    Slice slice(data);
+    ASSERT_TRUE(writer->appendv(&slice, 1).ok());
+
+    ASSERT_NE(_inner_fs->last_writer(), nullptr);
+    EXPECT_EQ(_inner_fs->last_writer()->bytes_appended(), data.size());
+    EXPECT_FALSE(writer->is_in_packed_file());
+}
+
+TEST_F(PackedFileSystemTest, NonzeroFirstSegmentUsesPackedWriter) {
+    _append_info.first_segment_id = 10;
+    PackedFileSystem merge_fs(_inner_fs, _append_info);
+
+    Path first_segment_path("rowset_1_10.dat");
+    FileWriterPtr first_segment_writer;
+    ASSERT_TRUE(merge_fs.create_file(first_segment_path, &first_segment_writer, nullptr).ok());
+    ASSERT_NE(first_segment_writer, nullptr);
+
+    std::string data = "test";
+    Slice data_slice(data);
+    ASSERT_TRUE(first_segment_writer->appendv(&data_slice, 1).ok());
+    ASSERT_NE(_inner_fs->last_writer(), nullptr);
+    EXPECT_EQ(_inner_fs->last_writer()->bytes_appended(), 0);
+    EXPECT_TRUE(first_segment_writer->is_in_packed_file());
+
+    Path segment_zero_path("rowset_1_0.dat");
+    FileWriterPtr segment_zero_writer;
+    ASSERT_TRUE(merge_fs.create_file(segment_zero_path, &segment_zero_writer, nullptr).ok());
+    ASSERT_NE(segment_zero_writer, nullptr);
+    ASSERT_TRUE(segment_zero_writer->appendv(&data_slice, 1).ok());
+    ASSERT_NE(_inner_fs->last_writer(), nullptr);
+    EXPECT_EQ(_inner_fs->last_writer()->bytes_appended(), data.size());
+    EXPECT_FALSE(segment_zero_writer->is_in_packed_file());
+
+    Path first_segment_index_path("rowset_1_10.idx");
+    FileWriterPtr first_segment_index_writer;
+    ASSERT_TRUE(merge_fs.create_file(first_segment_index_path, &first_segment_index_writer, nullptr)
+                        .ok());
+    ASSERT_NE(first_segment_index_writer, nullptr);
+
+    std::string index = "idx";
+    Slice index_slice(index);
+    ASSERT_TRUE(first_segment_index_writer->appendv(&index_slice, 1).ok());
+    ASSERT_NE(_inner_fs->last_writer(), nullptr);
+    EXPECT_EQ(_inner_fs->last_writer()->bytes_appended(), 0);
+    EXPECT_TRUE(first_segment_index_writer->is_in_packed_file());
 }
 
 TEST_F(PackedFileSystemTest, OpenFileNotInMergeFile) {

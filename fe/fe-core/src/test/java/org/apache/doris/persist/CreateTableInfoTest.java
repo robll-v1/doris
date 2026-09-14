@@ -36,9 +36,10 @@ import org.apache.doris.thrift.TStorageType;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
-import org.junit.Assert;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
@@ -51,13 +52,20 @@ public class CreateTableInfoTest {
 
     private FakeEnv fakeEnv;
 
-    @Before
+    @BeforeEach
     public void setUp() {
         fakeEnv = new FakeEnv();
         env = Deencapsulation.newInstance(Env.class);
 
         FakeEnv.setEnv(env);
         FakeEnv.setMetaVersion(FeConstants.meta_version);
+    }
+
+    @AfterEach
+    public void tearDown() {
+        if (fakeEnv != null) {
+            fakeEnv.close();
+        }
     }
 
     @Test
@@ -105,9 +113,9 @@ public class CreateTableInfoTest {
         DataInputStream dis = new DataInputStream(Files.newInputStream(path));
 
         CreateTableInfo rInfo1 = CreateTableInfo.read(dis);
-        Assert.assertEquals(rInfo1.getTable(), table);
-        Assert.assertEquals(rInfo1, info);
-        Assert.assertEquals(rInfo1.getDbName(), "db1");
+        Assertions.assertEquals(rInfo1.getTable(), table);
+        Assertions.assertEquals(rInfo1, info);
+        Assertions.assertEquals(rInfo1.getDbName(), "db1");
 
         // 3. delete files
         dis.close();

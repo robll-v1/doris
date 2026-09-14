@@ -22,6 +22,8 @@ import org.apache.doris.alter.AlterJobV2.JobState;
 import org.apache.doris.alter.BatchAlterJobPersistInfo;
 import org.apache.doris.alter.IndexChangeJob;
 import org.apache.doris.analysis.UserIdentity;
+import org.apache.doris.authentication.AuthenticationIntegrationMeta;
+import org.apache.doris.authentication.RoleMappingMeta;
 import org.apache.doris.backup.BackupJob;
 import org.apache.doris.backup.Repository;
 import org.apache.doris.backup.RestoreJob;
@@ -38,9 +40,13 @@ import org.apache.doris.catalog.EncryptKeySearchDesc;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.Function;
 import org.apache.doris.catalog.FunctionSearchDesc;
+import org.apache.doris.catalog.MTMV;
 import org.apache.doris.catalog.Resource;
+import org.apache.doris.catalog.constraint.Constraint;
+import org.apache.doris.catalog.info.TableNameInfo;
 import org.apache.doris.cloud.CloudWarmUpJob;
 import org.apache.doris.cloud.catalog.CloudEnv;
+import org.apache.doris.cloud.persist.CloudMetaSyncPoint;
 import org.apache.doris.cloud.persist.UpdateCloudReplicaInfo;
 import org.apache.doris.cloud.snapshot.SnapshotState;
 import org.apache.doris.common.Config;
@@ -54,13 +60,13 @@ import org.apache.doris.cooldown.CooldownConfHandler;
 import org.apache.doris.cooldown.CooldownConfList;
 import org.apache.doris.cooldown.CooldownDelete;
 import org.apache.doris.datasource.CatalogIf;
-import org.apache.doris.datasource.CatalogLog;
 import org.apache.doris.datasource.ExternalCatalog;
-import org.apache.doris.datasource.ExternalObjectLog;
-import org.apache.doris.datasource.InitCatalogLog;
-import org.apache.doris.datasource.InitDatabaseLog;
 import org.apache.doris.datasource.InternalCatalog;
-import org.apache.doris.datasource.MetaIdMappingsLog;
+import org.apache.doris.datasource.log.CatalogLog;
+import org.apache.doris.datasource.log.ExternalObjectLog;
+import org.apache.doris.datasource.log.InitCatalogLog;
+import org.apache.doris.datasource.log.InitDatabaseLog;
+import org.apache.doris.datasource.log.MetaIdMappingsLog;
 import org.apache.doris.dictionary.Dictionary;
 import org.apache.doris.ha.MasterInfo;
 import org.apache.doris.indexpolicy.DropIndexPolicyLog;
@@ -86,6 +92,7 @@ import org.apache.doris.load.loadv2.LoadJobFinalOperation;
 import org.apache.doris.load.routineload.RoutineLoadJob;
 import org.apache.doris.meta.MetaContext;
 import org.apache.doris.metric.MetricRepo;
+import org.apache.doris.mtmv.MTMVUtil;
 import org.apache.doris.mysql.privilege.UserPropertyInfo;
 import org.apache.doris.plugin.PluginInfo;
 import org.apache.doris.policy.DropPolicyLog;
@@ -93,15 +100,16 @@ import org.apache.doris.policy.Policy;
 import org.apache.doris.policy.StoragePolicy;
 import org.apache.doris.resource.workloadgroup.WorkloadGroup;
 import org.apache.doris.resource.workloadschedpolicy.WorkloadSchedPolicy;
-import org.apache.doris.statistics.AnalysisInfo;
-import org.apache.doris.statistics.AnalysisManager;
-import org.apache.doris.statistics.NewPartitionLoadedEvent;
-import org.apache.doris.statistics.TableStatsMeta;
-import org.apache.doris.statistics.UpdateRowsEvent;
+import org.apache.doris.statistics.analysis.AnalysisInfo;
+import org.apache.doris.statistics.analysis.AnalysisManager;
+import org.apache.doris.statistics.analysis.NewPartitionLoadedEvent;
+import org.apache.doris.statistics.analysis.TableStatsMeta;
+import org.apache.doris.statistics.analysis.UpdateRowsEvent;
 import org.apache.doris.system.Backend;
 import org.apache.doris.system.Frontend;
 import org.apache.doris.transaction.TransactionState;
 import org.apache.doris.transaction.TransactionStatus;
+import org.apache.doris.tso.TSOTimestamp;
 
 import com.google.common.base.Strings;
 import org.apache.logging.log4j.LogManager;
@@ -124,13 +132,14 @@ import java.util.concurrent.atomic.AtomicLong;
 public class EditLog {
     public static final Logger LOG = LogManager.getLogger(EditLog.class);
 
-    // Helper class to hold log edit requests
-    private static class EditLogItem {
+    // Helper class to hold log edit requests.
+    // Public so that callers can enqueue inside a lock and await outside it.
+    public static class EditLogItem {
         static AtomicLong nextUid = new AtomicLong(0);
         final short op;
         final Writable writable;
         final Object lock = new Object();
-        boolean finished = false;
+        volatile boolean finished = false;
         long logId = -1;
         long uid = -1;
 
@@ -138,6 +147,24 @@ public class EditLog {
             this.op = op;
             this.writable = writable;
             uid = nextUid.getAndIncrement();
+        }
+
+        /**
+         * Wait for this edit log entry to be flushed to persistent storage.
+         * Returns the assigned log ID.
+         */
+        public long await() {
+            synchronized (lock) {
+                while (!finished) {
+                    try {
+                        lock.wait();
+                    } catch (InterruptedException e) {
+                        LOG.error("Fatal Error : write stream Exception");
+                        System.exit(-1);
+                    }
+                }
+            }
+            return logId;
         }
     }
 
@@ -147,7 +174,8 @@ public class EditLog {
     private EditLogOutputStream editStream = null;
 
     private long txId = 0;
-
+    // This best-effort timer starts when EditLog is created and resets after every roll.
+    private volatile long lastEditLogRollTimeMs = System.currentTimeMillis();
 
     private AtomicLong numTransactions = new AtomicLong(0);
     private AtomicLong totalTimeTransactions = new AtomicLong(0);
@@ -243,9 +271,10 @@ public class EditLog {
 
         txId += batch.size();
         // update statistics, etc. (optional, can be added as needed)
-        if (txId >= Config.edit_log_roll_num) {
-            LOG.info("txId {} is equal to or larger than edit_log_roll_num {}, will roll edit.", txId,
-                    Config.edit_log_roll_num);
+        if (txId >= Config.edit_log_roll_num || exceedEditLogRollInterval()) {
+            LOG.info("edit log roll condition met. txId: {}, edit log roll num: {}, "
+                            + "cloud edit log roll interval: {} seconds",
+                    txId, Config.edit_log_roll_num, Config.cloud_edit_log_roll_interval_second);
             rollEditLog();
             txId = 0;
         }
@@ -804,6 +833,11 @@ public class EditLog {
                     Env.getCurrentEnv().replayCreateFunction(function);
                     break;
                 }
+                case OperationType.OP_ADD_FUNCTIONS: {
+                    final CreateFunctionInfo info = (CreateFunctionInfo) journal.getData();
+                    Env.getCurrentEnv().replayCreateFunctions(info);
+                    break;
+                }
                 case OperationType.OP_DROP_FUNCTION: {
                     FunctionSearchDesc function = (FunctionSearchDesc) journal.getData();
                     Env.getCurrentEnv().replayDropFunction(function);
@@ -973,6 +1007,12 @@ public class EditLog {
                     env.getBinlogManager().addModifyTableProperty(log, logId);
                     break;
                 }
+                case OperationType.OP_TABLE_STREAM_CLEANUP: {
+                    TableStreamCleanupInfo info =
+                            (TableStreamCleanupInfo) journal.getData();
+                    env.replayTableStreamCleanup(info);
+                    break;
+                }
                 case OperationType.OP_MODIFY_DISTRIBUTION_BUCKET_NUM: {
                     ModifyTableDefaultDistributionBucketNumOperationLog log =
                             (ModifyTableDefaultDistributionBucketNumOperationLog) journal.getData();
@@ -1063,6 +1103,32 @@ public class EditLog {
                     env.getSqlBlockRuleMgr().replayDrop(log.getRuleNames());
                     break;
                 }
+                case OperationType.OP_CREATE_AUTHENTICATION_INTEGRATION: {
+                    AuthenticationIntegrationMeta log = (AuthenticationIntegrationMeta) journal.getData();
+                    env.getAuthenticationIntegrationMgr().replayCreateAuthenticationIntegration(log);
+                    break;
+                }
+                case OperationType.OP_ALTER_AUTHENTICATION_INTEGRATION: {
+                    AuthenticationIntegrationMeta log = (AuthenticationIntegrationMeta) journal.getData();
+                    env.getAuthenticationIntegrationMgr().replayAlterAuthenticationIntegration(log);
+                    break;
+                }
+                case OperationType.OP_DROP_AUTHENTICATION_INTEGRATION: {
+                    DropAuthenticationIntegrationOperationLog log =
+                            (DropAuthenticationIntegrationOperationLog) journal.getData();
+                    env.getAuthenticationIntegrationMgr().replayDropAuthenticationIntegration(log);
+                    break;
+                }
+                case OperationType.OP_CREATE_ROLE_MAPPING: {
+                    RoleMappingMeta log = (RoleMappingMeta) journal.getData();
+                    env.getRoleMappingMgr().replayCreateRoleMapping(log);
+                    break;
+                }
+                case OperationType.OP_DROP_ROLE_MAPPING: {
+                    DropRoleMappingOperationLog log = (DropRoleMappingOperationLog) journal.getData();
+                    env.getRoleMappingMgr().replayDropRoleMapping(log);
+                    break;
+                }
                 case OperationType.OP_MODIFY_TABLE_ENGINE: {
                     ModifyTableEngineOperationLog log = (ModifyTableEngineOperationLog) journal.getData();
                     env.getAlterInstance().replayProcessModifyEngine(log);
@@ -1149,20 +1215,36 @@ public class EditLog {
                 }
                 case OperationType.OP_ADD_CONSTRAINT: {
                     final AlterConstraintLog log = (AlterConstraintLog) journal.getData();
-                    try {
-                        log.getTableIf().replayAddConstraint(log.getConstraint());
-                    } catch (Exception e) {
-                        LOG.error("Failed to replay add constraint", e);
+                    TableNameInfo tni = log.getTableNameInfo();
+                    Constraint constraint = log.getConstraint();
+                    if (tni == null) {
+                        LOG.warn("Skip replaying add constraint {} because table name could not be resolved",
+                                constraint.getName());
+                        break;
                     }
+                    List<MTMV> dependentMtmvs = MTMVUtil.getDependentMtmvsByConstraint(tni, constraint);
+                    env.getConstraintManager().addConstraint(
+                            tni, constraint.getName(), constraint, true);
+                    MTMVUtil.invalidateRewriteCachesBestEffort(dependentMtmvs,
+                            String.format("when replaying add constraint %s on table %s",
+                                    constraint.getName(), tni));
                     break;
                 }
                 case OperationType.OP_DROP_CONSTRAINT: {
                     final AlterConstraintLog log = (AlterConstraintLog) journal.getData();
-                    try {
-                        log.getTableIf().replayDropConstraint(log.getConstraint().getName());
-                    } catch (Exception e) {
-                        LOG.error("Failed to replay drop constraint", e);
+                    TableNameInfo tni = log.getTableNameInfo();
+                    Constraint constraint = log.getConstraint();
+                    if (tni == null) {
+                        LOG.warn("Skip replaying drop constraint {} because table name could not be resolved",
+                                constraint.getName());
+                        break;
                     }
+                    List<MTMV> dependentMtmvs = MTMVUtil.getDependentMtmvsByConstraint(tni, constraint);
+                    env.getConstraintManager().dropConstraint(
+                            tni, constraint.getName(), true);
+                    MTMVUtil.invalidateRewriteCachesBestEffort(dependentMtmvs,
+                            String.format("when replaying drop constraint %s on table %s",
+                                    constraint.getName(), tni));
                     break;
                 }
                 case OperationType.OP_ALTER_USER: {
@@ -1405,6 +1487,15 @@ public class EditLog {
                     // TODO: implement
                     break;
                 }
+                case OperationType.OP_META_SYNC_POINT: {
+                    // CloudMetaSyncPoint info = (CloudMetaSyncPoint) journal.getData();
+                    // This log is only used to keep FE/MS cut point in journal timeline.
+                    break;
+                }
+                case OperationType.OP_TSO_TIMESTAMP_WINDOW_END: {
+                    env.getTSOService().replayWindowEndTSO((TSOTimestamp) journal.getData());
+                    break;
+                }
                 default: {
                     IOException e = new IOException();
                     LOG.error("UNKNOWN Operation Type {}, log id: {}", opCode, logId, e);
@@ -1466,6 +1557,7 @@ public class EditLog {
      */
     public void rollEditLog() {
         journal.rollJournal();
+        lastEditLogRollTimeMs = System.currentTimeMillis();
     }
 
     // NOTICE: No guarantee atomicity of entries
@@ -1534,6 +1626,49 @@ public class EditLog {
         return req.logId;
     }
 
+    /**
+     * Submit an edit log entry to the batch queue without waiting for it to be flushed.
+     * The entry is enqueued in FIFO order, so calling this inside a write lock guarantees
+     * that edit log entries are ordered by lock acquisition order.
+     *
+     * <p>The caller MUST call {@link EditLogItem#await()} after releasing the lock to ensure
+     * the entry is persisted before proceeding.
+     *
+     * <p>If batch edit log is disabled, this falls back to a synchronous direct write
+     * and the returned item is already completed.
+     *
+     * @return an {@link EditLogItem} handle to await completion
+     */
+    public EditLogItem submitEdit(short op, Writable writable) {
+        if (this.getNumEditStreams() == 0) {
+            LOG.error("Fatal Error : no editLog stream", new Exception());
+            throw new Error("Fatal Error : no editLog stream");
+        }
+
+        EditLogItem req = new EditLogItem(op, writable);
+        if (Config.enable_batch_editlog && op != OperationType.OP_TIMESTAMP) {
+            while (true) {
+                try {
+                    logEditQueue.put(req);
+                    break;
+                } catch (InterruptedException e) {
+                    LOG.warn("Interrupted during put, will sleep and retry.");
+                    try {
+                        Thread.sleep(100);
+                    } catch (InterruptedException ex) {
+                        LOG.warn("interrupted during sleep, will retry.", ex);
+                    }
+                }
+            }
+        } else {
+            // Non-batch mode: write directly (synchronous)
+            long logId = logEditDirectly(op, writable);
+            req.logId = logId;
+            req.finished = true;
+        }
+        return req;
+    }
+
     private synchronized long logEditDirectly(short op, Writable writable) {
         long logId = -1;
         try {
@@ -1551,14 +1686,21 @@ public class EditLog {
         // get a new transactionId
         txId++;
 
-        if (txId >= Config.edit_log_roll_num) {
-            LOG.info("txId {} is equal to or larger than edit_log_roll_num {}, will roll edit.", txId,
-                    Config.edit_log_roll_num);
+        if (txId >= Config.edit_log_roll_num || exceedEditLogRollInterval()) {
+            LOG.info("edit log roll condition met. txId: {}, edit log roll num: {}, "
+                            + "cloud edit log roll interval: {} seconds",
+                    txId, Config.edit_log_roll_num, Config.cloud_edit_log_roll_interval_second);
             rollEditLog();
             txId = 0;
         }
 
         return logId;
+    }
+
+    private boolean exceedEditLogRollInterval() {
+        return Config.isCloudMode() && Config.cloud_edit_log_roll_interval_second > 0
+                && System.currentTimeMillis() - lastEditLogRollTimeMs
+                        >= TimeUnit.SECONDS.toMillis(Config.cloud_edit_log_roll_interval_second);
     }
 
     /**
@@ -1666,7 +1808,21 @@ public class EditLog {
     }
 
     public long logAddPartition(PartitionPersistInfo info) {
+        if (DebugPointUtil.isEnable("FE.logAddPartition.slow")) {
+            DebugPointUtil.DebugPoint debugPoint = DebugPointUtil.getDebugPoint("FE.logAddPartition.slow");
+            String pName = debugPoint.param("pName", "");
+            if (info.getPartition().getName().equals(pName)) {
+                int sleepMs = debugPoint.param("sleep", 1000);
+                LOG.info("logAddPartition debug point hit, pName {}, sleep {} s", pName, sleepMs);
+                try {
+                    Thread.sleep(sleepMs);
+                } catch (InterruptedException e) {
+                    LOG.warn("sleep interrupted", e);
+                }
+            }
+        }
         long logId = logEdit(OperationType.OP_ADD_PARTITION, info);
+        LOG.info("log add partition, logId:{}, info: {}", logId, info.toJson());
         AddPartitionRecord record = new AddPartitionRecord(logId, info);
         Env.getCurrentEnv().getBinlogManager().addAddPartitionRecord(record);
         return logId;
@@ -1674,6 +1830,7 @@ public class EditLog {
 
     public long logDropPartition(DropPartitionInfo info) {
         long logId = logEdit(OperationType.OP_DROP_PARTITION, info);
+        LOG.info("log drop partition, logId:{}, info: {}", logId, info.toJson());
         Env.getCurrentEnv().getBinlogManager().addDropPartitionRecord(info, logId);
         return logId;
     }
@@ -1684,6 +1841,7 @@ public class EditLog {
 
     public void logRecoverPartition(RecoverInfo info) {
         long logId = logEdit(OperationType.OP_RECOVER_PARTITION, info);
+        LOG.info("log recover partition, logId:{}, info: {}", logId, info.toJson());
         Env.getCurrentEnv().getBinlogManager().addRecoverTableRecord(info, logId);
     }
 
@@ -1702,6 +1860,7 @@ public class EditLog {
 
     public void logDropTable(DropInfo info) {
         long logId = logEdit(OperationType.OP_DROP_TABLE, info);
+        LOG.info("log drop table, logId : {}, infos: {}", logId, info);
         if (Strings.isNullOrEmpty(info.getCtl()) || info.getCtl().equals(InternalCatalog.INTERNAL_CATALOG_NAME)) {
             DropTableRecord record = new DropTableRecord(logId, info);
             Env.getCurrentEnv().getBinlogManager().addDropTableRecord(record);
@@ -1714,11 +1873,13 @@ public class EditLog {
 
     public void logRecoverTable(RecoverInfo info) {
         long logId = logEdit(OperationType.OP_RECOVER_TABLE, info);
+        LOG.info("log recover table, logId : {}, infos: {}", logId, info);
         Env.getCurrentEnv().getBinlogManager().addRecoverTableRecord(info, logId);
     }
 
     public void logDropRollup(DropInfo info) {
         long logId = logEdit(OperationType.OP_DROP_ROLLUP, info);
+        LOG.info("log drop rollup, logId : {}, infos: {}", logId, info);
         Env.getCurrentEnv().getBinlogManager().addDropRollup(info, logId);
     }
 
@@ -1786,6 +1947,10 @@ public class EditLog {
         logEdit(OperationType.OP_TIMESTAMP, stamp);
     }
 
+    public void logTSOTimestampWindowEnd(TSOTimestamp windowEnd) {
+        logEdit(OperationType.OP_TSO_TIMESTAMP_WINDOW_END, windowEnd);
+    }
+
     public void logMasterInfo(MasterInfo info) {
         logEdit(OperationType.OP_MASTER_INFO_CHANGE, info);
     }
@@ -1835,7 +2000,8 @@ public class EditLog {
     }
 
     public void logDatabaseRename(DatabaseInfo databaseInfo) {
-        logEdit(OperationType.OP_RENAME_DB, databaseInfo);
+        long logId = logEdit(OperationType.OP_RENAME_DB, databaseInfo);
+        LOG.info("log database rename, logId : {}, infos: {}", logId, databaseInfo);
     }
 
     public void logTableRename(TableInfo tableInfo) {
@@ -1982,6 +2148,10 @@ public class EditLog {
 
     public void logAddFunction(Function function) {
         logEdit(OperationType.OP_ADD_FUNCTION, function);
+    }
+
+    public void logAddFunctions(List<Function> functions) {
+        logEdit(OperationType.OP_ADD_FUNCTIONS, new CreateFunctionInfo(functions));
     }
 
     public void logAddGlobalFunction(Function function) {
@@ -2138,6 +2308,10 @@ public class EditLog {
         logModifyTableProperty(OperationType.OP_DYNAMIC_PARTITION, info);
     }
 
+    public EditLogItem logTableStreamCleanup(TableStreamCleanupInfo info) {
+        return submitEdit(OperationType.OP_TABLE_STREAM_CLEANUP, info);
+    }
+
     public long logModifyReplicationNum(ModifyTablePropertyOperationLog info) {
         return logModifyTableProperty(OperationType.OP_MODIFY_REPLICATION_NUM, info);
     }
@@ -2230,8 +2404,24 @@ public class EditLog {
         logEdit(OperationType.OP_DROP_SQL_BLOCK_RULE, new DropSqlBlockRuleOperationLog(ruleNames));
     }
 
-    public void logModifyTableEngine(ModifyTableEngineOperationLog log) {
-        logEdit(OperationType.OP_MODIFY_TABLE_ENGINE, log);
+    public void logCreateAuthenticationIntegration(AuthenticationIntegrationMeta meta) {
+        logEdit(OperationType.OP_CREATE_AUTHENTICATION_INTEGRATION, meta);
+    }
+
+    public void logAlterAuthenticationIntegration(AuthenticationIntegrationMeta meta) {
+        logEdit(OperationType.OP_ALTER_AUTHENTICATION_INTEGRATION, meta);
+    }
+
+    public void logDropAuthenticationIntegration(DropAuthenticationIntegrationOperationLog log) {
+        logEdit(OperationType.OP_DROP_AUTHENTICATION_INTEGRATION, log);
+    }
+
+    public void logCreateRoleMapping(RoleMappingMeta meta) {
+        logEdit(OperationType.OP_CREATE_ROLE_MAPPING, meta);
+    }
+
+    public void logDropRoleMapping(DropRoleMappingOperationLog log) {
+        logEdit(OperationType.OP_DROP_ROLE_MAPPING, log);
     }
 
     public void logCreatePolicy(Policy policy) {
@@ -2454,5 +2644,9 @@ public class EditLog {
 
     public long logBeginSnapshot(SnapshotState snapshotState) {
         return logEdit(OperationType.OP_BEGIN_SNAPSHOT, snapshotState);
+    }
+
+    public long logMetaSyncPoint(CloudMetaSyncPoint syncPoint) {
+        return logEdit(OperationType.OP_META_SYNC_POINT, syncPoint);
     }
 }

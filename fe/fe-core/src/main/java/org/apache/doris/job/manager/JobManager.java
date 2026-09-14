@@ -20,11 +20,8 @@ package org.apache.doris.job.manager;
 import org.apache.doris.analysis.CompoundPredicate;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
-import org.apache.doris.cloud.proto.Cloud;
-import org.apache.doris.cloud.rpc.MetaServiceProxy;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.CaseSensibility;
-import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
@@ -52,7 +49,6 @@ import org.apache.doris.nereids.trees.expressions.And;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.plans.commands.AlterJobCommand;
 import org.apache.doris.qe.ConnectContext;
-import org.apache.doris.rpc.RpcException;
 
 import com.google.common.collect.Lists;
 import lombok.Getter;
@@ -228,7 +224,9 @@ public class JobManager<T extends AbstractJob<?, C>, C> implements Writable {
         }
         writeLock();
         try {
-            deleteStremingJob(job);
+            if (!isReplay) {
+                deleteStreamingJob(job);
+            }
             jobMap.remove(job.getJobId());
             if (isReplay) {
                 job.onReplayEnd(job);
@@ -242,27 +240,12 @@ public class JobManager<T extends AbstractJob<?, C>, C> implements Writable {
         }
     }
 
-    private void deleteStremingJob(AbstractJob<?, C> job) throws JobException {
-        if (!(Config.isCloudMode() && job instanceof StreamingInsertJob)) {
+    private void deleteStreamingJob(AbstractJob<?, C> job) throws JobException {
+        if (!(job instanceof StreamingInsertJob)) {
             return;
         }
         StreamingInsertJob streamingJob = (StreamingInsertJob) job;
-        Cloud.DeleteStreamingJobResponse resp = null;
-        try {
-            Cloud.DeleteStreamingJobRequest req = Cloud.DeleteStreamingJobRequest.newBuilder()
-                    .setCloudUniqueId(Config.cloud_unique_id)
-                    .setDbId(streamingJob.getDbId())
-                    .setJobId(job.getJobId())
-                    .build();
-            resp = MetaServiceProxy.getInstance().deleteStreamingJob(req);
-            if (resp.getStatus().getCode() != Cloud.MetaServiceCode.OK) {
-                log.warn("failed to delete streaming job, response: {}", resp);
-                throw new JobException("deleteJobKey failed for jobId=%s, dbId=%s, status=%s",
-                        job.getJobId(), job.getJobId(), resp.getStatus());
-            }
-        } catch (RpcException e) {
-            log.warn("failed to delete streaming job {}", resp, e);
-        }
+        streamingJob.cleanup();
     }
 
     public void alterJobStatus(Long jobId, JobStatus status) throws JobException {
@@ -299,7 +282,7 @@ public class JobManager<T extends AbstractJob<?, C>, C> implements Writable {
                     checkSameStatus(a, jobStatus);
                     alterJobStatus(a.getJobId(), jobStatus);
                     if (a instanceof StreamingInsertJob) {
-                        ((StreamingInsertJob) a).resetFailureInfo(reason);
+                        ((StreamingInsertJob) a).onManualStatusAltered(jobStatus, reason);
                     }
                 } catch (JobException e) {
                     throw new JobException("Alter job status error, jobName is %s, errorMsg is %s",
@@ -441,10 +424,10 @@ public class JobManager<T extends AbstractJob<?, C>, C> implements Writable {
      */
     public void cancelTaskById(String jobName, Long taskId) throws JobException {
         for (T job : jobMap.values()) {
-            if (job.getJobConfig().getExecuteType().equals(JobExecuteType.STREAMING)) {
-                throw new JobException("streaming job not support cancel task by id");
-            }
             if (job.getJobName().equals(jobName)) {
+                if (job.getJobConfig().getExecuteType().equals(JobExecuteType.STREAMING)) {
+                    throw new JobException("streaming job not support cancel task by id");
+                }
                 job.cancelTaskById(taskId);
                 job.logUpdateOperation();
                 return;

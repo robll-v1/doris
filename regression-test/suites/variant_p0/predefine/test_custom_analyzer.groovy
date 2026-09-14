@@ -18,12 +18,14 @@
 import java.sql.SQLException
 
 suite("test_variant_custom_analyzer", "p0") {
+    def variantV2Function = "parse_to_variant"
     def indexTbName1 = "test_custom_analyzer_1"
     def indexTbName2 = "test_custom_analyzer_2"
     def indexTbName3 = "test_custom_analyzer_3"
     sql "set default_variant_max_subcolumns_count = 100"
     sql """ set enable_match_without_inverted_index = false """
     sql """ set default_variant_enable_typed_paths_to_sparse = false """
+    sql """ set default_variant_enable_doc_mode = false """
 
     sql """
         CREATE INVERTED INDEX TOKENIZER IF NOT EXISTS edge_ngram_phone_number_tokenizer
@@ -57,7 +59,7 @@ suite("test_variant_custom_analyzer", "p0") {
     sql """
         CREATE INVERTED INDEX ANALYZER IF NOT EXISTS lowercase_delimited
         PROPERTIES
-        (    
+        (
             "tokenizer" = "standard",
             "token_filter" = "asciifolding, word_splitter, lowercase"
         );
@@ -83,7 +85,7 @@ suite("test_variant_custom_analyzer", "p0") {
     qt_tokenize_sql """ select tokenize("clayfighter 63⅓", '"analyzer"="lowercase_delimited"'); """
     qt_tokenize_sql """ select tokenize("β-carbon nitride", '"analyzer"="lowercase_delimited"'); """
     qt_tokenize_sql """ select tokenize("ǁŨǁe language", '"analyzer"="lowercase_delimited"'); """
-     
+
     sql "DROP TABLE IF EXISTS ${indexTbName1}"
     sql """
         CREATE TABLE ${indexTbName1} (
@@ -94,21 +96,22 @@ suite("test_variant_custom_analyzer", "p0") {
         DUPLICATE KEY(`a`)
         DISTRIBUTED BY RANDOM BUCKETS 1
         PROPERTIES (
-        "replication_allocation" = "tag.location.default: 1"
+        "replication_allocation" = "tag.location.default: 1",
+        "disable_auto_compaction" = "true"
         );
     """
 
-    sql """ insert into ${indexTbName1} values(1, '{"ch" : "abcDEF"}'); """
-    sql """ insert into ${indexTbName1} values(2, '{"ch" : "中国人民"}'); """
-    sql """ insert into ${indexTbName1} values(3, '{"ch" : "ǁŨǁe Language"}'); """
-    sql """ insert into ${indexTbName1} values(4, '{"ch" : "RX J1242−11"}'); """
-    sql """ insert into ${indexTbName1} values(5, '{"ch" : "clayfighter 63⅓"}'); """
-    sql """ insert into ${indexTbName1} values(6, '{"ch" : "β-carbon nitrid"}'); """
+    sql """ insert into ${indexTbName1} values(1, ${variantV2Function}('{"ch" : "abcDEF"}')); """
+    sql """ insert into ${indexTbName1} values(2, ${variantV2Function}('{"ch" : "中国人民"}')); """
+    sql """ insert into ${indexTbName1} values(3, ${variantV2Function}('{"ch" : "ǁŨǁe Language"}')); """
+    sql """ insert into ${indexTbName1} values(4, ${variantV2Function}('{"ch" : "RX J1242−11"}')); """
+    sql """ insert into ${indexTbName1} values(5, ${variantV2Function}('{"ch" : "clayfighter 63⅓"}')); """
+    sql """ insert into ${indexTbName1} values(6, ${variantV2Function}('{"ch" : "β-carbon nitrid"}')); """
 
     try {
-        trigger_and_wait_compaction(indexTbName1, "full")
+        trigger_and_wait_compaction(indexTbName1, "full", 1800)
         sql "sync"
-        sql """ set enable_common_expr_pushdown = true; """
+        sql """ set enable_segment_limit_pushdown = true; """
 
         qt_sql """ select a, ch['ch'] from ${indexTbName1} where ch['ch'] match 'abcDEF'; """
         qt_sql """ select a, ch['ch'] from ${indexTbName1} where ch['ch'] match '中'; """
@@ -130,11 +133,11 @@ suite("test_variant_custom_analyzer", "p0") {
         );
     """
 
-    sql """ INSERT INTO ${indexTbName2} VALUES ('3', '{"ch" : "Wikipedia;Miscellaneous-Jj102786 / 3tle Born Oct 27th 1986 @ Blytheville, Arkansas @ 9:14pm 23 yrs of age male,white Cucassion American raised Religion:Pentocostal,Church of God"}'); """
+    sql """ INSERT INTO ${indexTbName2} VALUES ('3', ${variantV2Function}('{"ch" : "Wikipedia;Miscellaneous-Jj102786 / 3tle Born Oct 27th 1986 @ Blytheville, Arkansas @ 9:14pm 23 yrs of age male,white Cucassion American raised Religion:Pentocostal,Church of God"}')); """
 
     try {
         sql "sync"
-        sql """ set enable_common_expr_pushdown = true; """
+        sql """ set enable_segment_limit_pushdown = true; """
 
         qt_sql """ select a, ch['ch'] from ${indexTbName2} where ch['ch'] match '102'; """
     } finally {
@@ -154,11 +157,11 @@ suite("test_variant_custom_analyzer", "p0") {
         );
     """
 
-    sql """ INSERT INTO ${indexTbName3} VALUES ('4', '{"ch" : "1080º Avalanche"}'); """
+    sql """ INSERT INTO ${indexTbName3} VALUES ('4', ${variantV2Function}('{"ch" : "1080º Avalanche"}')); """
 
     try {
         sql "sync"
-        sql """ set enable_common_expr_pushdown = true; """
+        sql """ set enable_segment_limit_pushdown = true; """
 
         qt_sql """ select a, ch['ch'] from ${indexTbName3} where ch['ch'] match '1080º avalanche'; """
     } finally {

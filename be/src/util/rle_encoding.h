@@ -25,7 +25,6 @@
 #include "util/bit_util.h"
 
 namespace doris {
-#include "common/compile_check_begin.h"
 
 // Utility classes to do run length encoding (RLE) for fixed bit width values.  If runs
 // are sufficiently long, RLE is used, otherwise, the values are just bit-packed
@@ -435,17 +434,35 @@ template <typename T>
 void RleEncoder<T>::Put(T value, size_t run_length) {
     DCHECK(bit_width_ == 64 || value < (1LL << bit_width_));
 
-    // TODO(perf): remove the loop and use the repeat_count_
-    for (; run_length > 0; run_length--) {
+    // Fast path: if this is a continuation of the current repeated run and
+    // we've already buffered enough values, just increment repeat_count_
+    if (current_value_ == value && repeat_count_ >= 8 && run_length > 0) [[likely]] {
+        repeat_count_ += run_length;
+        return;
+    }
+
+    // Handle run_length > 1 more efficiently
+    while (run_length > 0) {
         if (current_value_ == value) [[likely]] {
-            ++repeat_count_;
-            if (repeat_count_ > 8) {
-                // This is just a continuation of the current run, no need to buffer the
-                // values.
-                // Note that this is the fast path for long repeated runs.
-                continue;
+            // Need to buffer values until we reach 8
+            size_t to_buffer = std::min(run_length, size_t(8 - num_buffered_values_));
+            for (size_t i = 0; i < to_buffer; ++i) {
+                buffered_values_[num_buffered_values_++] = value;
+                ++repeat_count_;
+            }
+            run_length -= to_buffer;
+            if (num_buffered_values_ == 8) {
+                DCHECK_EQ(literal_count_ % 8, 0);
+                FlushBufferedValues(false);
+                // After flushing, if we still have a repeated run and more values,
+                // we can add them directly to repeat_count_
+                if (repeat_count_ >= 8 && run_length > 0) {
+                    repeat_count_ += run_length;
+                    return;
+                }
             }
         } else {
+            // Value changed
             if (repeat_count_ >= 8) {
                 // We had a run that was long enough but it has ended.  Flush the
                 // current repeated run.
@@ -454,12 +471,13 @@ void RleEncoder<T>::Put(T value, size_t run_length) {
             }
             repeat_count_ = 1;
             current_value_ = value;
-        }
 
-        buffered_values_[num_buffered_values_] = value;
-        if (++num_buffered_values_ == 8) {
-            DCHECK_EQ(literal_count_ % 8, 0);
-            FlushBufferedValues(false);
+            buffered_values_[num_buffered_values_++] = value;
+            --run_length;
+            if (num_buffered_values_ == 8) {
+                DCHECK_EQ(literal_count_ % 8, 0);
+                FlushBufferedValues(false);
+            }
         }
     }
 }
@@ -866,5 +884,4 @@ uint32_t RleBatchDecoder<T>::GetBatch(T* values, uint32_t batch_num) {
     }
     return num_consumed;
 }
-#include "common/compile_check_end.h"
 } // namespace doris

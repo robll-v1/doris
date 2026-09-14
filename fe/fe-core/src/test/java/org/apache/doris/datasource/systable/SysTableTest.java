@@ -19,19 +19,20 @@ package org.apache.doris.datasource.systable;
 
 import org.apache.doris.common.Pair;
 import org.apache.doris.info.TableValuedFunctionRefInfo;
+import org.apache.doris.nereids.trees.expressions.functions.table.TableValuedFunction;
 
-import org.junit.Assert;
-import org.junit.Test;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Test;
 
 public class SysTableTest {
-    // Mock implementation of SysTable for testing
-    private static class MockSysTable extends SysTable {
-        public MockSysTable(String sysTableName, String tvfName) {
+    // Mock implementation of TvfSysTable for testing
+    private static class MockTvfSysTable extends TvfSysTable {
+        public MockTvfSysTable(String sysTableName, String tvfName) {
             super(sysTableName, tvfName);
         }
 
         @Override
-        public org.apache.doris.nereids.trees.expressions.functions.table.TableValuedFunction createFunction(
+        public TableValuedFunction createFunction(
                 String ctlName, String dbName, String sourceNameWithMetaName) {
             return null;
         }
@@ -45,59 +46,45 @@ public class SysTableTest {
 
     @Test
     public void testBasicProperties() {
-        MockSysTable sysTable = new MockSysTable("test_table", "test_tvf");
-        Assert.assertEquals("test_table", sysTable.getSysTableName());
-        Assert.assertEquals("$test_table", sysTable.suffix);
-        Assert.assertEquals("test_tvf", sysTable.tvfName);
-    }
-
-    @Test
-    public void testContainsMetaTable() {
-        MockSysTable sysTable = new MockSysTable("partitions", "partition_values");
-
-        // Positive cases
-        Assert.assertTrue(sysTable.containsMetaTable("mytable$partitions"));
-        Assert.assertTrue(sysTable.containsMetaTable("my_complex_table$partitions"));
-
-        // Negative cases
-        Assert.assertFalse(sysTable.containsMetaTable("mytable"));
-        Assert.assertFalse(sysTable.containsMetaTable("$partitions")); // No table name
-        Assert.assertFalse(sysTable.containsMetaTable("mytable$other"));
-        Assert.assertFalse(sysTable.containsMetaTable(""));
+        MockTvfSysTable sysTable = new MockTvfSysTable("test_table", "test_tvf");
+        Assertions.assertEquals("test_table", sysTable.getSysTableName());
+        Assertions.assertEquals("$test_table", sysTable.getSuffix());
+        Assertions.assertEquals("test_tvf", sysTable.getTvfName());
+        Assertions.assertFalse(sysTable.useNativeTablePath());
     }
 
     @Test
     public void testGetSourceTableName() {
-        MockSysTable sysTable = new MockSysTable("partitions", "partition_values");
+        MockTvfSysTable sysTable = new MockTvfSysTable("partitions", "partition_values");
 
-        Assert.assertEquals("mytable", sysTable.getSourceTableName("mytable$partitions"));
-        Assert.assertEquals("complex_table", sysTable.getSourceTableName("complex_table$partitions"));
-        Assert.assertEquals("table$with$dollar", sysTable.getSourceTableName("table$with$dollar$partitions"));
+        Assertions.assertEquals("mytable", sysTable.getSourceTableName("mytable$partitions"));
+        Assertions.assertEquals("complex_table", sysTable.getSourceTableName("complex_table$partitions"));
+        Assertions.assertEquals("table$with$dollar", sysTable.getSourceTableName("table$with$dollar$partitions"));
     }
 
     @Test
     public void testGetTableNameWithSysTableName() {
         // Test normal case
         Pair<String, String> result1 = SysTable.getTableNameWithSysTableName("table$partitions");
-        Assert.assertEquals("table", result1.first);
-        Assert.assertEquals("partitions", result1.second);
+        Assertions.assertEquals("table", result1.first);
+        Assertions.assertEquals("partitions", result1.second);
 
         // Test with multiple $ symbols
         Pair<String, String> result2 = SysTable.getTableNameWithSysTableName("table$with$dollar$partitions");
-        Assert.assertEquals("table$with$dollar", result2.first);
-        Assert.assertEquals("partitions", result2.second);
+        Assertions.assertEquals("table$with$dollar", result2.first);
+        Assertions.assertEquals("partitions", result2.second);
 
         // Test edge cases
         Pair<String, String> result3 = SysTable.getTableNameWithSysTableName("table");
-        Assert.assertEquals("table", result3.first);
-        Assert.assertEquals("", result3.second);
+        Assertions.assertEquals("table", result3.first);
+        Assertions.assertEquals("", result3.second);
 
         Pair<String, String> result4 = SysTable.getTableNameWithSysTableName("$");
-        Assert.assertEquals("$", result4.first);
-        Assert.assertEquals("", result4.second);
+        Assertions.assertEquals("$", result4.first);
+        Assertions.assertEquals("", result4.second);
 
         Pair<String, String> result5 = SysTable.getTableNameWithSysTableName("");
-        Assert.assertEquals("", result5.first);
-        Assert.assertEquals("", result5.second);
+        Assertions.assertEquals("", result5.first);
+        Assertions.assertEquals("", result5.second);
     }
 }

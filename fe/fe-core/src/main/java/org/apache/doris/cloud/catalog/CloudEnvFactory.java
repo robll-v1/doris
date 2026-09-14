@@ -28,6 +28,7 @@ import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.ReplicaAllocation;
 import org.apache.doris.catalog.Tablet;
+import org.apache.doris.catalog.TabletInvertedIndex;
 import org.apache.doris.cloud.common.util.CloudPropertyAnalyzer;
 import org.apache.doris.cloud.datasource.CloudInternalCatalog;
 import org.apache.doris.cloud.load.CleanCopyJobScheduler;
@@ -81,6 +82,11 @@ public class CloudEnvFactory extends EnvFactory {
     @Override
     public SystemInfoService createSystemInfoService() {
         return new CloudSystemInfoService();
+    }
+
+    @Override
+    public TabletInvertedIndex createTabletInvertedIndex() {
+        return new CloudTabletInvertedIndex();
     }
 
     @Override
@@ -152,7 +158,7 @@ public class CloudEnvFactory extends EnvFactory {
     @Override
     public Coordinator createCoordinator(ConnectContext context, Planner planner,
                                          StatsErrorEstimator statsErrorEstimator) {
-        if (planner instanceof NereidsPlanner && SessionVariable.canUseNereidsDistributePlanner()) {
+        if (planner instanceof NereidsPlanner && hasNereidsDistributedPlans((NereidsPlanner) planner)) {
             return new NereidsCoordinator(context, (NereidsPlanner) planner, statsErrorEstimator);
         }
         return new CloudCoordinator(context, planner, statsErrorEstimator);
@@ -161,10 +167,10 @@ public class CloudEnvFactory extends EnvFactory {
     @Override
     public Coordinator createCoordinator(ConnectContext context, Planner planner,
                                          StatsErrorEstimator statsErrorEstimator, long jobId) {
-        if (planner instanceof NereidsPlanner && SessionVariable.canUseNereidsDistributePlanner()) {
+        if (planner instanceof NereidsPlanner && hasNereidsDistributedPlans((NereidsPlanner) planner)) {
             return new NereidsCoordinator(context, (NereidsPlanner) planner, statsErrorEstimator, jobId);
         }
-        return new CloudCoordinator(context, planner, statsErrorEstimator);
+        return new CloudCoordinator(context, planner, statsErrorEstimator, jobId);
     }
 
     @Override

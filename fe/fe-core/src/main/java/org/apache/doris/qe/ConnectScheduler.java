@@ -18,11 +18,11 @@
 package org.apache.doris.qe;
 
 import org.apache.doris.analysis.UserIdentity;
+import org.apache.doris.arrowflight.sessions.FlightSqlConnectPoolMgr;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.Status;
 import org.apache.doris.common.ThreadPoolManager;
 import org.apache.doris.qe.ConnectContext.ThreadInfo;
-import org.apache.doris.service.arrowflight.sessions.FlightSqlConnectPoolMgr;
 
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
@@ -160,9 +160,13 @@ public class ConnectScheduler {
     private class TimeoutChecker extends TimerTask {
         @Override
         public void run() {
-            long now = System.currentTimeMillis();
-            connectPoolMgr.timeoutChecker(now);
-            flightSqlConnectPoolMgr.timeoutChecker(now);
+            try {
+                long now = System.currentTimeMillis();
+                connectPoolMgr.timeoutChecker(now);
+                flightSqlConnectPoolMgr.timeoutChecker(now);
+            } catch (Throwable t) {
+                LOG.warn("failed to check connection timeout", t);
+            }
         }
     }
 }

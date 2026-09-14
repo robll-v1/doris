@@ -17,6 +17,7 @@
 
 package org.apache.doris.alter;
 
+import org.apache.doris.catalog.CloudTabletStatMgr;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
@@ -36,8 +37,10 @@ import org.apache.doris.common.Config;
 import org.apache.doris.common.MetaNotFoundException;
 import org.apache.doris.proto.OlapFile;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.service.FrontendOptions;
 import org.apache.doris.task.AgentTask;
 import org.apache.doris.task.AgentTaskQueue;
+import org.apache.doris.thrift.TInvertedIndexFileStorageFormat;
 import org.apache.doris.thrift.TTaskType;
 
 import com.google.common.base.Preconditions;
@@ -83,13 +86,22 @@ public class CloudSchemaChangeJobV2 extends SchemaChangeJobV2 {
                 indexIdMap.keySet().stream().collect(Collectors.toList());
         try {
             ((CloudInternalCatalog) Env.getCurrentInternalCatalog())
-                    .commitMaterializedIndex(dbId, tableId, shadowIdxList, false);
+                    .commitMaterializedIndex(dbId, tableId, shadowIdxList, null, false);
         } catch (Exception e) {
             LOG.warn("commitMaterializedIndex exception:", e);
             throw new AlterCancelException(e.getMessage());
         }
         LOG.info("commitShadowIndex finished, dbId:{}, tableId:{}, jobId:{}, shadowIdxList:{}",
                 dbId, tableId, jobId, shadowIdxList);
+
+        List<Long> tabletIds = partitionIndexMap.cellSet().stream()
+                .flatMap(cell -> cell.getValue().getTablets().stream().map(Tablet::getId))
+                .collect(Collectors.toList());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("force sync tablet stats for table: {}, tabletNum: {}, tabletIds: {}", tableId,
+                    tabletIds.size(), tabletIds);
+        }
+        CloudTabletStatMgr.getInstance().addActiveTablets(tabletIds);
     }
 
     @Override
@@ -216,7 +228,6 @@ public class CloudSchemaChangeJobV2 extends SchemaChangeJobV2 {
             for (Map.Entry<Long, MaterializedIndex> entry : shadowIndexMap.entrySet()) {
                 long shadowIdxId = entry.getKey();
                 MaterializedIndex shadowIdx = entry.getValue();
-
                 short shadowShortKeyColumnCount = indexShortKeyMap.get(shadowIdxId);
                 List<Column> shadowSchema = indexSchemaMap.get(shadowIdxId);
                 List<Integer> clusterKeyUids = null;
@@ -226,11 +237,15 @@ public class CloudSchemaChangeJobV2 extends SchemaChangeJobV2 {
                 int shadowSchemaHash = indexSchemaVersionAndHashMap.get(shadowIdxId).schemaHash;
                 int shadowSchemaVersion = indexSchemaVersionAndHashMap.get(shadowIdxId).schemaVersion;
                 long originIndexId = indexIdMap.get(shadowIdxId);
+                TInvertedIndexFileStorageFormat invertedIndexFileStorageFormat =
+                        originIndexId == tbl.getBaseIndexId()
+                                ? tbl.getInvertedIndexFileStorageFormatForPartition(partitionId) : null;
                 KeysType originKeysType = tbl.getKeysTypeByIndexId(originIndexId);
                 List<Index> tabletIndexes = originIndexId == tbl.getBaseIndexId() ? indexes : null;
 
                 Cloud.CreateTabletsRequest.Builder requestBuilder =
-                        Cloud.CreateTabletsRequest.newBuilder();
+                        Cloud.CreateTabletsRequest.newBuilder()
+                                .setRequestIp(FrontendOptions.getLocalHostAddressCached());
                 for (Tablet shadowTablet : shadowIdx.getTablets()) {
                     OlapFile.TabletMetaCloudPB.Builder builder =
                             ((CloudInternalCatalog) Env.getCurrentInternalCatalog())
@@ -243,7 +258,7 @@ public class CloudSchemaChangeJobV2 extends SchemaChangeJobV2 {
                                             tbl.getStoragePolicy(), tbl.isInMemory(), true,
                                             tbl.getName(), tbl.getTTLSeconds(),
                                             tbl.getEnableUniqueKeyMergeOnWrite(), tbl.storeRowColumn(),
-                                            shadowSchemaVersion, tbl.getCompactionPolicy(),
+                                            shadowSchemaVersion, null, tbl.getCompactionPolicy(),
                                             tbl.getTimeSeriesCompactionGoalSizeMbytes(),
                                             tbl.getTimeSeriesCompactionFileCountThreshold(),
                                             tbl.getTimeSeriesCompactionTimeThresholdSeconds(),
@@ -251,11 +266,14 @@ public class CloudSchemaChangeJobV2 extends SchemaChangeJobV2 {
                                             tbl.getTimeSeriesCompactionLevelThreshold(),
                                             tbl.disableAutoCompaction(),
                                             tbl.getRowStoreColumnsUniqueIds(rowStoreColumns),
-                                            tbl.getInvertedIndexFileStorageFormat(),
+                                            invertedIndexFileStorageFormat,
                                             tbl.rowStorePageSize(),
                                             tbl.variantEnableFlattenNested(), clusterKeyUids,
                                             tbl.storagePageSize(), tbl.getTDEAlgorithmPB(),
-                                            tbl.storageDictPageSize(), true);
+                                            tbl.storageDictPageSize(), true,
+                                            columnSeqMapping,
+                                            tbl.getVerticalCompactionNumColumnsPerGroup(),
+                                            OlapFile.TabletRolePB.TABLET_ROLE_DATA);
                     requestBuilder.addTabletMetas(builder);
                 } // end for rollupTablets
                 requestBuilder.setDbId(dbId);

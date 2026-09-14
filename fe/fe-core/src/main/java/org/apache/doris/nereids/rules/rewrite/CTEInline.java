@@ -21,6 +21,7 @@ import org.apache.doris.nereids.jobs.JobContext;
 import org.apache.doris.nereids.trees.copier.DeepCopierContext;
 import org.apache.doris.nereids.trees.copier.LogicalPlanDeepCopier;
 import org.apache.doris.nereids.trees.expressions.Alias;
+import org.apache.doris.nereids.trees.expressions.CTEId;
 import org.apache.doris.nereids.trees.expressions.ExprId;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
@@ -33,6 +34,7 @@ import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalProject;
 import org.apache.doris.nereids.trees.plans.visitor.CustomRewriter;
 import org.apache.doris.nereids.trees.plans.visitor.DefaultPlanRewriter;
+import org.apache.doris.nereids.trees.plans.visitor.NondeterministicFunctionCollector;
 import org.apache.doris.qe.ConnectContext;
 
 import com.google.common.collect.ImmutableList;
@@ -40,6 +42,7 @@ import com.google.common.collect.Lists;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 
 /**
  * pull up LogicalCteAnchor to the top of plan to avoid CteAnchor break other rewrite rules pattern
@@ -48,9 +51,16 @@ import java.util.List;
  * and put all of them to the top of plan depends on dependency tree of them.
  */
 public class CTEInline extends DefaultPlanRewriter<LogicalCTEProducer<?>> implements CustomRewriter {
+    // all cte used by recursive cte's recursive child should be inline
+    private Set<CTEId> mustInlineCTEs;
 
     @Override
     public Plan rewriteRoot(Plan plan, JobContext jobContext) {
+        mustInlineCTEs = jobContext.getCascadesContext().getStatementContext().getMustInlineCTEs();
+        if (!mustInlineCTEs.isEmpty()) {
+            collectRecursiveCteDependencies(plan);
+        }
+
         Plan root = plan.accept(this, null);
         // collect cte id to consumer
         root.foreach(p -> {
@@ -59,6 +69,26 @@ public class CTEInline extends DefaultPlanRewriter<LogicalCTEProducer<?>> implem
             }
         });
         return root;
+    }
+
+    private void collectRecursiveCteDependencies(Plan plan) {
+        // Resolve the transitive dependencies before making any materialization decisions.
+        // Otherwise an outer producer can remain shared by independent recursive controllers
+        // even when its consumers are inside CTEs that must be inlined.
+        List<LogicalCTEProducer<?>> producers = plan.collectToList(p -> p instanceof LogicalCTEProducer);
+        boolean changed;
+        do {
+            changed = false;
+            for (LogicalCTEProducer<?> producer : producers) {
+                if (mustInlineCTEs.contains(producer.getCteId())) {
+                    List<LogicalCTEConsumer> consumers = producer.child()
+                            .collectToList(p -> p instanceof LogicalCTEConsumer);
+                    for (LogicalCTEConsumer consumer : consumers) {
+                        changed |= mustInlineCTEs.add(consumer.getCteId());
+                    }
+                }
+            }
+        } while (changed);
     }
 
     @Override
@@ -78,17 +108,26 @@ public class CTEInline extends DefaultPlanRewriter<LogicalCTEProducer<?>> implem
                 }
                 return false;
             });
-            ConnectContext connectContext = ConnectContext.get();
-            if (connectContext.getSessionVariable().enableCTEMaterialize
-                    && consumers.size() > connectContext.getSessionVariable().inlineCTEReferencedThreshold) {
-                // not inline
-                Plan right = cteAnchor.right().accept(this, null);
-                return cteAnchor.withChildren(cteAnchor.left(), right);
-            } else {
+            if (mustInlineCTEs.contains(cteAnchor.getCteId())) {
                 // should inline
                 Plan root = cteAnchor.right().accept(this, (LogicalCTEProducer<?>) cteAnchor.left());
                 // process child
                 return root.accept(this, null);
+            } else {
+                ConnectContext connectContext = ConnectContext.get();
+                LogicalCTEProducer<?> cteProducer = (LogicalCTEProducer<?>) cteAnchor.left();
+                if (connectContext.getSessionVariable().enableCTEMaterialize
+                        && (consumers.size() > connectContext.getSessionVariable().inlineCTEReferencedThreshold
+                                || containsNondeterministicFunction(cteProducer))) {
+                    // not inline
+                    Plan right = cteAnchor.right().accept(this, null);
+                    return cteAnchor.withChildren(cteAnchor.left(), right);
+                } else {
+                    // should inline
+                    Plan root = cteAnchor.right().accept(this, cteProducer);
+                    // process child
+                    return root.accept(this, null);
+                }
             }
         }
     }
@@ -112,5 +151,11 @@ public class CTEInline extends DefaultPlanRewriter<LogicalCTEProducer<?>> implem
             return new LogicalProject<>(projects, inlinedPlan);
         }
         return cteConsumer;
+    }
+
+    private boolean containsNondeterministicFunction(LogicalCTEProducer<?> producer) {
+        List<Expression> nondeterministicFunctions = new ArrayList<>();
+        producer.accept(NondeterministicFunctionCollector.INSTANCE, nondeterministicFunctions);
+        return !nondeterministicFunctions.isEmpty();
     }
 }

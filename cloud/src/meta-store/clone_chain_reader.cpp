@@ -146,7 +146,8 @@ TxnErrorCode CloneChainReader::get_table_versions(
 }
 
 TxnErrorCode CloneChainReader::get_partition_version(int64_t partition_id, VersionPB* version,
-                                                     Versionstamp* versionstamp, bool snapshot) {
+                                                     Versionstamp* versionstamp, bool snapshot,
+                                                     std::string* source_instance) {
     DCHECK(txn_kv_) << "TxnKv must be set before calling";
     if (!txn_kv_) {
         return TxnErrorCode::TXN_INVALID_ARGUMENT;
@@ -157,12 +158,13 @@ TxnErrorCode CloneChainReader::get_partition_version(int64_t partition_id, Versi
     if (err != TxnErrorCode::TXN_OK) {
         return err;
     }
-    return get_partition_version(txn.get(), partition_id, version, versionstamp, snapshot);
+    return get_partition_version(txn.get(), partition_id, version, versionstamp, snapshot,
+                                 source_instance);
 }
 
 TxnErrorCode CloneChainReader::get_partition_version(Transaction* txn, int64_t partition_id,
                                                      VersionPB* version, Versionstamp* versionstamp,
-                                                     bool snapshot) {
+                                                     bool snapshot, std::string* source_instance) {
     std::string current_instance_id(instance_id_);
     Versionstamp current_snapshot_version = snapshot_version_;
     do {
@@ -173,6 +175,9 @@ TxnErrorCode CloneChainReader::get_partition_version(Transaction* txn, int64_t p
             if (err == TxnErrorCode::TXN_OK) {
                 min_read_versionstamp_ =
                         std::min(reader.min_read_versionstamp(), min_read_versionstamp_);
+                if (source_instance) {
+                    *source_instance = current_instance_id;
+                }
             }
             return err;
         }
@@ -190,9 +195,77 @@ TxnErrorCode CloneChainReader::get_partition_version(Transaction* txn, int64_t p
     } while (true);
 }
 
+TxnErrorCode CloneChainReader::get_table_stream_offsets(
+        Transaction* txn, const std::vector<TableStreamPartitionSetPB>& bindings,
+        TableStreamOffsetMap* offsets, TableStreamOffsetVersionstampMap* versionstamps,
+        bool snapshot) {
+    std::string current_instance_id(instance_id_);
+    Versionstamp current_snapshot_version = snapshot_version_;
+    std::vector<TableStreamPartitionSetPB> remaining_bindings = bindings;
+
+    do {
+        MetaReader reader(current_instance_id, current_snapshot_version);
+        TableStreamOffsetMap current_offsets;
+        TableStreamOffsetVersionstampMap current_versionstamps;
+        TxnErrorCode err = reader.get_table_stream_offsets(
+                txn, remaining_bindings, &current_offsets, &current_versionstamps, snapshot);
+        if (err != TxnErrorCode::TXN_OK) {
+            return err;
+        }
+        min_read_versionstamp_ = std::min(reader.min_read_versionstamp(), min_read_versionstamp_);
+
+        for (auto& [stream_id, partition_offsets] : current_offsets) {
+            auto& output_offsets = (*offsets)[stream_id];
+            for (auto& [partition_id, offset] : partition_offsets) {
+                output_offsets.emplace(partition_id, std::move(offset));
+            }
+        }
+        if (versionstamps) {
+            for (const auto& [stream_id, partition_versionstamps] : current_versionstamps) {
+                auto& output_versionstamps = (*versionstamps)[stream_id];
+                for (const auto& [partition_id, versionstamp] : partition_versionstamps) {
+                    output_versionstamps.emplace(partition_id, versionstamp);
+                }
+            }
+        }
+
+        std::vector<TableStreamPartitionSetPB> new_remaining_bindings;
+        for (const TableStreamPartitionSetPB& binding : remaining_bindings) {
+            TableStreamPartitionSetPB remaining_binding;
+            remaining_binding.mutable_identity()->CopyFrom(binding.identity());
+            auto stream_it = current_offsets.find(binding.identity().stream_id());
+            for (int64_t partition_id : binding.partition_ids()) {
+                if (stream_it == current_offsets.end() ||
+                    !stream_it->second.contains(partition_id)) {
+                    remaining_binding.add_partition_ids(partition_id);
+                }
+            }
+            if (!remaining_binding.partition_ids().empty()) {
+                new_remaining_bindings.push_back(std::move(remaining_binding));
+            }
+        }
+        remaining_bindings = std::move(new_remaining_bindings);
+        if (remaining_bindings.empty()) {
+            break;
+        }
+
+        std::string previous_instance_id;
+        Versionstamp previous_snapshot_version;
+        if (!get_source_snapshot_info(current_instance_id, &previous_instance_id,
+                                      &previous_snapshot_version)) {
+            break;
+        }
+        current_instance_id = std::move(previous_instance_id);
+        current_snapshot_version = previous_snapshot_version;
+    } while (true);
+
+    return TxnErrorCode::TXN_OK;
+}
+
 TxnErrorCode CloneChainReader::get_partition_versions(
         const std::vector<int64_t>& partition_ids, std::unordered_map<int64_t, VersionPB>* versions,
-        std::unordered_map<int64_t, Versionstamp>* versionstamps, bool snapshot) {
+        std::unordered_map<int64_t, Versionstamp>* versionstamps, bool snapshot,
+        std::unordered_map<int64_t, std::string>* source_instances) {
     DCHECK(txn_kv_) << "TxnKv must be set before calling";
     if (!txn_kv_) {
         return TxnErrorCode::TXN_INVALID_ARGUMENT;
@@ -203,13 +276,15 @@ TxnErrorCode CloneChainReader::get_partition_versions(
     if (err != TxnErrorCode::TXN_OK) {
         return err;
     }
-    return get_partition_versions(txn.get(), partition_ids, versions, versionstamps, snapshot);
+    return get_partition_versions(txn.get(), partition_ids, versions, versionstamps, snapshot,
+                                  source_instances);
 }
 
 TxnErrorCode CloneChainReader::get_partition_versions(
         Transaction* txn, const std::vector<int64_t>& partition_ids,
         std::unordered_map<int64_t, VersionPB>* versions,
-        std::unordered_map<int64_t, Versionstamp>* versionstamps, bool snapshot) {
+        std::unordered_map<int64_t, Versionstamp>* versionstamps, bool snapshot,
+        std::unordered_map<int64_t, std::string>* source_instances) {
     std::string current_instance_id(instance_id_);
     Versionstamp current_snapshot_version = snapshot_version_;
     std::vector<int64_t> remaining_ids = partition_ids;
@@ -228,12 +303,17 @@ TxnErrorCode CloneChainReader::get_partition_versions(
         // Add found results to output
         if (versions) {
             for (const auto& [partition_id, version] : current_versions) {
-                (*versions)[partition_id] = std::move(version);
+                (*versions)[partition_id] = version;
             }
         }
         if (versionstamps) {
             for (const auto& [partition_id, versionstamp] : current_versionstamps) {
                 (*versionstamps)[partition_id] = versionstamp;
+            }
+        }
+        if (source_instances) {
+            for (const auto& [partition_id, _] : current_versions) {
+                (*source_instances)[partition_id] = current_instance_id;
             }
         }
 
@@ -683,6 +763,94 @@ TxnErrorCode CloneChainReader::get_tablet_indexes(
     return TxnErrorCode::TXN_OK;
 }
 
+TxnErrorCode CloneChainReader::get_partition_indexes(
+        Transaction* txn, const std::vector<int64_t>& partition_ids,
+        std::unordered_map<int64_t, PartitionIndexPB>* partition_indexes, bool snapshot) {
+    std::string current_instance_id(instance_id_);
+    Versionstamp current_snapshot_version = snapshot_version_;
+    std::vector<int64_t> remaining_ids = partition_ids;
+
+    do {
+        MetaReader reader(current_instance_id, current_snapshot_version);
+        std::unordered_map<int64_t, PartitionIndexPB> current_indexes;
+        TxnErrorCode err =
+                reader.get_partition_indexes(txn, remaining_ids, &current_indexes, snapshot);
+        if (err != TxnErrorCode::TXN_OK) {
+            return err;
+        }
+
+        for (auto& [partition_id, partition_index] : current_indexes) {
+            partition_indexes->emplace(partition_id, std::move(partition_index));
+        }
+
+        std::vector<int64_t> new_remaining_ids;
+        new_remaining_ids.reserve(remaining_ids.size() - current_indexes.size());
+        for (int64_t partition_id : remaining_ids) {
+            if (!current_indexes.contains(partition_id)) {
+                new_remaining_ids.push_back(partition_id);
+            }
+        }
+        remaining_ids = std::move(new_remaining_ids);
+        if (remaining_ids.empty()) {
+            break;
+        }
+
+        std::string previous_instance_id;
+        Versionstamp previous_snapshot_version;
+        if (!get_source_snapshot_info(current_instance_id, &previous_instance_id,
+                                      &previous_snapshot_version)) {
+            break;
+        }
+        current_instance_id = std::move(previous_instance_id);
+        current_snapshot_version = previous_snapshot_version;
+    } while (true);
+
+    return TxnErrorCode::TXN_OK;
+}
+
+TxnErrorCode CloneChainReader::get_existing_partitions(
+        Transaction* txn, const std::vector<int64_t>& partition_ids,
+        std::unordered_set<int64_t>* existing_partition_ids, bool snapshot) {
+    std::string current_instance_id(instance_id_);
+    Versionstamp current_snapshot_version = snapshot_version_;
+    std::vector<int64_t> remaining_ids = partition_ids;
+
+    do {
+        MetaReader reader(current_instance_id, current_snapshot_version);
+        std::unordered_set<int64_t> current_existing_ids;
+        TxnErrorCode err =
+                reader.get_existing_partitions(txn, remaining_ids, &current_existing_ids, snapshot);
+        if (err != TxnErrorCode::TXN_OK) {
+            return err;
+        }
+        min_read_versionstamp_ = std::min(reader.min_read_versionstamp(), min_read_versionstamp_);
+        existing_partition_ids->insert(current_existing_ids.begin(), current_existing_ids.end());
+
+        std::vector<int64_t> new_remaining_ids;
+        new_remaining_ids.reserve(remaining_ids.size() - current_existing_ids.size());
+        for (int64_t partition_id : remaining_ids) {
+            if (!current_existing_ids.contains(partition_id)) {
+                new_remaining_ids.push_back(partition_id);
+            }
+        }
+        remaining_ids = std::move(new_remaining_ids);
+        if (remaining_ids.empty()) {
+            break;
+        }
+
+        std::string previous_instance_id;
+        Versionstamp previous_snapshot_version;
+        if (!get_source_snapshot_info(current_instance_id, &previous_instance_id,
+                                      &previous_snapshot_version)) {
+            break;
+        }
+        current_instance_id = std::move(previous_instance_id);
+        current_snapshot_version = previous_snapshot_version;
+    } while (true);
+
+    return TxnErrorCode::TXN_OK;
+}
+
 TxnErrorCode CloneChainReader::get_tablet_meta(int64_t tablet_id, TabletMetaCloudPB* tablet_meta,
                                                Versionstamp* versionstamp, bool snapshot) {
     DCHECK(txn_kv_) << "TxnKv must be set before calling";
@@ -971,6 +1139,70 @@ TxnErrorCode CloneChainReader::get_load_rowset_meta(Transaction* txn, int64_t ta
     } while (true);
 }
 
+TxnErrorCode CloneChainReader::get_load_rowset_metas(
+        int64_t tablet_id, std::vector<std::pair<RowsetMetaCloudPB, Versionstamp>>* rowset_metas,
+        bool snapshot) {
+    DCHECK(txn_kv_) << "TxnKv must be set before calling";
+    if (!txn_kv_) {
+        return TxnErrorCode::TXN_INVALID_ARGUMENT;
+    }
+
+    std::unique_ptr<Transaction> txn;
+    TxnErrorCode err = txn_kv_->create_txn(&txn);
+    if (err != TxnErrorCode::TXN_OK) {
+        return err;
+    }
+    return get_load_rowset_metas(txn.get(), tablet_id, rowset_metas, snapshot);
+}
+
+TxnErrorCode CloneChainReader::get_load_rowset_metas(
+        Transaction* txn, int64_t tablet_id,
+        std::vector<std::pair<RowsetMetaCloudPB, Versionstamp>>* rowset_metas, bool snapshot) {
+    std::string current_instance_id(instance_id_);
+    Versionstamp current_snapshot_version = snapshot_version_;
+    std::map<int64_t, std::pair<RowsetMetaCloudPB, Versionstamp>> version_to_rowset;
+
+    do {
+        MetaReader reader(current_instance_id, current_snapshot_version);
+        std::vector<std::pair<RowsetMetaCloudPB, Versionstamp>> current_rowsets;
+        TxnErrorCode err = reader.get_load_rowset_metas(txn, tablet_id, &current_rowsets, snapshot);
+        if (err != TxnErrorCode::TXN_OK) {
+            return err;
+        }
+        min_read_versionstamp_ = std::min(reader.min_read_versionstamp(), min_read_versionstamp_);
+
+        // Add found rowsets to version_to_rowset map (only if not already found)
+        for (auto&& rowset_pair : current_rowsets) {
+            int64_t version = rowset_pair.first.end_version();
+            if (!version_to_rowset.contains(version)) {
+                if (!rowset_pair.first.has_reference_instance_id()) {
+                    rowset_pair.first.set_reference_instance_id(current_instance_id);
+                }
+                version_to_rowset[version] = std::move(rowset_pair);
+            }
+        }
+
+        // Try to find in previous clone chain
+        std::string prev_instance_id;
+        Versionstamp prev_snapshot_version;
+        if (!get_source_snapshot_info(current_instance_id, &prev_instance_id,
+                                      &prev_snapshot_version)) {
+            // no previous clone chain
+            break;
+        }
+        current_instance_id = std::move(prev_instance_id);
+        current_snapshot_version = prev_snapshot_version;
+    } while (true);
+
+    rowset_metas->clear();
+    rowset_metas->reserve(version_to_rowset.size());
+    for (auto&& [version, rowset_pair] : version_to_rowset) {
+        rowset_metas->push_back(std::move(rowset_pair));
+    }
+
+    return TxnErrorCode::TXN_OK;
+}
+
 TxnErrorCode CloneChainReader::get_compact_rowset_meta(int64_t tablet_id, int64_t version,
                                                        RowsetMetaCloudPB* rowset_meta,
                                                        Versionstamp* versionstamp, bool snapshot) {
@@ -1017,6 +1249,71 @@ TxnErrorCode CloneChainReader::get_compact_rowset_meta(Transaction* txn, int64_t
         current_instance_id = std::move(prev_instance_id);
         current_snapshot_version = prev_snapshot_version;
     } while (true);
+}
+
+TxnErrorCode CloneChainReader::get_compact_rowset_metas(
+        int64_t tablet_id, std::vector<std::pair<RowsetMetaCloudPB, Versionstamp>>* rowset_metas,
+        bool snapshot) {
+    DCHECK(txn_kv_) << "TxnKv must be set before calling";
+    if (!txn_kv_) {
+        return TxnErrorCode::TXN_INVALID_ARGUMENT;
+    }
+
+    std::unique_ptr<Transaction> txn;
+    TxnErrorCode err = txn_kv_->create_txn(&txn);
+    if (err != TxnErrorCode::TXN_OK) {
+        return err;
+    }
+    return get_compact_rowset_metas(txn.get(), tablet_id, rowset_metas, snapshot);
+}
+
+TxnErrorCode CloneChainReader::get_compact_rowset_metas(
+        Transaction* txn, int64_t tablet_id,
+        std::vector<std::pair<RowsetMetaCloudPB, Versionstamp>>* rowset_metas, bool snapshot) {
+    std::string current_instance_id(instance_id_);
+    Versionstamp current_snapshot_version = snapshot_version_;
+    std::map<int64_t, std::pair<RowsetMetaCloudPB, Versionstamp>> version_to_rowset;
+
+    do {
+        MetaReader reader(current_instance_id, current_snapshot_version);
+        std::vector<std::pair<RowsetMetaCloudPB, Versionstamp>> current_rowsets;
+        TxnErrorCode err =
+                reader.get_compact_rowset_metas(txn, tablet_id, &current_rowsets, snapshot);
+        if (err != TxnErrorCode::TXN_OK) {
+            return err;
+        }
+        min_read_versionstamp_ = std::min(reader.min_read_versionstamp(), min_read_versionstamp_);
+
+        // Add found rowsets to version_to_rowset map (only if not already found)
+        for (auto&& rowset_pair : current_rowsets) {
+            int64_t version = rowset_pair.first.end_version();
+            if (!version_to_rowset.contains(version)) {
+                if (!rowset_pair.first.has_reference_instance_id()) {
+                    rowset_pair.first.set_reference_instance_id(current_instance_id);
+                }
+                version_to_rowset[version] = std::move(rowset_pair);
+            }
+        }
+
+        // Try to find in previous clone chain
+        std::string prev_instance_id;
+        Versionstamp prev_snapshot_version;
+        if (!get_source_snapshot_info(current_instance_id, &prev_instance_id,
+                                      &prev_snapshot_version)) {
+            // no previous clone chain
+            break;
+        }
+        current_instance_id = std::move(prev_instance_id);
+        current_snapshot_version = prev_snapshot_version;
+    } while (true);
+
+    rowset_metas->clear();
+    rowset_metas->reserve(version_to_rowset.size());
+    for (auto&& [version, rowset_pair] : version_to_rowset) {
+        rowset_metas->push_back(std::move(rowset_pair));
+    }
+
+    return TxnErrorCode::TXN_OK;
 }
 
 TxnErrorCode CloneChainReader::get_partition_pending_txn_id(int64_t partition_id,

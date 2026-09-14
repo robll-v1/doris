@@ -41,14 +41,13 @@ import org.apache.doris.nereids.trees.plans.visitor.DefaultPlanRewriter;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.ConnectContextUtil;
 import org.apache.doris.qe.OriginStatement;
-import org.apache.doris.statistics.Statistics;
+import org.apache.doris.statistics.model.Statistics;
 
 import com.google.common.collect.ImmutableList;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.ArrayList;
-import java.util.BitSet;
 import java.util.List;
 import java.util.Optional;
 
@@ -182,7 +181,7 @@ public class MTMVCache {
         }, mvPlan, plan, false);
         // Construct structInfo once for use later
         Optional<StructInfo> structInfoOptional = MaterializationContext.constructStructInfo(mvPlan, plan,
-                cascadesContext, new BitSet());
+                cascadesContext);
         return Pair.of(mvPlan, structInfoOptional.orElse(null));
     }
 }

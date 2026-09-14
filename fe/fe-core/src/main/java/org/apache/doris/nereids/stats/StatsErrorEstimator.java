@@ -24,7 +24,7 @@ import org.apache.doris.nereids.trees.plans.AbstractPlan;
 import org.apache.doris.persist.gson.GsonUtils;
 import org.apache.doris.planner.PlanNode;
 import org.apache.doris.planner.PlanNodeId;
-import org.apache.doris.statistics.Statistics;
+import org.apache.doris.statistics.model.Statistics;
 import org.apache.doris.thrift.TReportExecStatusParams;
 import org.apache.doris.thrift.TRuntimeProfileNode;
 import org.apache.doris.thrift.TUniqueId;
@@ -118,18 +118,6 @@ public class StatsErrorEstimator {
             return -1;
         }
         return Integer.parseInt(m.group(1));
-    }
-
-    private Double extractRowsReturned(String rowsReturnedStr) {
-        if (rowsReturnedStr == null) {
-            return 0.0;
-        }
-        Pattern p = Pattern.compile("\\((\\d+)\\)");
-        Matcher m = p.matcher(rowsReturnedStr);
-        if (!m.find()) {
-            return 0.0;
-        }
-        return Double.parseDouble(m.group(1));
     }
 
     private double oneIfZero(double d) {

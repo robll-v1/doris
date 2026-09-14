@@ -19,10 +19,12 @@ package org.apache.doris.nereids.rules.rewrite;
 
 import org.apache.doris.nereids.CascadesContext;
 import org.apache.doris.nereids.hint.DistributeHint;
+import org.apache.doris.nereids.trees.expressions.Alias;
 import org.apache.doris.nereids.trees.expressions.EqualTo;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.MarkJoinSlotReference;
 import org.apache.doris.nereids.trees.expressions.literal.IntegerLiteral;
+import org.apache.doris.nereids.trees.expressions.literal.NullLiteral;
 import org.apache.doris.nereids.trees.plans.DistributeType;
 import org.apache.doris.nereids.trees.plans.JoinType;
 import org.apache.doris.nereids.trees.plans.logical.LogicalFilter;
@@ -52,6 +54,7 @@ class InferPredicatesTest extends TestWithFeService implements MemoPatternMatchS
         createTable("create table test.student (\n"
                 + "id int not null,\n"
                 + "name varchar(128),\n"
+                + "dt date,\n"
                 + "age int,sex int)\n"
                 + "distributed by hash(id) buckets 10\n"
                 + "properties('replication_num' = '1');");
@@ -59,6 +62,7 @@ class InferPredicatesTest extends TestWithFeService implements MemoPatternMatchS
         createTable("create table test.score (\n"
                 + "sid int not null, \n"
                 + "cid int not null, \n"
+                + "dt date,\n"
                 + "grade double)\n"
                 + "distributed by hash(sid,cid) buckets 10\n"
                 + "properties('replication_num' = '1');");
@@ -66,27 +70,28 @@ class InferPredicatesTest extends TestWithFeService implements MemoPatternMatchS
         createTable("create table test.course (\n"
                 + "id int not null, \n"
                 + "name varchar(128), \n"
+                + "dt date,\n"
                 + "teacher varchar(128))\n"
                 + "distributed by hash(id) buckets 10\n"
                 + "properties('replication_num' = '1');");
 
         createTables("create table test.subquery1\n"
-                        + "(k1 bigint, k2 bigint)\n"
+                        + "(k1 bigint, k2 bigint, dt date)\n"
                         + "duplicate key(k1)\n"
                         + "distributed by hash(k2) buckets 1\n"
                         + "properties('replication_num' = '1');\n",
                 "create table test.subquery2\n"
-                        + "(k1 varchar(10), k2 bigint)\n"
+                        + "(k1 varchar(10), k2 bigint, dt date)\n"
                         + "partition by range(k2)\n"
                         + "(partition p1 values less than(\"10\"))\n"
                         + "distributed by hash(k2) buckets 1\n"
                         + "properties('replication_num' = '1');",
                 "create table test.subquery3\n"
-                        + "(k1 int not null, k2 varchar(128), k3 bigint, v1 bigint, v2 bigint)\n"
+                        + "(k1 int not null, k2 varchar(128), k3 bigint, v1 bigint, v2 bigint, dt date)\n"
                         + "distributed by hash(k2) buckets 1\n"
                         + "properties('replication_num' = '1');",
                 "create table test.subquery4\n"
-                        + "(k1 bigint, k2 bigint)\n"
+                        + "(k1 bigint, k2 bigint, dt date)\n"
                         + "duplicate key(k1)\n"
                         + "distributed by hash(k2) buckets 1\n"
                         + "properties('replication_num' = '1');");
@@ -632,7 +637,9 @@ class InferPredicatesTest extends TestWithFeService implements MemoPatternMatchS
     }
 
     /**
-     * in this case, filter on relation s1 should not contain s1.id = 1.
+     * In this case, filter on relation s1 should not contain s1.id = 1. Constant propagation can eliminate
+     * the left outer join because s1.id = 2 makes its s1.id = 1 conjunct false, so verify the eliminated
+     * join keeps the s2 columns as NULL while preserving only the s1.id = 2 filter on the left child.
      */
     @Test
     void innerJoinShouldNotInferUnderLeftJoinOnClausePredicates() {
@@ -645,13 +652,18 @@ class InferPredicatesTest extends TestWithFeService implements MemoPatternMatchS
                 .printlnTree()
                 .matches(logicalProject(
                         logicalJoin(
-                                logicalFilter(
-                                        logicalOlapScan()
-                                ).when(filter -> filter.getConjuncts().size() == 1
-                                        && !ExpressionUtils.isInferred(filter.getPredicate())
-                                        && filter.getPredicate().toSql().contains("id = 2")),
+                                logicalProject(
+                                        logicalFilter(
+                                                logicalOlapScan()
+                                        ).when(filter -> filter.getConjuncts().size() == 1
+                                                && !ExpressionUtils.isInferred(filter.getPredicate())
+                                                && filter.getPredicate().toSql().contains("id = 2"))
+                                ).when(project -> project.getProjects().stream()
+                                        .filter(expression -> expression instanceof Alias
+                                                && expression.child(0) instanceof NullLiteral)
+                                        .count() == 3),
                                 any()
-                        ).when(join -> join.getJoinType() == JoinType.LEFT_OUTER_JOIN)
+                        ).when(join -> join.getJoinType() == JoinType.INNER_JOIN)
                 ));
     }
 
@@ -859,4 +871,49 @@ class InferPredicatesTest extends TestWithFeService implements MemoPatternMatchS
         Assertions.assertTrue(allPredicates.contains(leftPredicate));
         Assertions.assertFalse(allPredicates.contains(rightPredicate));
     }
+
+    @Test
+    void inferPredicatesLeftAsofLeft() {
+        String sql = "select * from student asof left join score match_condition(student.dt > score.dt) on student.id = score.sid where student.id > 1";
+
+        PlanChecker.from(connectContext)
+                .analyze(sql)
+                .rewrite()
+                .matches(
+                        logicalJoin(
+                                logicalFilter(
+                                        logicalOlapScan()
+                                ).when(filter -> !ExpressionUtils.isInferred(filter.getPredicate())
+                                        & filter.getPredicate().toSql().contains("id > 1")),
+                                logicalFilter(
+                                        logicalOlapScan()
+                                ).when(filter -> ExpressionUtils.isInferred(filter.getPredicate())
+                                        & filter.getPredicate().toSql().contains("sid > 1"))
+                        )
+                );
+    }
+
+    @Test
+    void inferPredicatesLeftAsofInner() {
+        // convert left join to inner join
+        String sql = "select * from student asof left join score match_condition(student.dt > score.dt) on student.id = score.sid where score.sid > 1";
+
+        PlanChecker.from(connectContext)
+                .analyze(sql)
+                .rewrite()
+                .printlnTree()
+                .matches(
+                        logicalJoin(
+                                logicalFilter(
+                                        logicalOlapScan()
+                                ).when(filter -> ExpressionUtils.isInferred(filter.getPredicate())
+                                        & filter.getPredicate().toSql().contains("id > 1")),
+                                logicalFilter(
+                                        logicalOlapScan()
+                                ).when(filter -> ExpressionUtils.isInferred(filter.getPredicate())
+                                        & filter.getPredicate().toSql().contains("sid > 1"))
+                        )
+                );
+    }
+
 }

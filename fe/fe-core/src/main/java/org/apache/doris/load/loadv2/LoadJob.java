@@ -430,6 +430,11 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback
                     id, this.state, jobState);
             return false;
         }
+        // RETRY closes the current attempt. The next attempt must enter PENDING before LOADING.
+        if (this.state == JobState.RETRY && jobState == JobState.LOADING) {
+            LOG.info("the load job {} is retrying, should not update state to {}", id, jobState);
+            return false;
+        }
         switch (jobState) {
             case UNKNOWN:
                 executeUnknown();
@@ -790,7 +795,7 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback
         jobInfo.add(TimeUtils.longToTimeString(finishTimestamp));
         // tracking url
         jobInfo.add(loadingStatus.getTrackingUrl());
-        jobInfo.add(loadStatistic.toJson());
+        jobInfo.add(getJobDetailsJson());
         // transaction id
         jobInfo.add(transactionId);
         // error tablets
@@ -818,6 +823,10 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback
 
     public String getResourceName() {
         return "N/A";
+    }
+
+    protected String getJobDetailsJson() {
+        return loadStatistic.toJson();
     }
 
     protected long getEtlStartTimestamp() {

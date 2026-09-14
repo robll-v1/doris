@@ -58,6 +58,12 @@ public class TruncateTableInfo implements Writable {
     private boolean force = true; // older version it was forced always.
     @SerializedName(value = "ur")
     private Map<Long, Long> updateRecords;
+    @SerializedName(value = "ut")
+    private long updateTime;
+    @SerializedName(value = "version")
+    private long version;
+    @SerializedName(value = "versionTime")
+    private long versionTimeMs;
 
     public TruncateTableInfo() {
 
@@ -66,7 +72,7 @@ public class TruncateTableInfo implements Writable {
     // for internal table
     public TruncateTableInfo(long dbId, String db, long tblId, String table, List<Partition> partitions,
             boolean isEntireTable, String rawSql, List<Partition> oldPartitions, boolean force,
-            Map<Long, Long> updateRecords) {
+            Map<Long, Long> updateRecords, long version, long versionTimeMs) {
         this.dbId = dbId;
         this.db = db;
         this.tblId = tblId;
@@ -79,14 +85,17 @@ public class TruncateTableInfo implements Writable {
         }
         this.force = force;
         this.updateRecords = updateRecords;
+        this.version = version;
+        this.versionTimeMs = versionTimeMs;
     }
 
     // for external table
-    public TruncateTableInfo(String ctl, String db, String table, List<String> partNames) {
+    public TruncateTableInfo(String ctl, String db, String table, List<String> partNames, long updateTime) {
         this.ctl = ctl;
         this.db = db;
         this.table = table;
         this.extPartNames = partNames;
+        this.updateTime = updateTime;
     }
 
     public String getCtl() {
@@ -135,6 +144,18 @@ public class TruncateTableInfo implements Writable {
 
     public Map<Long, Long> getUpdateRecords() {
         return updateRecords;
+    }
+
+    public long getUpdateTime() {
+        return updateTime;
+    }
+
+    public long getVersion() {
+        return version;
+    }
+
+    public long getVersionTimeMs() {
+        return versionTimeMs;
     }
 
     public static TruncateTableInfo read(DataInput in) throws IOException {

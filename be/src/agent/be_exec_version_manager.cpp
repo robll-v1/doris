@@ -110,10 +110,31 @@ void BeExecVersionManager::check_function_compatibility(int current_be_exec_vers
  *
  * 7: start from doris 3.0.2
  *    a. window funnel logic change
-*     b. support const column in serialize/deserialize function: PR #41175
+ *    b. support const column in serialize/deserialize function: PR #41175
  */
 
-const int BeExecVersionManager::max_be_exec_version = 8;
+// /////////////////////////////////////////////////////////////////////////////
+// ATTN: !!! BE EXEC VERSION IS A VERY SENSITIVE COMPATIBILITY FIELD !!!
+// 1. We should avoid abusing be_exec_version, especially not using it to handle
+//    compatibility issues of functions (use function aliases for that instead).
+// 2. Do not fork versions in past releases; all new be exec versions should
+//    first go into master before entering new release versions.
+// !!! DO NOT CHANGE IT UNLESS YOU ARE 100% SURE WHAT YOU ARE DOING !!!
+// /////////////////////////////////////////////////////////////////////////////
+
+// 10: start from doris 4.0.3
+//   a. use new fixed object serialization way.
+// 11: start from master
+//   a. enforce Iceberg SQL MERGE cardinality only when every executing BE supports it.
+// 12: start from master
+//   a. support Variant columns and delete-only writer omission in Iceberg SQL MERGE.
+// 13: start from master
+//   a. support strict ownership hash routing for external table sink writers.
+//   b. support Paimon default fixed-bucket routing in the external sink exchange.
+// 14: start from master
+//   a. support TIMESTAMP_NS in Thrift descriptors and PBlock exchange.
+
+const int BeExecVersionManager::max_be_exec_version = SUPPORT_TIMESTAMP_NS_VERSION;
 const int BeExecVersionManager::min_be_exec_version = 0;
 std::map<std::string, std::set<int>> BeExecVersionManager::_function_change_map {};
 std::set<std::string> BeExecVersionManager::_function_restrict_map;

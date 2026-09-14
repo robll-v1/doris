@@ -42,10 +42,9 @@ import org.apache.doris.nereids.util.PlanChecker;
 import org.apache.doris.qe.SessionVariable;
 
 import com.google.common.collect.ImmutableList;
-import mockit.Mock;
-import mockit.MockUp;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 
 import java.util.BitSet;
 import java.util.HashMap;
@@ -60,14 +59,11 @@ public class PreMaterializedViewRewriterTest extends SqlTestBase {
 
     @Test
     public void testShouldNotRecordTmpPlanWhenNoMv() {
-        connectContext.getSessionVariable().setDisableNereidsRules("PRUNE_EMPTY_PARTITION");
+        connectContext.getSessionVariable().setDisableNereidsRules("PRUNE_EMPTY_PARTITION, ELIMINATE_GROUP_BY_KEY");
         BitSet disableNereidsRules = connectContext.getSessionVariable().getDisableNereidsRules();
-        new MockUp<SessionVariable>() {
-            @Mock
-            public BitSet getDisableNereidsRules() {
-                return disableNereidsRules;
-            }
-        };
+        SessionVariable spySv = Mockito.spy(connectContext.getSessionVariable());
+        Mockito.doReturn(disableNereidsRules).when(spySv).getDisableNereidsRules();
+        connectContext.setSessionVariable(spySv);
         connectContext.getSessionVariable().enableMaterializedViewRewrite = true;
         connectContext.getSessionVariable().enableMaterializedViewNestRewrite = true;
         connectContext.getSessionVariable().setPreMaterializedViewRewriteStrategy(
@@ -2956,6 +2952,19 @@ public class PreMaterializedViewRewriterTest extends SqlTestBase {
         Assertions.assertTrue(PreMaterializedViewRewriter.needPreRewrite(cascadesContext));
     }
 
+    /**
+     * Test pre-materialized view rewrite need pre-rewrite when ELIMINATE_GROUP_BY_KEY applied
+     * */
+    @Test
+    public void testNeedPreRewriteForEliminateGroupByKey() {
+        CascadesContext cascadesContext = MemoTestUtils.createCascadesContext("select T1.id from T1");
+        StatementContext statementContext = cascadesContext.getConnectContext().getStatementContext();
+        statementContext.setForceRecordTmpPlan(true);
+        statementContext.ruleSetApplied(RuleType.ELIMINATE_GROUP_BY_KEY);
+        statementContext.getPlannerHooks().add(InitMaterializationContextHook.INSTANCE);
+        statementContext.getTmpPlanForMvRewrite().add(cascadesContext.getRewritePlan());
+    }
+
     private void checkIfEquals(String originalSql, List<String> equivalentSqlList) {
         // init original cascades context
         CascadesContext originalCascadesContext = initOriginal(originalSql);
@@ -2967,9 +2976,9 @@ public class PreMaterializedViewRewriterTest extends SqlTestBase {
         // extract plan from memo and check is equals or not
         Memo memo = cascadesContext.getMemo();
         for (Map.Entry<BitSet, LogicalPlan> planEntry : bitSetLogicalPlanMap.entrySet()) {
-            memo.incrementAndGetRefreshVersion();
+            memo.incrementAndGetRefreshVersion(planEntry.getKey());
             StructInfo structInfo = memo.getRoot().getStructInfoMap().getStructInfo(cascadesContext,
-                    planEntry.getKey(), memo.getRoot(), null, true);
+                    planEntry.getKey(), memo.getRoot(), null, true, false);
             Assertions.assertNotNull(structInfo);
             Assertions.assertTrue(structInfo.getOriginalPlan().deepEquals(planEntry.getValue()));
         }
@@ -2977,6 +2986,7 @@ public class PreMaterializedViewRewriterTest extends SqlTestBase {
 
     private CascadesContext initOriginal(String sql) {
         CascadesContext cascadesContext = createCascadesContext(sql, connectContext);
+        connectContext.setThreadLocalInfo();
         PlanChecker.from(cascadesContext).analyze().rewrite();
         return cascadesContext;
     }

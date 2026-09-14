@@ -17,17 +17,12 @@
 
 package org.apache.doris.nereids.types;
 
-import org.apache.doris.analysis.Expr;
-import org.apache.doris.catalog.BuiltinAggregateFunctions;
 import org.apache.doris.catalog.Type;
-import org.apache.doris.nereids.trees.expressions.Expression;
-import org.apache.doris.nereids.trees.expressions.SlotReference;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -60,36 +55,42 @@ public class AggStateType extends DataType {
             .put("var_samp", "variance_samp")
             .put("hist", "histogram")
             .put("map_agg", "map_agg_v2")
+            .put("window_funnel", "window_funnel_v2")
             .build();
 
+    private final String functionName;
     private final List<DataType> subTypes;
     private final List<Boolean> subTypeNullables;
-    private final String functionName;
+    private final boolean returnNullable;
+    // Planning-only coercion policy; it is not part of the serialized AggState type identity.
+    private final boolean looseTypeCoercionAllowed;
 
     /**
      * Constructor for AggStateType
      * @param functionName     nested function's name
      * @param subTypes         nested function's argument list
      * @param subTypeNullables nested nested function's argument's nullable list
+     * @param returnNullable nested function's return nullable
      */
-    public AggStateType(String functionName, List<DataType> subTypes, List<Boolean> subTypeNullables) {
+    public AggStateType(String functionName, List<DataType> subTypes,
+            List<Boolean> subTypeNullables, boolean returnNullable) {
+        this(functionName, subTypes, subTypeNullables, returnNullable, true);
+    }
+
+    /** Constructor with a planning-time type coercion policy. */
+    public AggStateType(String functionName, List<DataType> subTypes,
+            List<Boolean> subTypeNullables, boolean returnNullable, boolean looseTypeCoercionAllowed) {
+        // be only supports lowercase function names
+        Objects.requireNonNull(functionName, "functionName should not be null");
+        functionName = functionName.toLowerCase(Locale.ROOT);
+        this.functionName = aliasToName.getOrDefault(functionName, functionName);
         this.subTypes = ImmutableList.copyOf(Objects.requireNonNull(subTypes, "subTypes should not be null"));
         this.subTypeNullables = ImmutableList
                 .copyOf(Objects.requireNonNull(subTypeNullables, "subTypeNullables should not be null"));
         Preconditions.checkState(subTypes.size() == subTypeNullables.size(),
                 "AggStateType' subTypes.size()!=subTypeNullables.size()");
-        Objects.requireNonNull(functionName, "functionName should not be null");
-        // be only supports lowercase function names
-        functionName = functionName.toLowerCase(Locale.ROOT);
-        this.functionName = aliasToName.getOrDefault(functionName, functionName);
-    }
-
-    public List<Expression> getMockedExpressions() {
-        List<Expression> result = new ArrayList<Expression>();
-        for (int i = 0; i < subTypes.size(); i++) {
-            result.add(new SlotReference("mocked", subTypes.get(i), subTypeNullables.get(i)));
-        }
-        return result;
+        this.returnNullable = returnNullable;
+        this.looseTypeCoercionAllowed = looseTypeCoercionAllowed;
     }
 
     public List<DataType> getSubTypes() {
@@ -104,17 +105,21 @@ public class AggStateType extends DataType {
         return functionName;
     }
 
+    public boolean isLooseTypeCoercionAllowed() {
+        return looseTypeCoercionAllowed;
+    }
+
     @Override
     public Type toCatalogDataType() {
         List<Type> types = subTypes.stream().map(DataType::toCatalogDataType).collect(Collectors.toList());
-        return Expr.createAggStateType(functionName, types, subTypeNullables,
-                BuiltinAggregateFunctions.INSTANCE.aggFuncNameNullableMap.get(functionName));
+        return new org.apache.doris.catalog.AggStateType(functionName, returnNullable, types, subTypeNullables);
     }
 
     @Override
     public DataType conversion() {
-        return new AggStateType(functionName, subTypes.stream().map(DataType::conversion).collect(Collectors.toList()),
-                subTypeNullables);
+        return new AggStateType(functionName,
+                subTypes.stream().map(DataType::conversion).collect(Collectors.toList()),
+                subTypeNullables, returnNullable, looseTypeCoercionAllowed);
     }
 
     @Override

@@ -19,7 +19,7 @@
 
 #include <bthread/mutex.h>
 
-#include "olap/delta_writer.h"
+#include "load/delta_writer/delta_writer.h"
 #include "runtime/workload_management/resource_context.h"
 
 namespace doris {
@@ -31,11 +31,17 @@ class CloudDeltaWriter final : public BaseDeltaWriter {
 public:
     CloudDeltaWriter(CloudStorageEngine& engine, const WriteRequest& req, RuntimeProfile* profile,
                      const UniqueId& load_id);
+    CloudDeltaWriter(CloudStorageEngine& engine, const WriteRequest& group_build_req,
+                     const WriteRequest& sub_data_req, const WriteRequest& sub_row_binlog_req,
+                     RuntimeProfile* profile, const UniqueId& load_id);
     ~CloudDeltaWriter() override;
 
-    Status write(const vectorized::Block* block, const DorisVector<uint32_t>& row_idxs) override;
+    Status write(const Block* block, const TabletAddRowsPayload& rows,
+                 bool* memtable_flushed = nullptr) override;
 
     Status close() override;
+
+    Status flush_memtable_async() override;
 
     Status cancel_with_status(const Status& st) override;
 
@@ -43,15 +49,13 @@ public:
 
     void update_tablet_stats();
 
-    const RowsetMetaSharedPtr& rowset_meta();
-
     bool is_init() const { return _is_init; }
 
     static Status batch_init(std::vector<CloudDeltaWriter*> writers);
 
     Status commit_rowset();
 
-    Status set_txn_related_delete_bitmap();
+    Status set_txn_related_info();
     std::shared_ptr<ResourceContext> resource_context() { return _resource_ctx; }
 
 private:
@@ -62,7 +66,6 @@ private:
     Status _commit_empty_rowset();
 
     bthread::Mutex _mtx;
-    CloudStorageEngine& _engine;
     std::shared_ptr<ResourceContext> _resource_ctx;
 };
 

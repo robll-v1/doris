@@ -32,10 +32,11 @@ import org.apache.doris.nereids.trees.plans.JoinType;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.PlanType;
 import org.apache.doris.nereids.trees.plans.algebra.Join;
+import org.apache.doris.nereids.trees.plans.algebra.ShuffleType;
 import org.apache.doris.nereids.util.ExpressionUtils;
 import org.apache.doris.nereids.util.JoinUtils;
 import org.apache.doris.nereids.util.Utils;
-import org.apache.doris.statistics.Statistics;
+import org.apache.doris.statistics.model.Statistics;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableList.Builder;
@@ -65,7 +66,6 @@ public abstract class AbstractPhysicalJoin<
     protected final List<Expression> markJoinConjuncts;
     protected final DistributeHint hint;
     protected final Optional<MarkJoinSlotReference> markJoinSlotReference;
-    protected final List<RuntimeFilter> runtimeFilters = Lists.newArrayList();
 
     // use for translate only
     protected final List<Expression> filterConjuncts = Lists.newArrayList();
@@ -239,14 +239,6 @@ public abstract class AbstractPhysicalJoin<
         return physicalJoin;
     }
 
-    public void addRuntimeFilter(RuntimeFilter rf) {
-        runtimeFilters.add(rf);
-    }
-
-    public List<RuntimeFilter> getRuntimeFilters() {
-        return runtimeFilters;
-    }
-
     @Override
     public List<Slot> computeOutput() {
         return ImmutableList.<Slot>builder()
@@ -299,10 +291,6 @@ public abstract class AbstractPhysicalJoin<
             args.add("RFs");
             args.add(runtimeFilters.stream().map(rf -> rf.toString() + " ").collect(Collectors.toList()));
         }
-        if (!runtimeFiltersV2.isEmpty()) {
-            args.add("RFV2");
-            args.add(runtimeFiltersV2);
-        }
         return Utils.toSqlString(this.getClass().getSimpleName() + "[" + id.asInt() + "]" + getGroupIdWithPrefix(),
                 args.toArray());
     }
@@ -320,7 +308,8 @@ public abstract class AbstractPhysicalJoin<
         return false;
     }
 
-    protected Join.ShuffleType shuffleType() {
+    /**shuffleType*/
+    public ShuffleType shuffleType() {
         if (left() instanceof PhysicalDistribute) {
             if (right() instanceof PhysicalDistribute) {
                 return ShuffleType.shuffle;

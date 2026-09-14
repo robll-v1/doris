@@ -17,18 +17,31 @@
 
 package org.apache.doris.nereids.rules.rewrite;
 
+import org.apache.doris.analysis.ColumnAccessPathType;
 import org.apache.doris.nereids.StatementContext;
 import org.apache.doris.nereids.rules.rewrite.AccessPathExpressionCollector.CollectAccessPathResult;
+import org.apache.doris.nereids.rules.rewrite.AccessPathExpressionCollector.CollectorContext;
 import org.apache.doris.nereids.trees.expressions.Alias;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
 import org.apache.doris.nereids.trees.expressions.Slot;
+import org.apache.doris.nereids.trees.expressions.SlotReference;
+import org.apache.doris.nereids.trees.expressions.functions.Function;
+import org.apache.doris.nereids.trees.expressions.functions.generator.Explode;
+import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeMap;
+import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeMapOuter;
+import org.apache.doris.nereids.trees.expressions.functions.generator.ExplodeOuter;
+import org.apache.doris.nereids.trees.expressions.functions.generator.PosExplode;
+import org.apache.doris.nereids.trees.expressions.functions.generator.PosExplodeOuter;
+import org.apache.doris.nereids.trees.expressions.literal.StructLiteral;
 import org.apache.doris.nereids.trees.plans.Plan;
+import org.apache.doris.nereids.trees.plans.logical.LogicalAggregate;
 import org.apache.doris.nereids.trees.plans.logical.LogicalCTEAnchor;
 import org.apache.doris.nereids.trees.plans.logical.LogicalCTEConsumer;
 import org.apache.doris.nereids.trees.plans.logical.LogicalCTEProducer;
 import org.apache.doris.nereids.trees.plans.logical.LogicalFileScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalFilter;
+import org.apache.doris.nereids.trees.plans.logical.LogicalGenerate;
 import org.apache.doris.nereids.trees.plans.logical.LogicalOlapScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalProject;
 import org.apache.doris.nereids.trees.plans.logical.LogicalTVFRelation;
@@ -45,23 +58,186 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Set;
+import java.util.TreeSet;
 
 /** AccessPathPlanCollector */
 public class AccessPathPlanCollector extends DefaultPlanVisitor<Void, StatementContext> {
     private Multimap<Integer, CollectAccessPathResult> allSlotToAccessPaths = LinkedHashMultimap.create();
     private Map<Slot, List<CollectAccessPathResult>> scanSlotToAccessPaths = new LinkedHashMap<>();
+    private boolean skipMetaPath;
+
+    public void setSkipMetaPath(boolean skipMetaPath) {
+        this.skipMetaPath = skipMetaPath;
+    }
 
     public Map<Slot, List<CollectAccessPathResult>> collect(Plan root, StatementContext context) {
         root.accept(this, context);
         return scanSlotToAccessPaths;
     }
 
+    private boolean shouldCollectAccessPath(Slot slot) {
+        return slot.getDataType() instanceof NestedColumnPrunable
+                || slot.getDataType().isVariantType()
+                || slot.getDataType().isStringLikeType()
+                || slot.nullable();
+    }
+
+    @Override
+    public Void visitLogicalGenerate(LogicalGenerate<? extends Plan> generate, StatementContext context) {
+        List<Function> generators = generate.getGenerators();
+        List<Slot> output = generate.getGeneratorOutput();
+
+        AccessPathExpressionCollector exprCollector
+                = new AccessPathExpressionCollector(context, allSlotToAccessPaths, false, skipMetaPath);
+        for (int i = 0; i < output.size(); i++) {
+            Slot generatorOutput = output.get(i);
+            Function function = generators.get(i);
+            Collection<CollectAccessPathResult> accessPaths = allSlotToAccessPaths.get(
+                    generatorOutput.getExprId().asInt());
+            if (function instanceof Explode || function instanceof ExplodeOuter) {
+                if (accessPaths.isEmpty()) {
+                    // use the whole column
+                    for (Expression child : function.children()) {
+                        exprCollector.collect(child);
+                    }
+                } else {
+                    for (CollectAccessPathResult accessPath : accessPaths) {
+                        List<String> path = accessPath.getPath();
+                        if (function.arity() == 1) {
+                            // $c$1.VALUES.b
+                            CollectorContext argumentContext = new CollectorContext(context, false);
+                            argumentContext.setType(accessPath.getType());
+                            if (function.child(0).getDataType().isVariantType()) {
+                                argumentContext.getAccessPathBuilder()
+                                        .addSuffix(path.subList(1, path.size()));
+                            } else {
+                                argumentContext.getAccessPathBuilder()
+                                        .addSuffix(AccessPathInfo.ACCESS_ALL)
+                                        .addSuffix(path.subList(1, path.size()));
+                            }
+                            function.child(0).accept(exprCollector, argumentContext);
+                            continue;
+                        } else if (path.size() >= 2) {
+                            // $c$1.col1.VALUES.b will be extract 'col1'
+                            String colName = path.get(1);
+                            // extract '1' in 'col1'
+                            int colIndex = Integer.parseInt(colName.substring(StructLiteral.COL_PREFIX.length())) - 1;
+                            CollectorContext argumentContext = new CollectorContext(context, false);
+                            argumentContext.setType(accessPath.getType());
+                            if (function.child(colIndex).getDataType().isVariantType()) {
+                                argumentContext.getAccessPathBuilder()
+                                        .addSuffix(path.subList(2, path.size()));
+                            } else {
+                                argumentContext.getAccessPathBuilder()
+                                        .addSuffix(AccessPathInfo.ACCESS_ALL)
+                                        .addSuffix(path.subList(2, path.size()));
+                            }
+                            function.child(colIndex).accept(exprCollector, argumentContext);
+                            continue;
+                        }
+                        // use the whole column
+                        for (Expression child : function.children()) {
+                            exprCollector.collect(child);
+                        }
+                    }
+                }
+            } else if (function instanceof ExplodeMap || function instanceof ExplodeMapOuter) {
+                if (accessPaths.isEmpty()) {
+                    // use the whole column
+                    for (Expression child : function.children()) {
+                        exprCollector.collect(child);
+                    }
+                } else {
+                    for (CollectAccessPathResult accessPath : accessPaths) {
+                        List<String> path = accessPath.getPath();
+                        if (path.size() >= 2) {
+                            if (path.get(1).equalsIgnoreCase(StructLiteral.COL_PREFIX + "1")) {
+                                // key
+                                for (Expression child : function.children()) {
+                                    CollectorContext argumentContext = new CollectorContext(context, false);
+                                    argumentContext.setType(accessPath.getType());
+                                    argumentContext.getAccessPathBuilder()
+                                            .addSuffix(AccessPathInfo.ACCESS_MAP_KEYS)
+                                            .addSuffix(path.subList(2, path.size()));
+                                    child.accept(exprCollector, argumentContext);
+                                }
+                                continue;
+                            } else if (path.get(1).equalsIgnoreCase(StructLiteral.COL_PREFIX + "2")) {
+                                // value
+                                for (Expression child : function.children()) {
+                                    CollectorContext argumentContext = new CollectorContext(context, false);
+                                    argumentContext.setType(accessPath.getType());
+                                    argumentContext.getAccessPathBuilder()
+                                            .addSuffix(AccessPathInfo.ACCESS_MAP_VALUES)
+                                            .addSuffix(path.subList(2, path.size()));
+                                    child.accept(exprCollector, argumentContext);
+                                }
+                                continue;
+                            }
+                        }
+                        // use the whole column
+                        exprCollector.collect(function.child(0));
+                    }
+                }
+            } else if (function instanceof PosExplode || function instanceof PosExplodeOuter) {
+                if (accessPaths.isEmpty()) {
+                    // use the whole column
+                    for (Expression child : function.children()) {
+                        exprCollector.collect(child);
+                    }
+                } else {
+                    boolean useWholeItem = false;
+                    Set<Integer> prunedChildIndex = new TreeSet<>();
+                    for (CollectAccessPathResult accessPath : accessPaths) {
+                        List<String> path = accessPath.getPath();
+                        if (path.size() >= 2) {
+                            // $c$1.col1.VALUES.b will be extract 'col1'
+                            String colName = path.get(1);
+                            if (colName.startsWith(StructLiteral.COL_PREFIX)) {
+                                // $c$1.col1.VALUES.b will be extract 'col1'
+                                // extract '1' in 'col1'
+                                int colIndex
+                                        = Integer.parseInt(colName.substring(StructLiteral.COL_PREFIX.length())) - 1;
+                                CollectorContext argumentContext = new CollectorContext(context, false);
+                                argumentContext.setType(accessPath.getType());
+                                argumentContext.getAccessPathBuilder()
+                                        .addSuffix(AccessPathInfo.ACCESS_ALL)
+                                        .addSuffix(path.subList(2, path.size()));
+                                function.child(colIndex).accept(exprCollector, argumentContext);
+                                prunedChildIndex.add(colIndex);
+                            }
+                        } else {
+                            useWholeItem = true;
+                            break;
+                        }
+                    }
+                    if (useWholeItem) {
+                        // use the whole column
+                        for (Expression child : function.children()) {
+                            exprCollector.collect(child);
+                        }
+                    } else {
+                        for (int j = 0; j < function.arity(); j++) {
+                            if (!prunedChildIndex.contains(j)) {
+                                exprCollector.collect(function.child(j));
+                            }
+                        }
+                    }
+                }
+            } else {
+                exprCollector.collect(function);
+            }
+        }
+        return generate.child().accept(this, context);
+    }
+
     @Override
     public Void visitLogicalProject(LogicalProject<? extends Plan> project, StatementContext context) {
         AccessPathExpressionCollector exprCollector
-                = new AccessPathExpressionCollector(context, allSlotToAccessPaths, false);
+                = new AccessPathExpressionCollector(context, allSlotToAccessPaths, false, skipMetaPath);
         for (NamedExpression output : project.getProjects()) {
-            // e.g. select struct_element(s, 'city') from (select s from tbl)a;
+            // e.g. select element_at(s, 'city') from (select s from tbl)a;
             // we will not treat the inner `s` access all path
             if (output instanceof Slot && allSlotToAccessPaths.containsKey(output.getExprId().asInt())) {
                 continue;
@@ -70,7 +246,26 @@ public class AccessPathPlanCollector extends DefaultPlanVisitor<Void, StatementC
                 Slot innerSlot = (Slot) output.child(0);
                 Collection<CollectAccessPathResult> outerSlotAccessPaths = allSlotToAccessPaths.get(
                         output.getExprId().asInt());
-                allSlotToAccessPaths.putAll(innerSlot.getExprId().asInt(), outerSlotAccessPaths);
+                for (CollectAccessPathResult outerSlotAccessPath : outerSlotAccessPaths) {
+                    List<String> outerPath = outerSlotAccessPath.getPath();
+                    List<String> replaceSlotNamePath = new ArrayList<>();
+                    replaceSlotNamePath.add(innerSlot.getName());
+                    if (outerPath.size() == 1 && innerSlot instanceof SlotReference
+                            && ((SlotReference) innerSlot).hasSubColPath()) {
+                        // A whole access to a derived subcolumn slot is whole only relative to that
+                        // slot; preserve its physical leaf path when propagating to the scan slot.
+                        replaceSlotNamePath.addAll(((SlotReference) innerSlot).getSubPath());
+                    }
+                    replaceSlotNamePath.addAll(outerPath.subList(1, outerPath.size()));
+                    allSlotToAccessPaths.put(
+                            innerSlot.getExprId().asInt(),
+                            new CollectAccessPathResult(
+                                    replaceSlotNamePath,
+                                    outerSlotAccessPath.isPredicate(),
+                                    outerSlotAccessPath.getType()
+                            )
+                    );
+                }
             } else {
                 exprCollector.collect(output);
             }
@@ -83,6 +278,15 @@ public class AccessPathPlanCollector extends DefaultPlanVisitor<Void, StatementC
         boolean bottomFilter = filter.child().arity() == 0;
         collectByExpressions(filter, context, bottomFilter);
         return filter.child().accept(this, context);
+    }
+
+    @Override
+    public Void visitLogicalAggregate(LogicalAggregate<? extends Plan> aggregate, StatementContext context) {
+        // Collect access paths from aggregate expressions (e.g. sum(length(str_col))) before
+        // visiting children so that when the bottom project is processed next, str_col's offset
+        // path is already recorded and the direct-DATA suppression guard can fire correctly.
+        collectByExpressions(aggregate, context);
+        return aggregate.child().accept(this, context);
     }
 
     @Override
@@ -102,7 +306,7 @@ public class AccessPathPlanCollector extends DefaultPlanVisitor<Void, StatementC
         for (Entry<Slot, Slot> slots : cteConsumer.getConsumerToProducerOutputMap().entrySet()) {
             Slot outerSlot = slots.getKey();
 
-            if (outerSlot.getDataType() instanceof NestedColumnPrunable) {
+            if (shouldCollectAccessPath(outerSlot)) {
                 int outerSlotId = outerSlot.getExprId().asInt();
                 int innerSlotId = slots.getValue().getExprId().asInt();
                 allSlotToAccessPaths.putAll(innerSlotId, allSlotToAccessPaths.get(outerSlotId));
@@ -121,7 +325,7 @@ public class AccessPathPlanCollector extends DefaultPlanVisitor<Void, StatementC
         // now we will not prune complex type through union, because we can not prune the complex type's literal,
         // for example, we can not prune the literal now: array(map(1, named_struct('a', 100, 'b', 100))),
         // so we can not prune this sql:
-        // select struct_element(map_values(s[0]), 'a')
+        // select element_at(map_values(s[0]), 'a')
         // from (
         //     select s from tbl
         //     union all
@@ -138,7 +342,7 @@ public class AccessPathPlanCollector extends DefaultPlanVisitor<Void, StatementC
     @Override
     public Void visitLogicalOlapScan(LogicalOlapScan olapScan, StatementContext context) {
         for (Slot slot : olapScan.getOutput()) {
-            if (!(slot.getDataType() instanceof NestedColumnPrunable)) {
+            if (!shouldCollectAccessPath(slot)) {
                 continue;
             }
             Collection<CollectAccessPathResult> accessPaths = allSlotToAccessPaths.get(slot.getExprId().asInt());
@@ -152,12 +356,13 @@ public class AccessPathPlanCollector extends DefaultPlanVisitor<Void, StatementC
     @Override
     public Void visitLogicalFileScan(LogicalFileScan fileScan, StatementContext context) {
         for (Slot slot : fileScan.getOutput()) {
-            if (!(slot.getDataType() instanceof NestedColumnPrunable)) {
+            if (!shouldCollectAccessPath(slot)) {
                 continue;
             }
             Collection<CollectAccessPathResult> accessPaths = allSlotToAccessPaths.get(slot.getExprId().asInt());
             if (!accessPaths.isEmpty()) {
-                scanSlotToAccessPaths.put(slot, new ArrayList<>(accessPaths));
+                scanSlotToAccessPaths.put(
+                        slot, normalizeDataSkippingOnlyAccessPaths(accessPaths));
             }
         }
         return null;
@@ -166,12 +371,13 @@ public class AccessPathPlanCollector extends DefaultPlanVisitor<Void, StatementC
     @Override
     public Void visitLogicalTVFRelation(LogicalTVFRelation tvfRelation, StatementContext context) {
         for (Slot slot : tvfRelation.getOutput()) {
-            if (!(slot.getDataType() instanceof NestedColumnPrunable)) {
+            if (!shouldCollectAccessPath(slot)) {
                 continue;
             }
             Collection<CollectAccessPathResult> accessPaths = allSlotToAccessPaths.get(slot.getExprId().asInt());
             if (!accessPaths.isEmpty()) {
-                scanSlotToAccessPaths.put(slot, new ArrayList<>(accessPaths));
+                scanSlotToAccessPaths.put(
+                        slot, normalizeDataSkippingOnlyAccessPaths(accessPaths));
             }
         }
         return null;
@@ -193,9 +399,29 @@ public class AccessPathPlanCollector extends DefaultPlanVisitor<Void, StatementC
 
     private void collectByExpressions(Plan plan, StatementContext context, boolean bottomPredicate) {
         AccessPathExpressionCollector exprCollector
-                = new AccessPathExpressionCollector(context, allSlotToAccessPaths, bottomPredicate);
+                = new AccessPathExpressionCollector(context, allSlotToAccessPaths, bottomPredicate, skipMetaPath);
         for (Expression expression : plan.getExpressions()) {
             exprCollector.collect(expression);
         }
+    }
+
+    static List<CollectAccessPathResult> normalizeDataSkippingOnlyAccessPaths(
+            Collection<CollectAccessPathResult> accessPaths) {
+        List<CollectAccessPathResult> normalizedAccessPaths = new ArrayList<>();
+        for (CollectAccessPathResult accessPath : accessPaths) {
+            List<String> path = accessPath.getPath();
+            if (path.size() > 1 && accessPath.getType() == ColumnAccessPathType.META) {
+                // NULL/OFFSET suffixes are OLAP segment-reader-only optimizations. External
+                // table and TVF readers use access paths as real nested field paths, so read
+                // the referenced column/sub-column normally instead of sending a pseudo field.
+                normalizedAccessPaths.add(new CollectAccessPathResult(
+                        new ArrayList<>(path.subList(0, path.size() - 1)),
+                        accessPath.isPredicate(),
+                        ColumnAccessPathType.DATA));
+            } else {
+                normalizedAccessPaths.add(accessPath);
+            }
+        }
+        return normalizedAccessPaths;
     }
 }

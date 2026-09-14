@@ -34,18 +34,36 @@ import org.apache.doris.nereids.trees.expressions.functions.scalar.DateDiff;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.DayCeil;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.DayFloor;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.DayHourAdd;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.DayHourSub;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.DayMicrosecondAdd;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.DayMicrosecondSub;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.DayMinuteAdd;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.DayMinuteSub;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.DaySecondAdd;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.DaySecondSub;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.DaysAdd;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.DaysDiff;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.DaysSub;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.HourCeil;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.HourFloor;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.HourMicrosecondAdd;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.HourMicrosecondSub;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.HourMinuteAdd;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.HourMinuteSub;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.HourSecondAdd;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.HourSecondSub;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.HoursAdd;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.HoursDiff;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.HoursSub;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.MicroSecondsAdd;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.MicroSecondsDiff;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.MicroSecondsSub;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.MinuteCeil;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.MinuteFloor;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.MinuteMicrosecondAdd;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.MinuteMicrosecondSub;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.MinuteSecondAdd;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.MinuteSecondSub;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.MinutesAdd;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.MinutesDiff;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.MinutesSub;
@@ -62,6 +80,7 @@ import org.apache.doris.nereids.trees.expressions.functions.scalar.QuartersSub;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.SecondCeil;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.SecondFloor;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.SecondMicrosecondAdd;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.SecondMicrosecondSub;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.SecondsAdd;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.SecondsDiff;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.SecondsSub;
@@ -72,12 +91,19 @@ import org.apache.doris.nereids.trees.expressions.functions.scalar.WeeksDiff;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.WeeksSub;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.YearCeil;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.YearFloor;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.YearMonthAdd;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.YearMonthSub;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.YearsAdd;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.YearsDiff;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.YearsSub;
 import org.apache.doris.nereids.trees.expressions.literal.DateTimeV2Literal;
 import org.apache.doris.nereids.trees.expressions.literal.Interval;
 import org.apache.doris.nereids.trees.expressions.literal.Interval.TimeUnit;
+import org.apache.doris.nereids.trees.expressions.literal.StringLikeLiteral;
+import org.apache.doris.nereids.trees.expressions.literal.TimestampTzLiteral;
+import org.apache.doris.nereids.trees.expressions.literal.format.DateTimeChecker;
+import org.apache.doris.nereids.types.TimeStampNsType;
+import org.apache.doris.nereids.types.TimeStampTzType;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableSet;
@@ -279,9 +305,11 @@ public class DatetimeFunctionBinder {
                 return new MinutesDiff(end, start);
             case SECOND:
                 return new SecondsDiff(end, start);
+            case MICROSECOND:
+                return new MicroSecondsDiff(end, start);
             default:
                 throw new AnalysisException("Unsupported time stamp diff time unit: " + unit
-                        + ", supported time unit: YEAR/QUARTER/MONTH/WEEK/DAY/HOUR/MINUTE/SECOND");
+                        + ", supported time unit: YEAR/QUARTER/MONTH/WEEK/DAY/HOUR/MINUTE/SECOND/MICROSECOND");
         }
     }
 
@@ -303,12 +331,28 @@ public class DatetimeFunctionBinder {
                 return new MinutesAdd(timestamp, amount);
             case SECOND:
                 return new SecondsAdd(timestamp, amount);
+            case MICROSECOND:
+                return new MicroSecondsAdd(timestamp, amount);
+            case YEAR_MONTH:
+                return new YearMonthAdd(timestamp, amount);
             case DAY_SECOND:
                 return new DaySecondAdd(timestamp, amount);
             case DAY_HOUR:
                 return new DayHourAdd(timestamp, amount);
+            case DAY_MINUTE:
+                return new DayMinuteAdd(timestamp, amount);
+            case DAY_MICROSECOND:
+                return new DayMicrosecondAdd(timestamp, amount);
+            case HOUR_MINUTE:
+                return new HourMinuteAdd(timestamp, amount);
+            case HOUR_SECOND:
+                return new HourSecondAdd(timestamp, amount);
+            case HOUR_MICROSECOND:
+                return new HourMicrosecondAdd(timestamp, amount);
             case MINUTE_SECOND:
                 return new MinuteSecondAdd(timestamp, amount);
+            case MINUTE_MICROSECOND:
+                return new MinuteMicrosecondAdd(timestamp, amount);
             case SECOND_MICROSECOND:
                 return new SecondMicrosecondAdd(timestamp, amount);
             default:
@@ -335,6 +379,30 @@ public class DatetimeFunctionBinder {
                 return new MinutesSub(timeStamp, amount);
             case SECOND:
                 return new SecondsSub(timeStamp, amount);
+            case MICROSECOND:
+                return new MicroSecondsSub(timeStamp, amount);
+            case YEAR_MONTH:
+                return new YearMonthSub(timeStamp, amount);
+            case DAY_SECOND:
+                return new DaySecondSub(timeStamp, amount);
+            case DAY_HOUR:
+                return new DayHourSub(timeStamp, amount);
+            case DAY_MINUTE:
+                return new DayMinuteSub(timeStamp, amount);
+            case DAY_MICROSECOND:
+                return new DayMicrosecondSub(timeStamp, amount);
+            case HOUR_MINUTE:
+                return new HourMinuteSub(timeStamp, amount);
+            case HOUR_SECOND:
+                return new HourSecondSub(timeStamp, amount);
+            case HOUR_MICROSECOND:
+                return new HourMicrosecondSub(timeStamp, amount);
+            case MINUTE_SECOND:
+                return new MinuteSecondSub(timeStamp, amount);
+            case MINUTE_MICROSECOND:
+                return new MinuteMicrosecondSub(timeStamp, amount);
+            case SECOND_MICROSECOND:
+                return new SecondMicrosecondSub(timeStamp, amount);
             default:
                 throw new AnalysisException("Unsupported time stamp sub time unit: " + unit
                         + ", supported time unit: YEAR/QUARTER/MONTH/WEEK/DAY/HOUR/MINUTE/SECOND");
@@ -342,24 +410,32 @@ public class DatetimeFunctionBinder {
     }
 
     private Expression processDateFloor(TimeUnit unit, Expression timeStamp, Expression amount) {
-        DateTimeV2Literal e = DateTimeV2Literal.USE_IN_FLOOR_CEIL;
+        boolean isTimeStampNs = timeStamp.getDataType() instanceof TimeStampNsType;
+        boolean hasTimezone = false;
+        if (timeStamp.getDataType() instanceof TimeStampTzType) {
+            hasTimezone = true;
+        } else if (timeStamp instanceof StringLikeLiteral) {
+            String dateTimeStr = ((StringLikeLiteral) timeStamp).getValue();
+            hasTimezone = DateTimeChecker.hasTimeZone(dateTimeStr);
+        }
+        Expression e = hasTimezone ? TimestampTzLiteral.USE_IN_FLOOR_CEIL : DateTimeV2Literal.USE_IN_FLOOR_CEIL;
         switch (unit) {
             case YEAR:
-                return new YearFloor(timeStamp, amount, e);
+                return isTimeStampNs ? new YearFloor(timeStamp, amount) : new YearFloor(timeStamp, amount, e);
             case QUARTER:
-                return new QuarterFloor(timeStamp, amount, e);
+                return isTimeStampNs ? new QuarterFloor(timeStamp, amount) : new QuarterFloor(timeStamp, amount, e);
             case MONTH:
-                return new MonthFloor(timeStamp, amount, e);
+                return isTimeStampNs ? new MonthFloor(timeStamp, amount) : new MonthFloor(timeStamp, amount, e);
             case WEEK:
-                return new WeekFloor(timeStamp, amount, e);
+                return isTimeStampNs ? new WeekFloor(timeStamp, amount) : new WeekFloor(timeStamp, amount, e);
             case DAY:
-                return new DayFloor(timeStamp, amount, e);
+                return isTimeStampNs ? new DayFloor(timeStamp, amount) : new DayFloor(timeStamp, amount, e);
             case HOUR:
-                return new HourFloor(timeStamp, amount, e);
+                return isTimeStampNs ? new HourFloor(timeStamp, amount) : new HourFloor(timeStamp, amount, e);
             case MINUTE:
-                return new MinuteFloor(timeStamp, amount, e);
+                return isTimeStampNs ? new MinuteFloor(timeStamp, amount) : new MinuteFloor(timeStamp, amount, e);
             case SECOND:
-                return new SecondFloor(timeStamp, amount, e);
+                return isTimeStampNs ? new SecondFloor(timeStamp, amount) : new SecondFloor(timeStamp, amount, e);
             default:
                 throw new AnalysisException("Unsupported time stamp floor time unit: " + unit
                         + ", supported time unit: YEAR/QUARTER/MONTH/WEEK/DAY/HOUR/MINUTE/SECOND");
@@ -367,24 +443,32 @@ public class DatetimeFunctionBinder {
     }
 
     private Expression processDateCeil(TimeUnit unit, Expression timeStamp, Expression amount) {
-        DateTimeV2Literal e = DateTimeV2Literal.USE_IN_FLOOR_CEIL;
+        boolean isTimeStampNs = timeStamp.getDataType() instanceof TimeStampNsType;
+        boolean hasTimezone = false;
+        if (timeStamp.getDataType() instanceof TimeStampTzType) {
+            hasTimezone = true;
+        } else if (timeStamp instanceof StringLikeLiteral) {
+            String dateTimeStr = ((StringLikeLiteral) timeStamp).getValue();
+            hasTimezone = DateTimeChecker.hasTimeZone(dateTimeStr);
+        }
+        Expression e = hasTimezone ? TimestampTzLiteral.USE_IN_FLOOR_CEIL : DateTimeV2Literal.USE_IN_FLOOR_CEIL;
         switch (unit) {
             case YEAR:
-                return new YearCeil(timeStamp, amount, e);
+                return isTimeStampNs ? new YearCeil(timeStamp, amount) : new YearCeil(timeStamp, amount, e);
             case QUARTER:
-                return new QuarterCeil(timeStamp, amount, e);
+                return isTimeStampNs ? new QuarterCeil(timeStamp, amount) : new QuarterCeil(timeStamp, amount, e);
             case MONTH:
-                return new MonthCeil(timeStamp, amount, e);
+                return isTimeStampNs ? new MonthCeil(timeStamp, amount) : new MonthCeil(timeStamp, amount, e);
             case WEEK:
-                return new WeekCeil(timeStamp, amount, e);
+                return isTimeStampNs ? new WeekCeil(timeStamp, amount) : new WeekCeil(timeStamp, amount, e);
             case DAY:
-                return new DayCeil(timeStamp, amount, e);
+                return isTimeStampNs ? new DayCeil(timeStamp, amount) : new DayCeil(timeStamp, amount, e);
             case HOUR:
-                return new HourCeil(timeStamp, amount, e);
+                return isTimeStampNs ? new HourCeil(timeStamp, amount) : new HourCeil(timeStamp, amount, e);
             case MINUTE:
-                return new MinuteCeil(timeStamp, amount, e);
+                return isTimeStampNs ? new MinuteCeil(timeStamp, amount) : new MinuteCeil(timeStamp, amount, e);
             case SECOND:
-                return new SecondCeil(timeStamp, amount, e);
+                return isTimeStampNs ? new SecondCeil(timeStamp, amount) : new SecondCeil(timeStamp, amount, e);
             default:
                 throw new AnalysisException("Unsupported time stamp ceil time unit: " + unit
                         + ", supported time unit: YEAR/QUARTER/MONTH/WEEK/DAY/HOUR/MINUTE/SECOND");

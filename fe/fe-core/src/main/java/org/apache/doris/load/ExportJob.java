@@ -29,6 +29,7 @@ import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.TableIf;
 import org.apache.doris.catalog.TableIf.TableType;
+import org.apache.doris.catalog.info.TableNameInfo;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.Pair;
@@ -37,7 +38,7 @@ import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
 import org.apache.doris.common.util.TimeUtils;
 import org.apache.doris.datasource.InternalCatalog;
-import org.apache.doris.info.TableNameInfo;
+import org.apache.doris.datasource.property.fileformat.ParquetFileFormatProperties;
 import org.apache.doris.nereids.StatementContext;
 import org.apache.doris.nereids.analyzer.UnboundRelation;
 import org.apache.doris.nereids.analyzer.UnboundSlot;
@@ -123,6 +124,8 @@ public class ExportJob implements Writable {
     private String columns;
     @SerializedName("format")
     private String format;
+    @SerializedName("enableInt96Timestamps")
+    private String enableInt96Timestamps;
     @SerializedName("timeoutSecond")
     private int timeoutSecond;
     @SerializedName("maxFileSize")
@@ -247,7 +250,6 @@ public class ExportJob implements Writable {
                 for (int i = 0; i < selectStmtPerParallel.size(); ++i) {
                     if (LOG.isDebugEnabled()) {
                         LOG.debug("ExportTaskExecutor {} is responsible for outfile:", i);
-                        LOG.debug("outfile sql: [{}]", selectStmtPerParallel.get(i).get().toSql());
                     }
                 }
             }
@@ -346,7 +348,7 @@ public class ExportJob implements Writable {
         }
 
         StatementBase statementBase = new LogicalPlanAdapter(outfileLogicalPlan, statementContext);
-        statementBase.setOrigStmt(new OriginStatement(statementBase.toSql(), 0));
+        statementBase.setOrigStmt(new OriginStatement("", 0));
         return statementBase;
     }
 
@@ -483,6 +485,11 @@ public class ExportJob implements Writable {
         // compressType == null means outfile will use default compression type
         if (compressType != null) {
             outfileProperties.put(ExportCommand.COMPRESS_TYPE, compressType);
+        }
+
+        if (enableInt96Timestamps != null) {
+            outfileProperties.put(ParquetFileFormatProperties.ENABLE_INT96_TIMESTAMPS,
+                    enableInt96Timestamps);
         }
 
         if (!maxFileSize.isEmpty()) {

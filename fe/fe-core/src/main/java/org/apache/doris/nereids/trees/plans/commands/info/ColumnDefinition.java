@@ -17,7 +17,6 @@
 
 package org.apache.doris.nereids.trees.plans.commands.info;
 
-import org.apache.doris.alter.SchemaChangeHandler;
 import org.apache.doris.analysis.ColumnDef;
 import org.apache.doris.analysis.ColumnNullableType;
 import org.apache.doris.analysis.DefaultValueExprDef;
@@ -40,6 +39,7 @@ import org.apache.doris.nereids.types.StructType;
 import org.apache.doris.nereids.types.TinyIntType;
 import org.apache.doris.nereids.types.VarcharType;
 import org.apache.doris.nereids.types.coercion.CharacterType;
+import org.apache.doris.nereids.util.SqlLiteralUtils;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.ConnectContextUtil;
 import org.apache.doris.qe.SessionVariable;
@@ -62,9 +62,13 @@ public class ColumnDefinition {
     private boolean isKey;
     private AggregateType aggType;
     private boolean isNullable;
+    // Distinguishes an explicit NULL/NOT NULL clause from the parser's default nullability.
+    private final boolean nullableSpecified;
     private Optional<DefaultValue> defaultValue;
     private Optional<DefaultValue> onUpdateDefaultValue = Optional.empty();
     private final String comment;
+    // Distinguishes an explicit COMMENT '' clause from an omitted COMMENT clause.
+    private final boolean commentSpecified;
     private final boolean isVisible;
     private boolean aggTypeImplicit = false;
     private long autoIncInitValue = -1;
@@ -84,7 +88,7 @@ public class ColumnDefinition {
             Optional<DefaultValue> onUpdateDefaultValue, String comment,
             Optional<GeneratedColumnDesc> generatedColumnDesc) {
         this(name, type, isKey, aggType, nullableType, autoIncInitValue, defaultValue, onUpdateDefaultValue,
-                comment, true, generatedColumnDesc);
+                comment, comment != null && !comment.isEmpty(), true, generatedColumnDesc);
     }
 
     /**
@@ -97,8 +101,10 @@ public class ColumnDefinition {
         this.isKey = isKey;
         this.aggType = aggType;
         this.isNullable = isNullable;
+        this.nullableSpecified = true;
         this.defaultValue = defaultValue;
         this.comment = comment;
+        this.commentSpecified = comment != null && !comment.isEmpty();
         this.isVisible = isVisible;
     }
 
@@ -113,10 +119,12 @@ public class ColumnDefinition {
         this.isKey = isKey;
         this.aggType = aggType;
         this.isNullable = isNullable;
+        this.nullableSpecified = true;
         this.autoIncInitValue = autoIncInitValue;
         this.defaultValue = defaultValue;
         this.onUpdateDefaultValue = onUpdateDefaultValue;
         this.comment = comment;
+        this.commentSpecified = comment != null && !comment.isEmpty();
         this.isVisible = isVisible;
     }
 
@@ -127,15 +135,30 @@ public class ColumnDefinition {
             ColumnNullableType nullableType, long autoIncInitValue, Optional<DefaultValue> defaultValue,
             Optional<DefaultValue> onUpdateDefaultValue, String comment, boolean isVisible,
             Optional<GeneratedColumnDesc> generatedColumnDesc) {
+        this(name, type, isKey, aggType, nullableType, autoIncInitValue, defaultValue, onUpdateDefaultValue,
+                comment, comment != null && !comment.isEmpty(), isVisible, generatedColumnDesc);
+    }
+
+    /**
+     * constructor
+     */
+    public ColumnDefinition(String name, DataType type, boolean isKey, AggregateType aggType,
+            ColumnNullableType nullableType, long autoIncInitValue, Optional<DefaultValue> defaultValue,
+            Optional<DefaultValue> onUpdateDefaultValue, String comment, boolean commentSpecified,
+            boolean isVisible,
+            Optional<GeneratedColumnDesc> generatedColumnDesc) {
         this.name = name;
         this.type = type;
         this.isKey = isKey;
         this.aggType = aggType;
         this.isNullable = nullableType.getNullable(type.toCatalogDataType().getPrimitiveType());
+        this.nullableSpecified = nullableType == ColumnNullableType.NULLABLE
+                || nullableType == ColumnNullableType.NOT_NULLABLE;
         this.autoIncInitValue = autoIncInitValue;
         this.defaultValue = defaultValue;
         this.onUpdateDefaultValue = onUpdateDefaultValue;
         this.comment = comment;
+        this.commentSpecified = commentSpecified;
         this.isVisible = isVisible;
         this.generatedColumnDesc = generatedColumnDesc;
     }
@@ -184,6 +207,22 @@ public class ColumnDefinition {
         return defaultValue.isPresent();
     }
 
+    public boolean hasOnUpdateDefaultValue() {
+        return onUpdateDefaultValue.isPresent();
+    }
+
+    /**
+     * Returns the column's default value as the catalog-level string (the same value the translated
+     * {@link org.apache.doris.catalog.Column#getDefaultValue()} carries), or {@code null} when the column
+     * has no default. Exposed so {@code CreateTableInfoToConnectorRequestConverter} can thread it onto
+     * {@code ConnectorColumn.defaultValue} for connectors (Hive) that build metastore default constraints
+     * and gate DDL on per-column defaults; connectors that ignore create-time defaults (iceberg/paimon/
+     * maxcompute) are unaffected.
+     */
+    public String getDefaultValueString() {
+        return defaultValue.map(DefaultValue::getValue).orElse(null);
+    }
+
     public boolean isVisible() {
         return isVisible;
     }
@@ -192,23 +231,52 @@ public class ColumnDefinition {
         this.generatedColumnsThatReferToThis = generatedColumnsThatReferToThis;
     }
 
+    public String getComment() {
+        return getComment(false);
+    }
+
+    public String getComment(boolean escapeQuota) {
+        String comment = this.comment == null ? "" : this.comment;
+        if (!escapeQuota) {
+            return comment;
+        }
+        return SqlUtils.escapeQuota(comment);
+    }
+
+    public boolean isCommentSpecified() {
+        return commentSpecified;
+    }
+
     /**
      * toSql
      */
     public String toSql() {
+        return toSql("`" + name + "`", true);
+    }
+
+    /**
+     * Convert this column definition to schema-change SQL with a caller-provided column name.
+     * Unlike {@link #toSql()}, this overload emits COMMENT only when it was explicitly specified.
+     */
+    public String toSql(String columnNameSql) {
+        return toSql(columnNameSql, commentSpecified);
+    }
+
+    private String toSql(String columnNameSql, boolean includeComment) {
         StringBuilder sb = new StringBuilder();
-        sb.append("`").append(name).append("` ");
+        sb.append(columnNameSql).append(" ");
         sb.append(type.toSql()).append(" ");
 
         if (aggType != null && aggType != AggregateType.NONE) {
             sb.append(aggType.name()).append(" ");
         }
 
-        if (!isNullable) {
-            sb.append("NOT NULL ");
-        } else {
-            // should append NULL to make result can be executed right.
-            sb.append("NULL ");
+        if (nullableSpecified) {
+            if (!isNullable) {
+                sb.append("NOT NULL ");
+            } else {
+                sb.append("NULL ");
+            }
         }
 
         if (autoIncInitValue != -1) {
@@ -236,7 +304,9 @@ public class ColumnDefinition {
                 sb.append("DEFAULT ").append("NULL").append(" ");
             }
         }
-        sb.append("COMMENT \"").append(SqlUtils.escapeQuota(comment)).append("\"");
+        if (includeComment) {
+            sb.append("COMMENT ").append(SqlLiteralUtils.quoteStringLiteral(getComment()));
+        }
 
         return sb.toString();
     }
@@ -265,8 +335,24 @@ public class ColumnDefinition {
         }
     }
 
+    /**
+     * Returns whether the given type may be used as an OLAP key column.
+     */
+    public static boolean isEligibleKeyType(DataType type) {
+        return !type.isFloatLikeType()
+                && !type.isStringType()
+                && !type.isArrayType()
+                && !type.isBitmapType()
+                && !type.isHllType()
+                && !type.isQuantileStateType()
+                && !type.isJsonType()
+                && !type.isVariantType()
+                && !type.isMapType()
+                && !type.isStructType();
+    }
+
     private void checkKeyColumnType(boolean isOlap) {
-        if (isOlap) {
+        if (isOlap && !isEligibleKeyType(type)) {
             if (type.isFloatLikeType()) {
                 throw new AnalysisException("Float or double can not used as a key, use decimal instead.");
             } else if (type.isStringType()) {
@@ -286,6 +372,9 @@ public class ColumnDefinition {
             } else if (type.isStructType()) {
                 throw new AnalysisException("Struct can only be used in the non-key column of"
                         + " the duplicate table at present.");
+            } else {
+                throw new AnalysisException("Type " + type.toSql() + " can not be used in key column["
+                        + getName() + "].");
             }
         }
     }
@@ -295,10 +384,25 @@ public class ColumnDefinition {
      */
     public void validate(boolean isOlap, Set<String> keysSet, Set<String> clusterKeySet, boolean isEnableMergeOnWrite,
             KeysType keysType) {
+        validateInternal(isOlap, keysSet, clusterKeySet, isEnableMergeOnWrite, keysType, false);
+    }
+
+    /**
+     * Validate a nested field whose name is scoped by its parent path rather than the Doris top-level column namespace.
+     */
+    public void validateNestedColumn(boolean isOlap, Set<String> keysSet, Set<String> clusterKeySet,
+            boolean isEnableMergeOnWrite, KeysType keysType) {
+        validateInternal(isOlap, keysSet, clusterKeySet, isEnableMergeOnWrite, keysType, true);
+    }
+
+    private void validateInternal(boolean isOlap, Set<String> keysSet, Set<String> clusterKeySet,
+            boolean isEnableMergeOnWrite, KeysType keysType, boolean nestedColumn) {
         try {
             // if enableAddHiddenColumn is true, can add hidden column.
             // So does not check if the column name starts with __DORIS_
-            if (enableAddHiddenColumn) {
+            if (nestedColumn) {
+                FeNameFormat.checkColumnNameBypassSystemColumnPrefix(name);
+            } else if (enableAddHiddenColumn) {
                 FeNameFormat.checkColumnNameBypassHiddenColumn(name);
             } else {
                 FeNameFormat.checkColumnName(name);
@@ -417,18 +521,8 @@ public class ColumnDefinition {
                 .getValue().equals(DefaultValue.ARRAY_EMPTY_DEFAULT_VALUE.getValue())) {
             throw new AnalysisException("Array type column default value only support null or "
                     + DefaultValue.ARRAY_EMPTY_DEFAULT_VALUE);
-        } else if (type.isMapType()) {
-            if (defaultValue.isPresent() && defaultValue.get() != DefaultValue.NULL_DEFAULT_VALUE) {
-                throw new AnalysisException("Map type column default value just support null");
-            }
-        } else if (type.isStructType()) {
-            if (defaultValue.isPresent() && defaultValue.get() != DefaultValue.NULL_DEFAULT_VALUE) {
-                throw new AnalysisException("Struct type column default value just support null");
-            }
-        } else if (type.isJsonType() || type.isVariantType()) {
-            if (defaultValue.isPresent() && defaultValue.get() != DefaultValue.NULL_DEFAULT_VALUE) {
-                throw new AnalysisException("Json or Variant type column default value just support null");
-            }
+        } else {
+            validateComplexTypeDefaultValue();
         }
 
         if (!isNullable && defaultValue.isPresent()
@@ -511,6 +605,22 @@ public class ColumnDefinition {
     }
 
     /**
+     * Validate non-null defaults for complex types before connector-specific validation.
+     */
+    public void validateComplexTypeDefaultValue() throws AnalysisException {
+        if (!defaultValue.isPresent() || defaultValue.get() == DefaultValue.NULL_DEFAULT_VALUE) {
+            return;
+        }
+        if (type.isMapType()) {
+            throw new AnalysisException("Map type column default value just support null");
+        } else if (type.isStructType()) {
+            throw new AnalysisException("Struct type column default value just support null");
+        } else if (type.isJsonType() || type.isVariantType()) {
+            throw new AnalysisException("Json or Variant type column default value just support null");
+        }
+    }
+
+    /**
      * translate to catalog create table stmt
      */
     public Column translateToCatalogStyle() {
@@ -536,13 +646,15 @@ public class ColumnDefinition {
         Column column = new Column(name, type.toCatalogDataType(), isKey, aggType, isNullable,
                 autoIncInitValue, defaultValue.map(DefaultValue::getValue).orElse(null), comment, isVisible,
                 defaultValue.map(DefaultValue::getDefaultValueExprDef).orElse(null), Column.COLUMN_UNIQUE_ID_INIT_VALUE,
-                defaultValue.map(DefaultValue::getRawValue).orElse(null), onUpdateDefaultValue.isPresent(),
+                defaultValue.map(value -> value.getRawValue(type)).orElse(null), onUpdateDefaultValue.isPresent(),
                 onUpdateDefaultValue.map(DefaultValue::getDefaultValueExprDef).orElse(null), clusterKeyId,
                 generatedColumnDesc.map(GeneratedColumnDesc::translateToInfo).orElse(null),
                 generatedColumnsThatReferToThis,
                 generatedColumnDesc.map(desc ->
                         ConnectContextUtil.getAffectQueryResultInPlanVariables(ConnectContext.get()))
                         .orElse(null));
+        column.setNullableSpecified(nullableSpecified);
+        column.setCommentSpecified(commentSpecified);
         column.setAggregationTypeImplicit(aggTypeImplicit);
         return column;
     }
@@ -620,6 +732,30 @@ public class ColumnDefinition {
     }
 
     /**
+     * add hidden column __DORIS_COMMIT_TSO_COL__ for time-travel on dup / mow tables.
+     */
+    public static ColumnDefinition newCommitTsoColumnDefinition(AggregateType aggregateType) {
+        ColumnDefinition columnDefinition = new ColumnDefinition(Column.COMMIT_TSO_COL, BigIntType.INSTANCE, false,
+                    aggregateType, false, Optional.of(new DefaultValue(DefaultValue.ZERO_NUMBER)),
+                "doris commit tso hidden column", false);
+        columnDefinition.setEnableAddHiddenColumn(true);
+
+        return columnDefinition;
+    }
+
+    /**
+     * add hidden column __DORIS_ROW_LSN_COL__ for stable row identity on row-binlog tables.
+     */
+    public static ColumnDefinition newRowLsnColumnDefinition(AggregateType aggregateType) {
+        ColumnDefinition columnDefinition = new ColumnDefinition(Column.ROW_LSN_COL, BigIntType.INSTANCE, false,
+                    aggregateType, false, Optional.of(new DefaultValue(DefaultValue.ZERO_NUMBER)),
+                "doris row lsn hidden column", false);
+        columnDefinition.setEnableAddHiddenColumn(true);
+
+        return columnDefinition;
+    }
+
+    /**
      * used in CreateTableInfo.validate(), specify the default value as DefaultValue.NULL_DEFAULT_VALUE
      * becasue ColumnDefinition.validate() will check that bitmap type column don't set default value
      * and then set the default value of that column to bitmap_empty()
@@ -684,8 +820,8 @@ public class ColumnDefinition {
     }
 
     public static String removeNamePrefix(String colName) {
-        if (colName.startsWith(SchemaChangeHandler.SHADOW_NAME_PREFIX)) {
-            return colName.substring(SchemaChangeHandler.SHADOW_NAME_PREFIX.length());
+        if (colName.startsWith(Column.SHADOW_NAME_PREFIX)) {
+            return colName.substring(Column.SHADOW_NAME_PREFIX.length());
         }
         return colName;
     }

@@ -17,11 +17,18 @@
 
 package org.apache.doris.nereids.trees.plans.commands;
 
+import org.apache.doris.catalog.Env;
+import org.apache.doris.catalog.MTMV;
 import org.apache.doris.catalog.TableIf;
 import org.apache.doris.catalog.constraint.Constraint;
-import org.apache.doris.catalog.constraint.PrimaryKeyConstraint;
-import org.apache.doris.common.util.MetaLockUtils;
+import org.apache.doris.catalog.info.TableNameInfo;
+import org.apache.doris.common.ErrorCode;
+import org.apache.doris.common.ErrorReport;
+import org.apache.doris.info.TableNameInfoUtils;
+import org.apache.doris.mtmv.MTMVUtil;
+import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.nereids.NereidsPlanner;
+import org.apache.doris.nereids.analyzer.UnboundRelation;
 import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.properties.PhysicalProperties;
 import org.apache.doris.nereids.trees.plans.Plan;
@@ -33,11 +40,9 @@ import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.StmtExecutor;
 
-import com.google.common.collect.Lists;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
-import java.util.Comparator;
 import java.util.List;
 import java.util.Set;
 
@@ -61,28 +66,70 @@ public class DropConstraintCommand extends Command implements ForwardWithSync {
 
     @Override
     public void run(ConnectContext ctx, StmtExecutor executor) throws Exception {
-        TableIf table = extractTable(ctx, plan);
-        List<TableIf> tables = Lists.newArrayList(table);
-        table.readLock();
+        TableNameInfo tableNameInfo;
         try {
-            Constraint constraint = table.getConstraintsMapUnsafe().get(name);
-            if (constraint == null) {
-                throw new AnalysisException(
-                        String.format("Unknown constraint %s on table %s.", name, table.getName()));
-            }
-            if (constraint instanceof PrimaryKeyConstraint) {
-                tables.addAll(((PrimaryKeyConstraint) constraint).getForeignTables());
-            }
-        } finally {
-            table.readUnlock();
+            TableIf table = extractTable(ctx, plan);
+            tableNameInfo = TableNameInfoUtils.fromCatalogDb(
+                    table.getDatabase().getCatalog(), table.getDatabase(), table);
+        } catch (Exception e) {
+            // Table may no longer exist (e.g., external table deleted by another system).
+            // Fall back to extracting the table name from the unresolved plan.
+            LOG.warn("Table resolution failed for dropping constraint {}, "
+                    + "falling back to name-based lookup: {}", name, e.getMessage());
+            tableNameInfo = extractTableNameFromPlan(ctx);
         }
-        tables.sort((Comparator.comparing(TableIf::getId)));
-        MetaLockUtils.writeLockTables(tables);
-        try {
-            table.dropConstraint(name, false);
-        } finally {
-            MetaLockUtils.writeUnlockTables(tables);
+        // must be checked on both paths above: table resolution failing (which includes an
+        // authorization failure) falls back to a name-only lookup that binds nothing.
+        checkAlterPriv(ctx, tableNameInfo);
+        Constraint constraint = Env.getCurrentEnv().getConstraintManager().getConstraint(tableNameInfo, name);
+        if (constraint == null) {
+            throw new AnalysisException(
+                    String.format("Unknown constraint %s on table %s.", name, tableNameInfo));
         }
+        // dropping a primary key cascades into ConstraintManager.cascadeDropForeignKeys(), which
+        // deletes the foreign key constraints of every referencing table, so those tables have to be
+        // authorized too. Checked before dropConstraint() because the cascade is atomic. The snapshot
+        // is taken under the manager lock; a foreign key added after it still needs ALTER on its own
+        // table to be created, so it cannot be used to bypass this.
+        for (TableNameInfo fkTableInfo
+                : Env.getCurrentEnv().getConstraintManager().getCascadeDropTables(constraint)) {
+            checkAlterPriv(ctx, fkTableInfo);
+        }
+        List<MTMV> dependentMtmvs = MTMVUtil.getDependentMtmvsByConstraint(tableNameInfo, constraint);
+        Env.getCurrentEnv().getConstraintManager().dropConstraint(tableNameInfo, name, false);
+        MTMVUtil.invalidateRewriteCachesBestEffort(dependentMtmvs,
+                String.format("after drop constraint %s on table %s", constraint.getName(), tableNameInfo));
+    }
+
+    private void checkAlterPriv(ConnectContext ctx, TableNameInfo tableNameInfo)
+            throws org.apache.doris.common.AnalysisException {
+        if (!Env.getCurrentEnv().getAccessManager().checkTblPriv(ctx, tableNameInfo.getCtl(),
+                tableNameInfo.getDb(), tableNameInfo.getTbl(), PrivPredicate.ALTER)) {
+            ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLEACCESS_DENIED_ERROR, "ALTER",
+                    ctx.getQualifiedUser(), ctx.getRemoteIP(),
+                    tableNameInfo.getDb() + ": " + tableNameInfo.getTbl());
+        }
+    }
+
+    private TableNameInfo extractTableNameFromPlan(ConnectContext ctx) {
+        if (!(plan instanceof UnboundRelation)) {
+            throw new AnalysisException(
+                    "Cannot resolve table for dropping constraint " + name);
+        }
+        UnboundRelation unbound = (UnboundRelation) plan;
+        List<String> parts = unbound.getNameParts();
+        String ctl = ctx.getCurrentCatalog() != null
+                ? ctx.getCurrentCatalog().getName()
+                : "internal";
+        String db = ctx.getDatabase();
+        // Fill in default catalog/db from connect context if not specified
+        if (parts.size() == 1) {
+            return new TableNameInfo(ctl, db, parts.get(0));
+        }
+        if (parts.size() == 2) {
+            return new TableNameInfo(ctl, parts.get(0), parts.get(1));
+        }
+        return new TableNameInfo(parts);
     }
 
     private TableIf extractTable(ConnectContext ctx, LogicalPlan plan) {

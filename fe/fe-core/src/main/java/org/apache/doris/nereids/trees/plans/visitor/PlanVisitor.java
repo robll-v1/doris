@@ -29,7 +29,6 @@ import org.apache.doris.nereids.trees.plans.logical.LogicalCTEAnchor;
 import org.apache.doris.nereids.trees.plans.logical.LogicalCTEConsumer;
 import org.apache.doris.nereids.trees.plans.logical.LogicalCTEProducer;
 import org.apache.doris.nereids.trees.plans.logical.LogicalCheckPolicy;
-import org.apache.doris.nereids.trees.plans.logical.LogicalDeferMaterializeTopN;
 import org.apache.doris.nereids.trees.plans.logical.LogicalExcept;
 import org.apache.doris.nereids.trees.plans.logical.LogicalFilter;
 import org.apache.doris.nereids.trees.plans.logical.LogicalGenerate;
@@ -45,6 +44,9 @@ import org.apache.doris.nereids.trees.plans.logical.LogicalPreAggOnHint;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPreFilter;
 import org.apache.doris.nereids.trees.plans.logical.LogicalProject;
 import org.apache.doris.nereids.trees.plans.logical.LogicalQualify;
+import org.apache.doris.nereids.trees.plans.logical.LogicalRecursiveUnion;
+import org.apache.doris.nereids.trees.plans.logical.LogicalRecursiveUnionAnchor;
+import org.apache.doris.nereids.trees.plans.logical.LogicalRecursiveUnionProducer;
 import org.apache.doris.nereids.trees.plans.logical.LogicalRelation;
 import org.apache.doris.nereids.trees.plans.logical.LogicalRepeat;
 import org.apache.doris.nereids.trees.plans.logical.LogicalSelectHint;
@@ -62,7 +64,6 @@ import org.apache.doris.nereids.trees.plans.physical.AbstractPhysicalSort;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalAssertNumRows;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalCTEAnchor;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalCTEProducer;
-import org.apache.doris.nereids.trees.plans.physical.PhysicalDeferMaterializeTopN;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalDistribute;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalExcept;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalFilter;
@@ -79,6 +80,9 @@ import org.apache.doris.nereids.trees.plans.physical.PhysicalNestedLoopJoin;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalPartitionTopN;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalProject;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalQuickSort;
+import org.apache.doris.nereids.trees.plans.physical.PhysicalRecursiveUnion;
+import org.apache.doris.nereids.trees.plans.physical.PhysicalRecursiveUnionAnchor;
+import org.apache.doris.nereids.trees.plans.physical.PhysicalRecursiveUnionProducer;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalRelation;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalRepeat;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalSetOperation;
@@ -212,6 +216,21 @@ public abstract class PlanVisitor<R, C> implements CommandVisitor<R, C>, Relatio
         return visit(join, context);
     }
 
+    public R visitLogicalRecursiveUnion(LogicalRecursiveUnion<? extends Plan, ? extends Plan> recursiveUnion,
+            C context) {
+        return visit(recursiveUnion, context);
+    }
+
+    public R visitLogicalRecursiveUnionAnchor(LogicalRecursiveUnionAnchor<? extends Plan> recursiveAnchor,
+                                                C context) {
+        return visit(recursiveAnchor, context);
+    }
+
+    public R visitLogicalRecursiveUnionProducer(LogicalRecursiveUnionProducer<? extends Plan> recursiveProducer,
+            C context) {
+        return visit(recursiveProducer, context);
+    }
+
     public R visitLogicalLimit(LogicalLimit<? extends Plan> limit, C context) {
         return visit(limit, context);
     }
@@ -273,10 +292,6 @@ public abstract class PlanVisitor<R, C> implements CommandVisitor<R, C>, Relatio
     }
 
     public R visitLogicalTopN(LogicalTopN<? extends Plan> topN, C context) {
-        return visit(topN, context);
-    }
-
-    public R visitLogicalDeferMaterializeTopN(LogicalDeferMaterializeTopN<? extends Plan> topN, C context) {
         return visit(topN, context);
     }
 
@@ -381,6 +396,21 @@ public abstract class PlanVisitor<R, C> implements CommandVisitor<R, C>, Relatio
         return visitPhysicalSetOperation(union, context);
     }
 
+    public R visitPhysicalRecursiveUnion(PhysicalRecursiveUnion<? extends Plan, ? extends Plan> recursiveUnion,
+            C context) {
+        return visit(recursiveUnion, context);
+    }
+
+    public R visitPhysicalRecursiveUnionAnchor(PhysicalRecursiveUnionAnchor<? extends Plan> recursiveUnionAnchor,
+                                                 C context) {
+        return visit(recursiveUnionAnchor, context);
+    }
+
+    public R visitPhysicalRecursiveUnionProducer(PhysicalRecursiveUnionProducer<? extends Plan> recursiveUnionProducer,
+            C context) {
+        return visit(recursiveUnionProducer, context);
+    }
+
     public R visitAbstractPhysicalSort(AbstractPhysicalSort<? extends Plan> sort, C context) {
         return visit(sort, context);
     }
@@ -390,10 +420,6 @@ public abstract class PlanVisitor<R, C> implements CommandVisitor<R, C>, Relatio
     }
 
     public R visitPhysicalTopN(PhysicalTopN<? extends Plan> topN, C context) {
-        return visitAbstractPhysicalSort(topN, context);
-    }
-
-    public R visitPhysicalDeferMaterializeTopN(PhysicalDeferMaterializeTopN<? extends Plan> topN, C context) {
         return visitAbstractPhysicalSort(topN, context);
     }
 

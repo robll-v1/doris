@@ -20,22 +20,24 @@
 
 #pragma once
 
+#include <gen_cpp/internal_service.pb.h>
+
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "common/status.h"
-#include "gen_cpp/internal_service.pb.h"
 #include "io/cache/block_file_cache.h"
 #include "io/cache/file_cache_common.h"
+#include "storage/options.h"
 namespace doris {
 class TUniqueId;
 
-namespace vectorized {
 class Block;
-} // namespace vectorized
 
 namespace io {
 
@@ -48,6 +50,12 @@ public:
 
     Status create_file_cache(const std::string& cache_base_path,
                              FileCacheSettings file_cache_settings);
+
+    Status create_file_caches(
+            const std::vector<CachePath>& cache_paths,
+            const std::function<bool(const std::string&, const Status&)>& should_ignore_error);
+
+    Status reload_file_cache(const std::vector<CachePath>& cache_base_paths);
 
     size_t try_release();
 
@@ -74,7 +82,7 @@ public:
     BlockFileCache* get_by_path(const UInt128Wrapper& hash);
     BlockFileCache* get_by_path(const std::string& cache_base_path);
     std::vector<BlockFileCache::QueryFileCacheContextHolderPtr> get_query_context_holders(
-            const TUniqueId& query_id);
+            const TUniqueId& query_id, int file_cache_query_limit_percent);
 
     /**
      * Clears data of all file cache instances
@@ -83,6 +91,7 @@ public:
      * @return summary message
      */
     std::string clear_file_caches(bool sync);
+    Status clear_file_caches(bool sync, std::string* result);
 
     /**
      * dump lru queue info for all file cache instances
@@ -90,6 +99,15 @@ public:
     void dump_all_caches();
 
     std::vector<std::string> get_base_paths();
+
+    /// Re-read the BE-wide async-write settings, split the pending-byte ownership limit equally
+    /// across all initialized cache instances, and update every per-disk manager.
+    /// @return OK after every manager is updated; otherwise the first manager update error.
+    Status refresh_async_write_options();
+
+    /// Start async-write workers for every initialized cache disk. Repeated calls are idempotent.
+    /// @return OK after every manager is ready; otherwise the first startup error.
+    Status start_async_write_managers();
 
     /**
      * Clears data of all file cache instances
@@ -100,7 +118,7 @@ public:
      */
     std::string reset_capacity(const std::string& path, int64_t new_capacity);
 
-    void get_cache_stats_block(vectorized::Block* block);
+    void get_cache_stats_block(Block* block);
 
     // Get all cache instances for inspection
     const std::vector<std::unique_ptr<BlockFileCache>>& get_caches() const { return _caches; }
@@ -110,6 +128,8 @@ public:
     FileCacheFactory(const FileCacheFactory&) = delete;
 
 private:
+    Status _refresh_async_write_options_locked();
+
     std::mutex _mtx;
     std::vector<std::unique_ptr<BlockFileCache>> _caches;
     std::unordered_map<std::string, BlockFileCache*> _path_to_cache;

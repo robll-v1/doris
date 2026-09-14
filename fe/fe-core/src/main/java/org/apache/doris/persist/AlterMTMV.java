@@ -17,15 +17,16 @@
 
 package org.apache.doris.persist;
 
+import org.apache.doris.catalog.info.TableNameInfo;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
-import org.apache.doris.info.TableNameInfo;
 import org.apache.doris.job.extensions.mtmv.MTMVTask;
 import org.apache.doris.mtmv.MTMVAlterOpType;
 import org.apache.doris.mtmv.MTMVRefreshInfo;
 import org.apache.doris.mtmv.MTMVRefreshPartitionSnapshot;
 import org.apache.doris.mtmv.MTMVRelation;
 import org.apache.doris.mtmv.MTMVStatus;
+import org.apache.doris.mtmv.ivm.IvmInfo;
 import org.apache.doris.persist.gson.GsonUtils;
 
 import com.google.gson.annotations.SerializedName;
@@ -55,6 +56,8 @@ public class AlterMTMV implements Writable {
     private MTMVRelation relation;
     @SerializedName("ps")
     private Map<String, MTMVRefreshPartitionSnapshot> partitionSnapshots;
+    @SerializedName("ii")
+    private IvmInfo ivmInfo;
 
     public AlterMTMV(TableNameInfo mvName, MTMVRefreshInfo refreshInfo, MTMVAlterOpType opType) {
         this.mvName = Objects.requireNonNull(mvName, "require mvName object");
@@ -135,6 +138,14 @@ public class AlterMTMV implements Writable {
     public void setPartitionSnapshots(
             Map<String, MTMVRefreshPartitionSnapshot> partitionSnapshots) {
         this.partitionSnapshots = partitionSnapshots;
+    }
+
+    public IvmInfo getIvmInfo() {
+        return ivmInfo;
+    }
+
+    public void setIvmInfo(IvmInfo ivmInfo) {
+        this.ivmInfo = ivmInfo == null ? null : new IvmInfo(ivmInfo);
     }
 
     @Override

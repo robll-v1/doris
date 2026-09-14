@@ -18,6 +18,7 @@
 package org.apache.doris.nereids.trees.expressions;
 
 import org.apache.doris.common.Config;
+import org.apache.doris.common.NameFormatUtils;
 import org.apache.doris.nereids.analyzer.Unbound;
 import org.apache.doris.nereids.analyzer.UnboundVariable;
 import org.apache.doris.nereids.exceptions.AnalysisException;
@@ -27,8 +28,8 @@ import org.apache.doris.nereids.trees.AbstractTreeNode;
 import org.apache.doris.nereids.trees.expressions.ArrayItemReference.ArrayItemSlot;
 import org.apache.doris.nereids.trees.expressions.functions.ExpressionTrait;
 import org.apache.doris.nereids.trees.expressions.functions.agg.AggregateFunction;
+import org.apache.doris.nereids.trees.expressions.functions.generator.TableGeneratingFunction;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.Lambda;
-import org.apache.doris.nereids.trees.expressions.functions.scalar.UniqueFunction;
 import org.apache.doris.nereids.trees.expressions.literal.Literal;
 import org.apache.doris.nereids.trees.expressions.literal.NullLiteral;
 import org.apache.doris.nereids.trees.expressions.shape.LeafExpression;
@@ -43,7 +44,6 @@ import org.apache.doris.nereids.types.StructField;
 import org.apache.doris.nereids.types.StructType;
 import org.apache.doris.nereids.util.ExpressionUtils;
 import org.apache.doris.nereids.util.LazyCompute;
-import org.apache.doris.nereids.util.Utils;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableSet;
@@ -51,6 +51,7 @@ import com.google.common.collect.ImmutableSet.Builder;
 import com.google.common.collect.Lists;
 import org.apache.commons.lang3.StringUtils;
 
+import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -71,58 +72,22 @@ public abstract class Expression extends AbstractTreeNode<Expression> implements
     private final boolean hasUnbound;
     private final Supplier<Set<Slot>> inputSlots = LazyCompute.of(
             () -> collect(e -> e instanceof Slot && !(e instanceof ArrayItemSlot)));
+    private final Supplier<Set<ExprId>> inputExprIds = LazyCompute.of(
+            () -> {
+                Set<Slot> inputSlots = getInputSlots();
+                Builder<ExprId> exprIds = ImmutableSet.builderWithExpectedSize(inputSlots.size());
+                for (Slot inputSlot : inputSlots) {
+                    exprIds.add(inputSlot.getExprId());
+                }
+                return exprIds.build();
+            }
+    );
     private final int fastChildrenHashCode;
     private final Supplier<String> toSqlCache = LazyCompute.of(this::computeToSql);
     private final Supplier<Integer> hashCodeCache = LazyCompute.of(this::computeHashCode);
 
     protected Expression(Expression... children) {
-        super(children);
-
-        boolean hasUnbound = false;
-        switch (children.length) {
-            case 0:
-                this.depth = 1;
-                this.width = 1;
-                this.compareWidthAndDepth = supportCompareWidthAndDepth();
-                this.fastChildrenHashCode = 0;
-                break;
-            case 1:
-                Expression child = children[0];
-                this.depth = child.depth + 1;
-                this.width = child.width;
-                this.compareWidthAndDepth = child.compareWidthAndDepth && supportCompareWidthAndDepth();
-                this.fastChildrenHashCode = child.fastChildrenHashCode() + 1;
-                break;
-            case 2:
-                Expression left = children[0];
-                Expression right = children[1];
-                this.depth = Math.max(left.depth, right.depth) + 1;
-                this.width = left.width + right.width;
-                this.compareWidthAndDepth =
-                        left.compareWidthAndDepth && right.compareWidthAndDepth && supportCompareWidthAndDepth();
-                this.fastChildrenHashCode = left.fastChildrenHashCode() + right.fastChildrenHashCode() + 2;
-                break;
-            default:
-                int maxChildDepth = 0;
-                int sumChildWidth = 0;
-                boolean compareWidthAndDepth = true;
-                int fastChildrenHashCode = 0;
-                for (Expression expression : children) {
-                    child = expression;
-                    maxChildDepth = Math.max(child.depth, maxChildDepth);
-                    sumChildWidth += child.width;
-                    hasUnbound |= child.hasUnbound;
-                    compareWidthAndDepth &= child.compareWidthAndDepth;
-                    fastChildrenHashCode = fastChildrenHashCode + expression.fastChildrenHashCode() + 1;
-                }
-                this.depth = maxChildDepth + 1;
-                this.width = sumChildWidth;
-                this.compareWidthAndDepth = compareWidthAndDepth;
-                this.fastChildrenHashCode = fastChildrenHashCode;
-        }
-        checkLimit();
-        this.inferred = false;
-        this.hasUnbound = hasUnbound || this instanceof Unbound;
+        this(Arrays.asList(children));
     }
 
     protected Expression(List<Expression> children) {
@@ -146,6 +111,7 @@ public abstract class Expression extends AbstractTreeNode<Expression> implements
                 this.width = child.width;
                 this.compareWidthAndDepth = child.compareWidthAndDepth && supportCompareWidthAndDepth();
                 this.fastChildrenHashCode = child.fastChildrenHashCode() + 1;
+                hasUnbound = child.hasUnbound();
                 break;
             case 2:
                 Expression left = children.get(0);
@@ -155,6 +121,7 @@ public abstract class Expression extends AbstractTreeNode<Expression> implements
                 this.compareWidthAndDepth =
                         left.compareWidthAndDepth && right.compareWidthAndDepth && supportCompareWidthAndDepth();
                 this.fastChildrenHashCode = left.fastChildrenHashCode() + right.fastChildrenHashCode() + 2;
+                hasUnbound = left.hasUnbound() || right.hasUnbound();
                 break;
             default:
                 int maxChildDepth = 0;
@@ -199,7 +166,8 @@ public abstract class Expression extends AbstractTreeNode<Expression> implements
     // alias
     public String getExpressionName() {
         if (!this.exprName.isPresent()) {
-            this.exprName = Optional.of(Utils.normalizeName(this.getClass().getSimpleName(), DEFAULT_EXPRESSION_NAME));
+            this.exprName = Optional.of(
+                    NameFormatUtils.normalizeName(this.getClass().getSimpleName(), DEFAULT_EXPRESSION_NAME));
         }
         return this.exprName.get();
     }
@@ -292,7 +260,7 @@ public abstract class Expression extends AbstractTreeNode<Expression> implements
             DataType expected = expectedTypes.get(i);
             if (!checkInputDataTypesWithExpectType(input.getDataType(), expected)) {
                 errorMessages.add(String.format("argument %d requires %s type, however '%s' is of %s type",
-                        i + 1, expected.simpleString(), input.toSql(), input.getDataType().simpleString()));
+                        i + 1, expected, input.toSql(), input.getDataType()));
             }
         }
         if (!errorMessages.isEmpty()) {
@@ -334,6 +302,9 @@ public abstract class Expression extends AbstractTreeNode<Expression> implements
         throw new RuntimeException();
     }
 
+    // `inferred` means this predicate was derived by optimizer rules and did not exist in
+    // the original SQL. If an equivalent predicate already exists in the original SQL,
+    // it is not inferred even when the optimizer can derive the same predicate again.
     public Expression withInferred(boolean inferred) {
         throw new RuntimeException("current expression has not impl the withInferred method");
     }
@@ -352,7 +323,8 @@ public abstract class Expression extends AbstractTreeNode<Expression> implements
                 || this instanceof Variable
                 || this instanceof VariableDesc
                 || this instanceof WindowExpression
-                || this instanceof WindowFrame) {
+                || this instanceof WindowFrame
+                || this instanceof TableGeneratingFunction) {
             // agg_fun(literal) is not constant, the result depends on the group by keys
             return false;
         }
@@ -394,12 +366,7 @@ public abstract class Expression extends AbstractTreeNode<Expression> implements
      * Note that the input slots of subquery's inner plan is not included.
      */
     public final Set<ExprId> getInputSlotExprIds() {
-        Set<Slot> inputSlots = getInputSlots();
-        Builder<ExprId> exprIds = ImmutableSet.builderWithExpectedSize(inputSlots.size());
-        for (Slot inputSlot : inputSlots) {
-            exprIds.add(inputSlot.getExprId());
-        }
-        return exprIds.build();
+        return inputExprIds.get();
     }
 
     public boolean isLiteral() {
@@ -421,10 +388,6 @@ public abstract class Expression extends AbstractTreeNode<Expression> implements
     public boolean isKeyColumnFromTable() {
         return (this instanceof SlotReference) && ((SlotReference) this).getOriginalColumn().isPresent()
                 && ((SlotReference) this).getOriginalColumn().get().isKey();
-    }
-
-    public boolean containsUniqueFunction() {
-        return containsType(UniqueFunction.class);
     }
 
     /** containsNullLiteralChildren */

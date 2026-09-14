@@ -24,29 +24,33 @@
 #include <glog/logging.h>
 
 #include <algorithm>
-#include <exception>
 #include <memory>
 #include <mutex>
 #include <utility>
 #include <vector>
 
+#include "cloud/config.h"
 #include "common/logging.h"
 #include "common/status.h"
-#include "olap/olap_common.h"
-#include "pipeline/dependency.h"
-#include "pipeline/pipeline_fragment_context.h"
+#include "exec/operator/rec_cte_scan_operator.h"
+#include "exec/pipeline/dependency.h"
+#include "exec/pipeline/pipeline_fragment_context.h"
+#include "exec/runtime_filter/runtime_filter_definitions.h"
+#include "exec/spill/spill_file_manager.h"
+#include "io/cache/block_file_cache_factory.h"
+#include "io/cache/remote_scan_cache_write_limiter.h"
 #include "runtime/exec_env.h"
 #include "runtime/fragment_mgr.h"
 #include "runtime/memory/heap_profiler.h"
 #include "runtime/runtime_query_statistics_mgr.h"
 #include "runtime/runtime_state.h"
 #include "runtime/thread_context.h"
+#include "runtime/workload_group/workload_group.h"
 #include "runtime/workload_group/workload_group_manager.h"
 #include "runtime/workload_management/query_task_controller.h"
-#include "runtime_filter/runtime_filter_definitions.h"
+#include "storage/olap_common.h"
 #include "util/mem_info.h"
 #include "util/uid_util.h"
-#include "vec/spill/spill_stream_manager.h"
 
 namespace doris {
 
@@ -72,6 +76,8 @@ const std::string toString(QuerySource queryType) {
         return "ROUTINE_LOAD";
     case QuerySource::EXTERNAL_CONNECTOR:
         return "EXTERNAL_CONNECTOR";
+    case QuerySource::EXTERNAL_FRONTEND:
+        return "EXTERNAL_FRONTEND";
     default:
         return "UNKNOWN";
     }
@@ -101,14 +107,35 @@ QueryContext::QueryContext(TUniqueId query_id, ExecEnv* exec_env,
     _init_resource_context();
     SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(query_mem_tracker());
     _query_watcher.start();
-    _execution_dependency =
-            pipeline::Dependency::create_unique(-1, -1, "ExecutionDependency", false);
+    _execution_dependency = Dependency::create_unique(-1, -1, "ExecutionDependency", false);
     _memory_sufficient_dependency =
-            pipeline::Dependency::create_unique(-1, -1, "MemorySufficientDependency", true);
+            Dependency::create_unique(-1, -1, "MemorySufficientDependency", true);
 
     _runtime_filter_mgr = std::make_unique<RuntimeFilterMgr>(true);
 
     _timeout_second = query_options.execution_timeout;
+
+    bool initialize_context_holder =
+            config::enable_file_cache && config::enable_file_cache_query_limit &&
+            query_options.__isset.enable_file_cache && query_options.enable_file_cache &&
+            query_options.__isset.file_cache_query_limit_percent &&
+            query_options.file_cache_query_limit_percent < 100;
+
+    // Initialize file cache context holders
+    if (initialize_context_holder) {
+        _query_context_holders = io::FileCacheFactory::instance()->get_query_context_holders(
+                _query_id, query_options.file_cache_query_limit_percent);
+    }
+
+    const bool initialize_remote_scan_cache_write_limiter =
+            config::is_cloud_mode() && config::enable_file_cache &&
+            query_options.__isset.file_cache_query_limit_bytes &&
+            query_options.file_cache_query_limit_bytes >= 0 &&
+            query_options.query_type == TQueryType::SELECT;
+    if (initialize_remote_scan_cache_write_limiter) {
+        _remote_scan_cache_write_limiter = std::make_unique<io::RemoteScanCacheWriteLimiter>(
+                _query_id, query_options.file_cache_query_limit_bytes);
+    }
 
     bool is_query_type_valid = query_options.query_type == TQueryType::SELECT ||
                                query_options.query_type == TQueryType::LOAD ||
@@ -126,36 +153,44 @@ QueryContext::QueryContext(TUniqueId query_id, ExecEnv* exec_env,
     }
     clock_gettime(CLOCK_MONOTONIC, &this->_query_arrival_timestamp);
     DorisMetrics::instance()->query_ctx_cnt->increment(1);
+    _mem_arb = MemShareArbitrator::create_shared(
+            query_id, query_options.mem_limit,
+            query_options.__isset.max_scan_mem_ratio ? query_options.max_scan_mem_ratio : 1.0);
 }
 
 void QueryContext::_init_query_mem_tracker() {
+    // If user not set query limit, will use default 1TB memory limit. It is large enough to cover most cases.
+    constexpr int64_t DEFAULT_QUERY_MEM_LIMIT = 1LL << 60;
     bool has_query_mem_limit = _query_options.__isset.mem_limit && (_query_options.mem_limit > 0);
-    int64_t bytes_limit = has_query_mem_limit ? _query_options.mem_limit : -1;
-    if (bytes_limit > MemInfo::mem_limit() || bytes_limit == -1) {
-        VLOG_NOTICE << "Query memory limit " << PrettyPrinter::print(bytes_limit, TUnit::BYTES)
+    int64_t user_set_mem_limit =
+            has_query_mem_limit ? _query_options.mem_limit : DEFAULT_QUERY_MEM_LIMIT;
+    int64_t adjusted_mem_limit = user_set_mem_limit;
+    if (adjusted_mem_limit > MemInfo::mem_limit()) {
+        VLOG_NOTICE << "Query memory limit "
+                    << PrettyPrinter::print(user_set_mem_limit, TUnit::BYTES)
                     << " exceeds process memory limit of "
                     << PrettyPrinter::print(MemInfo::mem_limit(), TUnit::BYTES)
-                    << " OR is -1. Using process memory limit instead.";
-        bytes_limit = MemInfo::mem_limit();
+                    << ". Using process memory limit instead.";
+        adjusted_mem_limit = MemInfo::mem_limit();
     }
     // If the query is a pure load task(streamload, routine load, group commit), then it should not use
     // memlimit per query to limit their memory usage.
     if (is_pure_load_task()) {
-        bytes_limit = MemInfo::mem_limit();
+        adjusted_mem_limit = MemInfo::mem_limit();
     }
     std::shared_ptr<MemTrackerLimiter> query_mem_tracker;
     if (_query_options.query_type == TQueryType::SELECT) {
         query_mem_tracker = MemTrackerLimiter::create_shared(
                 MemTrackerLimiter::Type::QUERY, fmt::format("Query#Id={}", print_id(_query_id)),
-                bytes_limit);
+                adjusted_mem_limit);
     } else if (_query_options.query_type == TQueryType::LOAD) {
         query_mem_tracker = MemTrackerLimiter::create_shared(
                 MemTrackerLimiter::Type::LOAD, fmt::format("Load#Id={}", print_id(_query_id)),
-                bytes_limit);
+                adjusted_mem_limit);
     } else if (_query_options.query_type == TQueryType::EXTERNAL) { // spark/flink/etc..
         query_mem_tracker = MemTrackerLimiter::create_shared(
                 MemTrackerLimiter::Type::QUERY, fmt::format("External#Id={}", print_id(_query_id)),
-                bytes_limit);
+                adjusted_mem_limit);
     } else {
         LOG(FATAL) << "__builtin_unreachable";
         __builtin_unreachable();
@@ -173,6 +208,7 @@ void QueryContext::_init_query_mem_tracker() {
     query_mem_tracker->set_enable_check_limit(!(_query_options.__isset.enable_reserve_memory &&
                                                 _query_options.enable_reserve_memory));
     _resource_ctx->memory_context()->set_mem_tracker(query_mem_tracker);
+    _resource_ctx->memory_context()->set_user_set_mem_limit(user_set_mem_limit);
 }
 
 void QueryContext::_init_resource_context() {
@@ -191,6 +227,11 @@ void QueryContext::init_query_task_controller() {
 #endif
 }
 
+void QueryContext::record_spill_data_dir(SpillDataDir* data_dir) {
+    std::lock_guard lock(_spill_data_dirs_mutex);
+    _spill_data_dirs.emplace(data_dir);
+}
+
 QueryContext::~QueryContext() {
     SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(query_mem_tracker());
     // query mem tracker consumption is equal to 0, it means that after QueryContext is created,
@@ -206,40 +247,37 @@ QueryContext::~QueryContext() {
                 PrettyPrinter::print_bytes(query_mem_tracker()->consumption()),
                 PrettyPrinter::print_bytes(query_mem_tracker()->peak_consumption()));
     }
-    [[maybe_unused]] uint64_t group_id = 0;
-    if (workload_group()) {
-        group_id = workload_group()->id(); // before remove
-    }
-
     _resource_ctx->task_controller()->finish();
 
     if (enable_profile()) {
         _report_query_profile();
     }
 
-#ifndef BE_TEST
-    if (ExecEnv::GetInstance()->pipeline_tracer_context()->enabled()) [[unlikely]] {
-        try {
-            ExecEnv::GetInstance()->pipeline_tracer_context()->end_query(_query_id, group_id);
-        } catch (std::exception& e) {
-            LOG(WARNING) << "Dump trace log failed bacause " << e.what();
-        }
-    }
-#endif
     _runtime_filter_mgr.reset();
     _execution_dependency.reset();
     _runtime_predicates.clear();
     file_scan_range_params_map.clear();
     obj_pool.clear();
-    if (_merge_controller_handler) {
-        _merge_controller_handler->release_undone_filters(this);
-    }
     _merge_controller_handler.reset();
 
+    if (auto* spill_file_mgr = _exec_env->spill_file_mgr()) {
+        for (auto* data_dir : _spill_data_dirs) {
+            spill_file_mgr->delete_query_spill_directory(print_id(_query_id), data_dir);
+        }
+    }
+
     DorisMetrics::instance()->query_ctx_cnt->increment(-1);
-    ExecEnv::GetInstance()->fragment_mgr()->remove_query_context(this->_query_id);
+    // fragment_mgr is nullptr in unittest
+    if (ExecEnv::GetInstance()->fragment_mgr()) {
+        ExecEnv::GetInstance()->fragment_mgr()->remove_query_context(this->_query_id);
+    }
     // the only one msg shows query's end. any other msg should append to it if need.
-    LOG_INFO("Query {} deconstructed, mem_tracker: {}", print_id(this->_query_id), mem_tracker_msg);
+    timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    int64_t elapsed_ms = (now.tv_sec - _query_arrival_timestamp.tv_sec) * 1000LL +
+                         (now.tv_nsec - _query_arrival_timestamp.tv_nsec) / 1000000LL;
+    LOG_INFO("Query {} deconstructed, elapsed_ms: {}, mem_tracker: {}", print_id(this->_query_id),
+             elapsed_ms, mem_tracker_msg);
 }
 
 void QueryContext::set_ready_to_execute(Status reason) {
@@ -267,7 +305,7 @@ void QueryContext::set_memory_sufficient(bool sufficient) {
     }
 }
 
-void QueryContext::cancel(Status new_status, int fragment_id) {
+void QueryContext::cancel(Status new_status) {
     if (!_exec_status.update(new_status)) {
         return;
     }
@@ -305,7 +343,21 @@ void QueryContext::cancel(Status new_status, int fragment_id) {
     }
 
     set_ready_to_execute(new_status);
-    cancel_all_pipeline_context(new_status, fragment_id);
+
+    // Copy the fragment contexts under the map lock, then cancel them after releasing it. Fragment
+    // cancellation may take task-level locks and must not run while holding the query map lock.
+    std::vector<std::weak_ptr<PipelineFragmentContext>> ctx_to_cancel;
+    {
+        std::lock_guard<std::mutex> lock(_pipeline_map_write_lock);
+        for (auto& entry : _fragment_id_to_pipeline_ctx) {
+            ctx_to_cancel.push_back(entry.second);
+        }
+    }
+    for (auto& f_context : ctx_to_cancel) {
+        if (auto pipeline_ctx = f_context.lock()) {
+            pipeline_ctx->cancel(new_status);
+        }
+    }
 }
 
 void QueryContext::set_load_error_url(std::string error_url) {
@@ -328,26 +380,8 @@ std::string QueryContext::get_first_error_msg() {
     return _first_error_msg;
 }
 
-void QueryContext::cancel_all_pipeline_context(const Status& reason, int fragment_id) {
-    std::vector<std::weak_ptr<pipeline::PipelineFragmentContext>> ctx_to_cancel;
-    {
-        std::lock_guard<std::mutex> lock(_pipeline_map_write_lock);
-        for (auto& [f_id, f_context] : _fragment_id_to_pipeline_ctx) {
-            if (fragment_id == f_id) {
-                continue;
-            }
-            ctx_to_cancel.push_back(f_context);
-        }
-    }
-    for (auto& f_context : ctx_to_cancel) {
-        if (auto pipeline_ctx = f_context.lock()) {
-            pipeline_ctx->cancel(reason);
-        }
-    }
-}
-
 std::string QueryContext::print_all_pipeline_context() {
-    std::vector<std::weak_ptr<pipeline::PipelineFragmentContext>> ctx_to_print;
+    std::vector<std::weak_ptr<PipelineFragmentContext>> ctx_to_print;
     fmt::memory_buffer debug_string_buffer;
     size_t i = 0;
     {
@@ -373,13 +407,15 @@ std::string QueryContext::print_all_pipeline_context() {
     return fmt::to_string(debug_string_buffer);
 }
 
-void QueryContext::set_pipeline_context(
-        const int fragment_id, std::shared_ptr<pipeline::PipelineFragmentContext> pip_ctx) {
+void QueryContext::set_pipeline_context(const int fragment_id,
+                                        std::shared_ptr<PipelineFragmentContext> pip_ctx) {
     std::lock_guard<std::mutex> lock(_pipeline_map_write_lock);
-    _fragment_id_to_pipeline_ctx.insert({fragment_id, pip_ctx});
+    // Use insert_or_assign instead of insert to support overwriting old entries
+    // when recursive CTE recreates PipelineFragmentContext between rounds.
+    _fragment_id_to_pipeline_ctx.insert_or_assign(fragment_id, pip_ctx);
 }
 
-doris::pipeline::TaskScheduler* QueryContext::get_pipe_exec_scheduler() {
+doris::TaskScheduler* QueryContext::get_pipe_exec_scheduler() {
     if (!_task_scheduler) {
         throw Exception(Status::InternalError("task_scheduler is null"));
     }
@@ -495,6 +531,60 @@ TReportExecStatusParams QueryContext::get_realtime_exec_status() {
             /*is_done=*/false);
 
     return exec_status;
+}
+
+Status QueryContext::send_block_to_cte_scan(
+        const TUniqueId& instance_id, int node_id,
+        const google::protobuf::RepeatedPtrField<doris::PBlock>& pblocks, bool eos) {
+    std::unique_lock<std::mutex> l(_cte_scan_lock);
+    auto it = _cte_scan.find(std::make_pair(instance_id, node_id));
+    if (it == _cte_scan.end()) {
+        return Status::InternalError("RecCTEScan not found for instance {}, node {}",
+                                     print_id(instance_id), node_id);
+    }
+    for (const auto& pblock : pblocks) {
+        RETURN_IF_ERROR(it->second->add_block(pblock));
+    }
+    if (eos) {
+        it->second->set_ready();
+    }
+    return Status::OK();
+}
+
+void QueryContext::registe_cte_scan(const TUniqueId& instance_id, int node_id,
+                                    RecCTEScanLocalState* scan) {
+    std::unique_lock<std::mutex> l(_cte_scan_lock);
+    auto key = std::make_pair(instance_id, node_id);
+    DCHECK(!_cte_scan.contains(key)) << "Duplicate registe cte scan for instance "
+                                     << print_id(instance_id) << ", node " << node_id;
+    _cte_scan.emplace(key, scan);
+}
+
+void QueryContext::deregiste_cte_scan(const TUniqueId& instance_id, int node_id) {
+    std::lock_guard<std::mutex> l(_cte_scan_lock);
+    auto key = std::make_pair(instance_id, node_id);
+    DCHECK(_cte_scan.contains(key)) << "Duplicate deregiste cte scan for instance "
+                                    << print_id(instance_id) << ", node " << node_id;
+    _cte_scan.erase(key);
+}
+
+Status QueryContext::reset_global_rf(const google::protobuf::RepeatedField<int32_t>& filter_ids) {
+    if (_merge_controller_handler) {
+        return _merge_controller_handler->reset_global_rf(this, filter_ids);
+    }
+    return Status::OK();
+}
+
+void QueryContext::add_total_task_num(int delta) {
+    if (auto* qtc = dynamic_cast<QueryTaskController*>(_resource_ctx->task_controller())) {
+        qtc->add_total_task_num(delta);
+    }
+}
+
+void QueryContext::inc_finished_task_num() {
+    if (auto* qtc = dynamic_cast<QueryTaskController*>(_resource_ctx->task_controller())) {
+        qtc->inc_finished_task_num();
+    }
 }
 
 } // namespace doris

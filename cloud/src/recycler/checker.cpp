@@ -34,6 +34,7 @@
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
@@ -45,15 +46,19 @@
 #include "common/defer.h"
 #include "common/encryption_util.h"
 #include "common/logging.h"
+#include "common/rowset_segment_id.h"
 #include "common/util.h"
 #include "cpp/sync_point.h"
 #include "meta-service/meta_service.h"
 #include "meta-service/meta_service_schema.h"
 #include "meta-service/meta_service_tablet_stats.h"
 #include "meta-store/blob_message.h"
+#include "meta-store/clone_chain_reader.h"
 #include "meta-store/keys.h"
+#include "meta-store/meta_reader.h"
 #include "meta-store/txn_kv.h"
-#include "snapshot/snapshot_manager.h"
+#include "meta-store/versioned_value.h"
+#include "snapshot/snapshot_manager_factory.h"
 #ifdef ENABLE_HDFS_STORAGE_VAULT
 #include "recycler/hdfs_accessor.h"
 #endif
@@ -77,6 +82,53 @@ extern bool enable_inverted_check;
 } // namespace config
 
 using namespace std::chrono;
+
+TxnErrorCode collect_pending_table_stream_drops(
+        const std::shared_ptr<TxnKv>& txn_kv, std::string_view instance_id,
+        std::unordered_map<int64_t, PendingTableStreamDrop>* pending_drops) {
+    pending_drops->clear();
+    const std::string log_key = versioned::log_key(instance_id);
+    const std::string begin_key = encode_versioned_key(log_key, Versionstamp::min());
+    const std::string end_key = encode_versioned_key(log_key, Versionstamp::max());
+    std::unique_ptr<BlobIterator> iter = blob_get_range(txn_kv, begin_key, end_key, true);
+    for (; iter->valid(); iter->next()) {
+        OperationLogPB operation_log;
+        if (!iter->parse_value(&operation_log)) {
+            LOG_WARNING("failed to parse OperationLogPB while checking Table Stream metadata")
+                    .tag("instance_id", instance_id)
+                    .tag("key", hex(iter->key()));
+            return TxnErrorCode::TXN_INVALID_DATA;
+        }
+        if (!operation_log.has_drop_index() ||
+            operation_log.drop_index().object_type() != IndexObjectTypePB::TABLE_STREAM) {
+            continue;
+        }
+
+        const DropIndexLogPB& drop_index = operation_log.drop_index();
+        if (!drop_index.has_db_id() || !drop_index.has_table_id() ||
+            !drop_index.has_stream_db_id()) {
+            LOG_WARNING("Table Stream DropIndexLogPB is missing its binding")
+                    .tag("instance_id", instance_id)
+                    .tag("operation_log", operation_log.ShortDebugString());
+            return TxnErrorCode::TXN_INVALID_DATA;
+        }
+        PendingTableStreamDrop drop {.base_db_id = drop_index.db_id(),
+                                     .base_table_id = drop_index.table_id(),
+                                     .stream_db_id = drop_index.stream_db_id()};
+        for (int64_t stream_id : drop_index.index_ids()) {
+            auto [existing, inserted] = pending_drops->emplace(stream_id, drop);
+            if (!inserted && (existing->second.base_db_id != drop.base_db_id ||
+                              existing->second.base_table_id != drop.base_table_id ||
+                              existing->second.stream_db_id != drop.stream_db_id)) {
+                LOG_WARNING("conflicting pending Table Stream drops")
+                        .tag("instance_id", instance_id)
+                        .tag("stream_id", stream_id);
+                return TxnErrorCode::TXN_INVALID_DATA;
+            }
+        }
+    }
+    return iter->error_code();
+}
 
 Checker::Checker(std::shared_ptr<TxnKv> txn_kv) : txn_kv_(std::move(txn_kv)) {
     ip_port_ = std::string(butil::my_ip_cstr()) + ":" + std::to_string(config::brpc_listen_port);
@@ -280,6 +332,11 @@ int Checker::start() {
                 }
             }
 
+            log_progress("do_table_stream_check");
+            if (int ret = checker->do_table_stream_check(); ret != 0) {
+                success = false;
+            }
+
             if (config::enable_packed_file_check) {
                 log_progress("do_packed_file_check");
                 if (int ret = checker->do_packed_file_check(); ret != 0) {
@@ -464,12 +521,15 @@ int key_exist(TxnKv* txn_kv, std::string_view key) {
 
 InstanceChecker::InstanceChecker(std::shared_ptr<TxnKv> txn_kv, const std::string& instance_id)
         : txn_kv_(txn_kv), instance_id_(instance_id) {
-    snapshot_manager_ = std::make_shared<SnapshotManager>(txn_kv);
+    snapshot_manager_ = create_snapshot_manager(txn_kv);
     resource_mgr_ = std::make_shared<ResourceManager>(std::move(txn_kv));
     resource_mgr_->init();
 }
 
 int InstanceChecker::init(const InstanceInfoPB& instance) {
+    table_stream_versioned_write_ = instance.multi_version_status() == MULTI_VERSION_WRITE_ONLY ||
+                                    instance.multi_version_status() == MULTI_VERSION_READ_WRITE;
+
     int ret = init_obj_store_accessors(instance);
     if (ret != 0) {
         return ret;
@@ -651,7 +711,8 @@ int InstanceChecker::do_check() {
         }
 
         for (int i = 0; i < rs_meta.num_segments(); ++i) {
-            auto path = segment_path(rs_meta.tablet_id(), rs_meta.rowset_id_v2(), i);
+            auto segment_id = rowset_segment_id(rs_meta, i);
+            auto path = segment_path(rs_meta.tablet_id(), rs_meta.rowset_id_v2(), segment_id);
 
             // Skip check if segment is already packed into a larger file
             const auto& index_map = rs_meta.packed_slice_locations();
@@ -714,22 +775,26 @@ int InstanceChecker::do_check() {
         }
         if (!index_ids.empty()) {
             const auto& index_map = rs_meta.packed_slice_locations();
+            const auto index_format =
+                    rs_meta.has_inverted_index_storage_format()
+                            ? rs_meta.inverted_index_storage_format()
+                            : rs_meta.tablet_schema().inverted_index_storage_format();
             for (int i = 0; i < rs_meta.num_segments(); ++i) {
+                auto segment_id = rowset_segment_id(rs_meta, i);
                 std::vector<std::string> index_path_v;
-                if (rs_meta.tablet_schema().inverted_index_storage_format() ==
-                    InvertedIndexStorageFormatPB::V1) {
+                if (index_format == InvertedIndexStorageFormatPB::V1) {
                     for (const auto& index_id : index_ids) {
                         LOG(INFO) << "check inverted index, tablet_id=" << rs_meta.tablet_id()
-                                  << " rowset_id=" << rs_meta.rowset_id_v2() << " segment_id=" << i
-                                  << " index_id=" << index_id.first
+                                  << " rowset_id=" << rs_meta.rowset_id_v2()
+                                  << " segment_id=" << segment_id << " index_id=" << index_id.first
                                   << " index_suffix_name=" << index_id.second;
-                        index_path_v.emplace_back(
-                                inverted_index_path_v1(rs_meta.tablet_id(), rs_meta.rowset_id_v2(),
-                                                       i, index_id.first, index_id.second));
+                        index_path_v.emplace_back(inverted_index_path_v1(
+                                rs_meta.tablet_id(), rs_meta.rowset_id_v2(), segment_id,
+                                index_id.first, index_id.second));
                     }
                 } else {
-                    index_path_v.emplace_back(
-                            inverted_index_path_v2(rs_meta.tablet_id(), rs_meta.rowset_id_v2(), i));
+                    index_path_v.emplace_back(inverted_index_path_v2(
+                            rs_meta.tablet_id(), rs_meta.rowset_id_v2(), segment_id));
                 }
 
                 if (std::ranges::all_of(index_path_v, [&](const auto& idx_file_path) {
@@ -756,7 +821,7 @@ int InstanceChecker::do_check() {
     auto end_key = meta_rowset_key({instance_id_, INT64_MAX, 0});
 
     std::unique_ptr<RangeGetIterator> it;
-    do {
+    while (it == nullptr /* may be not init */ || (it->more() && !stopped())) {
         std::unique_ptr<Transaction> txn;
         TxnErrorCode err = txn_kv_->create_txn(&txn);
         if (err != TxnErrorCode::TXN_OK) {
@@ -786,7 +851,7 @@ int InstanceChecker::do_check() {
             check_rowset_objects(rs_meta, k);
         }
         start_key.push_back('\x00'); // Update to next smallest key for iteration
-    } while (it->more() && !stopped());
+    }
 
     return num_rowset_loss > 0 ? 1 : check_ret;
 }
@@ -794,7 +859,7 @@ int InstanceChecker::do_check() {
 int InstanceChecker::get_bucket_lifecycle(int64_t* lifecycle_days) {
     // If there are multiple buckets, return the minimum lifecycle.
     int64_t min_lifecycle_days = INT64_MAX;
-    int64_t tmp_liefcycle_days = 0;
+    int64_t tmp_lifecycle_days = 0;
     for (const auto& [id, accessor] : accessor_map_) {
         if (accessor->type() != AccessorType::S3) {
             continue;
@@ -806,12 +871,12 @@ int InstanceChecker::get_bucket_lifecycle(int64_t* lifecycle_days) {
             return -1;
         }
 
-        if (s3_accessor->get_life_cycle(&tmp_liefcycle_days) != 0) {
+        if (s3_accessor->get_lifecycle(&tmp_lifecycle_days) != 0) {
             return -1;
         }
 
-        if (tmp_liefcycle_days < min_lifecycle_days) {
-            min_lifecycle_days = tmp_liefcycle_days;
+        if (tmp_lifecycle_days < min_lifecycle_days) {
+            min_lifecycle_days = tmp_lifecycle_days;
         }
     }
     *lifecycle_days = min_lifecycle_days;
@@ -901,7 +966,7 @@ int InstanceChecker::do_inverted_check() {
         std::unique_ptr<RangeGetIterator> it;
         auto begin = meta_rowset_key({instance_id_, tablet_id, 0});
         auto end = meta_rowset_key({instance_id_, tablet_id, INT64_MAX});
-        do {
+        while (it == nullptr /* may be not init */ || (it->more() && !stopped())) {
             TxnErrorCode err = txn->get(begin, end, &it);
             if (err != TxnErrorCode::TXN_OK) {
                 LOG(WARNING) << "failed to get rowset kv, err=" << err;
@@ -925,7 +990,7 @@ int InstanceChecker::do_inverted_check() {
                     break;
                 }
             }
-        } while (it->more() && !stopped());
+        }
 
         if (!tablet_rowsets_cache.rowset_ids.contains(rowset_id)) {
             // Garbage data leak
@@ -992,21 +1057,25 @@ int InstanceChecker::do_inverted_check() {
         }
 
         for (auto file = list_iter->next(); file.has_value(); file = list_iter->next()) {
+            const auto& path = file->path;
+            if (path == "data/packed_file" || path.starts_with("data/packed_file/")) {
+                continue; // packed_file has dedicated check logic
+            }
             ++num_scanned;
-            int ret = check_segment_file(file->path);
+            int ret = check_segment_file(path);
             if (ret != 0) {
                 LOG(WARNING) << "failed to check segment file, uri=" << accessor->uri()
-                             << " path=" << file->path;
+                             << " path=" << path;
                 if (ret == 1) {
                     ++num_file_leak;
                 } else {
                     check_ret = -1;
                 }
             }
-            ret = check_inverted_index_file(file->path);
+            ret = check_inverted_index_file(path);
             if (ret != 0) {
                 LOG(WARNING) << "failed to check index file, uri=" << accessor->uri()
-                             << " path=" << file->path;
+                             << " path=" << path;
                 if (ret == 1) {
                     ++num_file_leak;
                 } else {
@@ -1027,7 +1096,7 @@ int InstanceChecker::traverse_mow_tablet(const std::function<int(int64_t, bool)>
     std::unique_ptr<RangeGetIterator> it;
     auto begin = meta_rowset_key({instance_id_, 0, 0});
     auto end = meta_rowset_key({instance_id_, std::numeric_limits<int64_t>::max(), 0});
-    do {
+    while (it == nullptr /* may be not init */ || (it->more() && !stopped())) {
         std::unique_ptr<Transaction> txn;
         TxnErrorCode err = txn_kv_->create_txn(&txn);
         if (err != TxnErrorCode::TXN_OK) {
@@ -1079,7 +1148,7 @@ int InstanceChecker::traverse_mow_tablet(const std::function<int(int64_t, bool)>
                 }
             }
         }
-    } while (it->more() && !stopped());
+    }
     return 0;
 }
 
@@ -1091,7 +1160,7 @@ int InstanceChecker::traverse_rowset_delete_bitmaps(
     auto end = meta_delete_bitmap_key({instance_id_, tablet_id, rowset_id,
                                        std::numeric_limits<int64_t>::max(),
                                        std::numeric_limits<int64_t>::max()});
-    do {
+    while (it == nullptr /* may be not init */ || (it->more() && !stopped())) {
         std::unique_ptr<Transaction> txn;
         TxnErrorCode err = txn_kv_->create_txn(&txn);
         if (err != TxnErrorCode::TXN_OK) {
@@ -1127,7 +1196,7 @@ int InstanceChecker::traverse_rowset_delete_bitmaps(
                 break;
             }
         }
-    } while (it->more() && !stopped());
+    }
 
     return 0;
 }
@@ -1145,7 +1214,7 @@ int InstanceChecker::collect_tablet_rowsets(
     auto end = meta_rowset_key({instance_id_, tablet_id + 1, 0});
 
     int64_t rowsets_num {0};
-    do {
+    while (it == nullptr /* may be not init */ || (it->more() && !stopped())) {
         TxnErrorCode err = txn->get(begin, end, &it);
         if (err != TxnErrorCode::TXN_OK) {
             LOG(WARNING) << "failed to get rowset kv, err=" << err;
@@ -1171,7 +1240,7 @@ int InstanceChecker::collect_tablet_rowsets(
                 break;
             }
         }
-    } while (it->more() && !stopped());
+    }
 
     LOG(INFO) << fmt::format(
             "[delete bitmap checker] successfully collect rowsets for instance_id={}, "
@@ -1223,11 +1292,16 @@ int InstanceChecker::do_delete_bitmap_inverted_check() {
         std::unordered_set<std::string> pending_delete_bitmaps {};
     } tablet_rowsets_cache {};
 
+    std::unordered_map<int64_t, std::unordered_set<std::string>> unexpired_tmp_rowsets;
+    if (int ret = collect_unexpired_job_tmp_rowsets(unexpired_tmp_rowsets); ret < 0) {
+        return ret;
+    }
+
     std::unique_ptr<RangeGetIterator> it;
     auto begin = meta_delete_bitmap_key({instance_id_, 0, "", 0, 0});
     auto end =
             meta_delete_bitmap_key({instance_id_, std::numeric_limits<int64_t>::max(), "", 0, 0});
-    do {
+    while (it == nullptr /* may be not init */ || (it->more() && !stopped())) {
         std::unique_ptr<Transaction> txn;
         TxnErrorCode err = txn_kv_->create_txn(&txn);
         if (err != TxnErrorCode::TXN_OK) {
@@ -1263,6 +1337,9 @@ int InstanceChecker::do_delete_bitmap_inverted_check() {
 
             if (tablet_rowsets_cache.tablet_id == -1 ||
                 tablet_rowsets_cache.tablet_id != tablet_id) {
+                if (tablet_rowsets_cache.tablet_id != -1) {
+                    unexpired_tmp_rowsets.erase(tablet_rowsets_cache.tablet_id);
+                }
                 TabletMetaCloudPB tablet_meta;
                 int ret = get_tablet_meta(txn_kv_.get(), instance_id_, tablet_id, tablet_meta);
                 if (ret < 0) {
@@ -1315,8 +1392,15 @@ int InstanceChecker::do_delete_bitmap_inverted_check() {
                 continue;
             }
 
+            bool belongs_to_unexpired_tmp_rowset = false;
+            auto tmp_rowsets_it = unexpired_tmp_rowsets.find(tablet_id);
+            if (tmp_rowsets_it != unexpired_tmp_rowsets.end()) {
+                belongs_to_unexpired_tmp_rowset = tmp_rowsets_it->second.contains(rowset_id);
+            }
+
             if (!tablet_rowsets_cache.rowsets.contains(rowset_id) &&
-                !tablet_rowsets_cache.pending_delete_bitmaps.contains(std::string(k))) {
+                !tablet_rowsets_cache.pending_delete_bitmaps.contains(std::string(k)) &&
+                !belongs_to_unexpired_tmp_rowset) {
                 TEST_SYNC_POINT_CALLBACK(
                         "InstanceChecker::do_delete_bitmap_inverted_check.get_leaked_delete_bitmap",
                         &tablet_id, &rowset_id, &version, &segment_id);
@@ -1329,9 +1413,119 @@ int InstanceChecker::do_delete_bitmap_inverted_check() {
                         instance_id_, tablet_id, rowset_id, version, segment_id);
             }
         }
-    } while (it->more() && !stopped());
+    }
 
     return (leaked_delete_bitmaps > 0 || abnormal_delete_bitmaps > 0) ? 1 : 0;
+}
+
+int InstanceChecker::collect_unexpired_job_tmp_rowsets(
+        std::unordered_map<int64_t, std::unordered_set<std::string>>& tmp_rowsets) {
+    static constexpr int64_t max_unexpired_tmp_rowsets = 1000;
+    auto begin = meta_rowset_tmp_key({instance_id_, 0, 0});
+    auto end = meta_rowset_tmp_key({instance_id_, INT64_MAX, 0});
+    std::unique_ptr<RangeGetIterator> it;
+    int64_t num_scanned = 0;
+    int64_t num_non_job = 0;
+    int64_t num_skipped_non_job_txns = 0;
+    int64_t num_unexpired = 0;
+    int64_t num_expired = 0;
+    int64_t last_txn_id = -1;
+    int64_t current_time = duration_cast<seconds>(system_clock::now().time_since_epoch()).count();
+
+    while (it == nullptr /* may be not init */ || (it->more() && !stopped())) {
+        std::unique_ptr<Transaction> txn;
+        TxnErrorCode err = txn_kv_->create_txn(&txn);
+        if (err != TxnErrorCode::TXN_OK) {
+            LOG(WARNING) << "failed to create txn";
+            return -1;
+        }
+        err = txn->get(begin, end, &it);
+        if (err != TxnErrorCode::TXN_OK) {
+            LOG(WARNING) << "failed to get tmp rowset kv, err=" << err;
+            return -1;
+        }
+        if (!it->has_next()) {
+            break;
+        }
+        while (it->has_next() && !stopped()) {
+            auto [k, v] = it->next();
+            ++num_scanned;
+
+            std::string_view k1 = k;
+            k1.remove_prefix(1);
+            std::vector<std::tuple<std::variant<int64_t, std::string>, int, int>> out;
+            if (decode_key(&k1, &out) != 0 || out.size() < 5) {
+                LOG(WARNING) << "malformed tmp rowset key, key=" << hex(k);
+                return -1;
+            }
+            // 0x01 "meta" ${instance_id} "rowset_tmp" ${txn_id} ${tablet_id} -> RowsetMetaCloudPB
+            auto txn_id = std::get<int64_t>(std::get<0>(out[3]));
+            bool is_first_rowset_of_txn = last_txn_id != txn_id;
+            last_txn_id = txn_id;
+
+            doris::RowsetMetaCloudPB rowset;
+            if (!rowset.ParseFromArray(v.data(), v.size())) {
+                LOG(WARNING) << "malformed tmp rowset meta, key=" << hex(k);
+                return -1;
+            }
+            if (!rowset.has_job_id() || rowset.job_id().empty()) {
+                ++num_non_job;
+                if (is_first_rowset_of_txn) {
+                    ++num_skipped_non_job_txns;
+                    if (txn_id == INT64_MAX) {
+                        begin = end;
+                    } else {
+                        begin = meta_rowset_tmp_key({instance_id_, txn_id + 1, 0});
+                    }
+                    it.reset();
+                    break;
+                }
+                if (!it->has_next()) {
+                    begin = k;
+                    begin.push_back('\x00');
+                }
+                continue;
+            }
+
+            // Must use the same threshold as the recycler so that a delete bitmap is never
+            // reported as leaked while its tmp rowset is still alive from the recycler's view.
+            // `earlest_ts` is a local sentinel initialized to 0 on purpose: it keeps the value
+            // below any real expiration so the helper never updates the recycler's
+            // earliest-ts bvar (the checker must not touch the recycler's metrics).
+            int64_t earlest_ts = 0;
+            int64_t expiration =
+                    calculate_tmp_rowset_expired_time(instance_id_, rowset, &earlest_ts);
+            if (current_time < expiration) {
+                tmp_rowsets[rowset.tablet_id()].insert(rowset.rowset_id_v2());
+                ++num_unexpired;
+                if (num_unexpired >= max_unexpired_tmp_rowsets) {
+                    LOG(WARNING)
+                            << "collect unexpired tmp rowsets for delete bitmap checker reached "
+                            << "limit, remaining tmp rowsets will not be considered and may cause "
+                            << "false positives, instance_id=" << instance_id_
+                            << ", num_scanned=" << num_scanned << ", num_non_job=" << num_non_job
+                            << ", num_skipped_non_job_txns=" << num_skipped_non_job_txns
+                            << ", num_unexpired=" << num_unexpired
+                            << ", num_expired=" << num_expired
+                            << ", limit=" << max_unexpired_tmp_rowsets;
+                    return 0;
+                }
+            } else {
+                ++num_expired;
+            }
+
+            if (!it->has_next()) {
+                begin = k;
+                begin.push_back('\x00');
+            }
+        }
+    }
+
+    LOG(INFO) << "collect unexpired tmp rowsets for delete bitmap checker finished, instance_id="
+              << instance_id_ << ", num_scanned=" << num_scanned << ", num_non_job=" << num_non_job
+              << ", num_skipped_non_job_txns=" << num_skipped_non_job_txns
+              << ", num_unexpired=" << num_unexpired << ", num_expired=" << num_expired;
+    return 0;
 }
 
 int InstanceChecker::get_pending_delete_bitmap_keys(
@@ -1411,7 +1605,7 @@ int InstanceChecker::check_inverted_index_file_storage_format_v1(
     std::unique_ptr<RangeGetIterator> it;
     auto begin = meta_rowset_key({instance_id_, tablet_id, 0});
     auto end = meta_rowset_key({instance_id_, tablet_id, INT64_MAX});
-    do {
+    while (it == nullptr /* may be not init */ || (it->more() && !stopped())) {
         TxnErrorCode err = txn->get(begin, end, &it);
         if (err != TxnErrorCode::TXN_OK) {
             LOG(WARNING) << "failed to get rowset kv, err=" << err;
@@ -1452,8 +1646,8 @@ int InstanceChecker::check_inverted_index_file_storage_format_v1(
                 return -1;
             }
 
-            for (size_t i = 0; i < rs_meta.num_segments(); i++) {
-                rowset_index_cache_v1.segment_ids.insert(i);
+            for (int64_t i = 0; i < rs_meta.num_segments(); i++) {
+                rowset_index_cache_v1.segment_ids.insert(rowset_segment_id(rs_meta, i));
             }
 
             for (const auto& i : rs_meta.tablet_schema().index()) {
@@ -1472,7 +1666,7 @@ int InstanceChecker::check_inverted_index_file_storage_format_v1(
                 break;
             }
         }
-    } while (it->more() && !stopped());
+    }
 
     if (!rowset_index_cache_v1.segment_ids.contains(segment_id)) {
         // Garbage data leak
@@ -1535,7 +1729,7 @@ int InstanceChecker::check_inverted_index_file_storage_format_v2(
     std::unique_ptr<RangeGetIterator> it;
     auto begin = meta_rowset_key({instance_id_, tablet_id, 0});
     auto end = meta_rowset_key({instance_id_, tablet_id, INT64_MAX});
-    do {
+    while (it == nullptr /* may be not init */ || (it->more() && !stopped())) {
         TxnErrorCode err = txn->get(begin, end, &it);
         if (err != TxnErrorCode::TXN_OK) {
             LOG(WARNING) << "failed to get rowset kv, err=" << err;
@@ -1553,8 +1747,8 @@ int InstanceChecker::check_inverted_index_file_storage_format_v2(
                 return -1;
             }
 
-            for (size_t i = 0; i < rs_meta.num_segments(); i++) {
-                rowset_index_cache_v2.segment_ids.insert(i);
+            for (int64_t i = 0; i < rs_meta.num_segments(); i++) {
+                rowset_index_cache_v2.segment_ids.insert(rowset_segment_id(rs_meta, i));
             }
 
             if (!it->has_next()) {
@@ -1563,7 +1757,7 @@ int InstanceChecker::check_inverted_index_file_storage_format_v2(
                 break;
             }
         }
-    } while (it->more() && !stopped());
+    }
 
     if (!rowset_index_cache_v2.segment_ids.contains(segment_id)) {
         // Garbage data leak
@@ -1657,7 +1851,7 @@ int InstanceChecker::check_delete_bitmap_storage_optimize_v2(
     };
     using namespace std::chrono;
     int64_t now = duration_cast<seconds>(system_clock::now().time_since_epoch()).count();
-    do {
+    while (it == nullptr /* may be not init */ || (it->more() && !stopped())) {
         std::unique_ptr<Transaction> txn;
         TxnErrorCode err = txn_kv_->create_txn(&txn);
         if (err != TxnErrorCode::TXN_OK) {
@@ -1730,7 +1924,7 @@ int InstanceChecker::check_delete_bitmap_storage_optimize_v2(
             }
             last_failed_version = version;
         }
-    } while (it->more() && !stopped());
+    }
     if (!failed_versions.empty()) {
         print_failed_versions();
     }
@@ -1794,7 +1988,7 @@ int InstanceChecker::do_mow_job_key_check() {
     std::string begin = mow_tablet_job_key({instance_id_, 0, 0});
     std::string end = mow_tablet_job_key({instance_id_, INT64_MAX, 0});
     MowTabletJobPB mow_tablet_job;
-    do {
+    while (it == nullptr /* may be not init */ || (it->more() && !stopped())) {
         std::unique_ptr<Transaction> txn;
         TxnErrorCode err = txn_kv_->create_txn(&txn);
         if (err != TxnErrorCode::TXN_OK) {
@@ -1857,7 +2051,7 @@ int InstanceChecker::do_mow_job_key_check() {
             }
         }
         begin = it->next_begin_key(); // Update to next smallest key for iteration
-    } while (it->more() && !stopped());
+    }
     return 0;
 }
 int InstanceChecker::do_tablet_stats_key_check() {
@@ -2112,7 +2306,7 @@ int InstanceChecker::scan_and_handle_kv(
     std::unique_ptr<RangeGetIterator> it;
     int limit = 10000;
     TEST_SYNC_POINT_CALLBACK("InstanceChecker:scan_and_handle_kv:limit", &limit);
-    do {
+    while (it == nullptr /* may be not init */ || (it->more() && !stopped())) {
         err = txn->get(start_key, end_key, &it, false, limit);
         TEST_SYNC_POINT_CALLBACK("InstanceChecker:scan_and_handle_kv:get_err", &err);
         if (err == TxnErrorCode::TXN_TOO_OLD) {
@@ -2142,29 +2336,355 @@ int InstanceChecker::scan_and_handle_kv(
             }
         }
         start_key = it->next_begin_key();
-    } while (it->more() && !stopped());
+    }
     return ret;
 }
 
+// The check validates Offset values and the Latest/Versioned projection invariant. FE Catalog is
+// the authority for Stream existence and binding, so no MS-side Stream Mapping is checked here.
+int InstanceChecker::do_table_stream_check() {
+    struct VersionedOffset {
+        Versionstamp versionstamp;
+        TableStreamOffsetPB offset;
+    };
+
+    auto decode_components =
+            [](std::string_view key, size_t expected_size,
+               std::vector<std::tuple<std::variant<int64_t, std::string>, int, int>>* components) {
+                if (key.empty()) {
+                    return false;
+                }
+                key.remove_prefix(1);
+                return decode_key(&key, components) == 0 && components->size() == expected_size;
+            };
+
+    auto classify_recycle_index = [&](const RecycleIndexPB* recycle_index, int64_t base_db_id,
+                                      int64_t base_table_id, int64_t stream_db_id,
+                                      int64_t stream_id) {
+        if (recycle_index == nullptr) {
+            return 0;
+        }
+        if (recycle_index->object_type() != TABLE_STREAM || !recycle_index->has_db_id() ||
+            recycle_index->db_id() != base_db_id || !recycle_index->has_table_id() ||
+            recycle_index->table_id() != base_table_id || !recycle_index->has_stream_db_id() ||
+            recycle_index->stream_db_id() != stream_db_id || !recycle_index->has_state()) {
+            LOG_WARNING("Recycle Index does not match Table Stream Offset")
+                    .tag("instance_id", instance_id_)
+                    .tag("stream_id", stream_id)
+                    .tag("recycle_index", recycle_index->ShortDebugString());
+            return 1;
+        }
+        switch (recycle_index->state()) {
+        case RecycleIndexPB::PREPARED:
+        case RecycleIndexPB::DROPPED:
+            return 0;
+        case RecycleIndexPB::RECYCLING:
+            return 2;
+        default:
+            LOG_WARNING("Recycle Index has invalid state for Table Stream Offset")
+                    .tag("instance_id", instance_id_)
+                    .tag("stream_id", stream_id)
+                    .tag("state", recycle_index->state());
+            return 1;
+        }
+    };
+
+    std::unordered_map<int64_t, std::optional<RecycleIndexPB>> recycle_indexes;
+    auto classify_cached_recycle_index = [&](int64_t base_db_id, int64_t base_table_id,
+                                             int64_t stream_db_id, int64_t stream_id) {
+        auto cached = recycle_indexes.find(stream_id);
+        if (cached == recycle_indexes.end()) {
+            std::unique_ptr<Transaction> txn;
+            TxnErrorCode err = txn_kv_->create_txn(&txn);
+            if (err != TxnErrorCode::TXN_OK) {
+                LOG_WARNING("failed to create transaction for Recycle Index check")
+                        .tag("instance_id", instance_id_)
+                        .tag("stream_id", stream_id)
+                        .tag("error", err);
+                return -1;
+            }
+            std::string value;
+            err = txn->get(recycle_index_key({instance_id_, stream_id}), &value, true);
+            if (err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
+                cached = recycle_indexes.emplace(stream_id, std::nullopt).first;
+            } else if (err != TxnErrorCode::TXN_OK) {
+                LOG_WARNING("failed to read Recycle Index during Table Stream Offset check")
+                        .tag("instance_id", instance_id_)
+                        .tag("stream_id", stream_id)
+                        .tag("error", err);
+                return -1;
+            } else {
+                RecycleIndexPB recycle_index;
+                if (!recycle_index.ParseFromString(value)) {
+                    LOG_WARNING("failed to parse Recycle Index during Table Stream Offset check")
+                            .tag("instance_id", instance_id_)
+                            .tag("stream_id", stream_id);
+                    return -1;
+                }
+                cached = recycle_indexes.emplace(stream_id, std::move(recycle_index)).first;
+            }
+        }
+        const RecycleIndexPB* recycle_index =
+                cached->second.has_value() ? &cached->second.value() : nullptr;
+        return classify_recycle_index(recycle_index, base_db_id, base_table_id, stream_db_id,
+                                      stream_id);
+    };
+
+    int check_ret = 0;
+    std::unordered_map<std::string, TableStreamOffsetPB> latest_offsets;
+    auto validate_offset = [&](int64_t base_db_id, int64_t base_table_id, int64_t stream_db_id,
+                               int64_t stream_id, int64_t partition_id,
+                               const TableStreamOffsetPB& offset) {
+        if (base_db_id <= 0 || base_table_id <= 0 || stream_db_id <= 0 || stream_id <= 0 ||
+            partition_id <= 0 || !offset.has_partition_id() || !offset.has_state() ||
+            !offset.has_offset_tso() || offset.partition_id() != partition_id ||
+            (offset.state() != TABLE_STREAM_OFFSET_INITIAL_SNAPSHOT_PENDING &&
+             offset.state() != TABLE_STREAM_OFFSET_CONSUMED)) {
+            LOG_WARNING("Table Stream Offset value does not match its key")
+                    .tag("instance_id", instance_id_)
+                    .tag("stream_id", stream_id)
+                    .tag("key_partition_id", partition_id)
+                    .tag("value_partition_id", offset.partition_id())
+                    .tag("state", offset.state());
+            return 1;
+        }
+
+        return classify_cached_recycle_index(base_db_id, base_table_id, stream_db_id, stream_id);
+    };
+
+    std::string begin = table_stream_offset_key({instance_id_, 0, 0, 0, 0, 0});
+    const std::string latest_end = table_stream_offset_key({instance_id_, INT64_MAX, 0, 0, 0, 0});
+    int ret = scan_and_handle_kv(
+            begin, latest_end, [&](std::string_view key, std::string_view value) {
+                std::vector<std::tuple<std::variant<int64_t, std::string>, int, int>> components;
+                if (!decode_components(key, 8, &components)) {
+                    LOG_WARNING("failed to decode Latest Stream Offset key").tag("key", hex(key));
+                    return -1;
+                }
+                TableStreamOffsetPB offset;
+                if (!offset.ParseFromArray(value.data(), value.size())) {
+                    LOG_WARNING("failed to parse Latest Stream Offset").tag("key", hex(key));
+                    return -1;
+                }
+                int64_t base_db_id = std::get<int64_t>(std::get<0>(components[3]));
+                int64_t base_table_id = std::get<int64_t>(std::get<0>(components[4]));
+                int64_t stream_db_id = std::get<int64_t>(std::get<0>(components[5]));
+                int64_t stream_id = std::get<int64_t>(std::get<0>(components[6]));
+                int64_t partition_id = std::get<int64_t>(std::get<0>(components[7]));
+                int validation = validate_offset(base_db_id, base_table_id, stream_db_id, stream_id,
+                                                 partition_id, offset);
+                if (validation == 2) {
+                    return 0;
+                }
+                if (validation != 0) {
+                    return validation;
+                }
+                latest_offsets.emplace(std::string(key), std::move(offset));
+                return 0;
+            });
+    if (ret < 0) {
+        return ret;
+    }
+    check_ret = std::max(check_ret, ret);
+    TEST_SYNC_POINT("InstanceChecker::do_table_stream_check::after_latest_scan");
+
+    std::unordered_map<std::string, VersionedOffset> versioned_offsets;
+    begin = versioned::table_stream_offset_key({instance_id_, 0, 0, 0, 0, 0});
+    const std::string versioned_end =
+            versioned::table_stream_offset_key({instance_id_, INT64_MAX, 0, 0, 0, 0});
+    ret = scan_and_handle_kv(
+            begin, versioned_end, [&](std::string_view key, std::string_view value) {
+                std::string_view logical_key = key;
+                Versionstamp versionstamp;
+                if (!decode_versioned_key(&logical_key, &versionstamp)) {
+                    LOG_WARNING("failed to decode Versioned Stream Offset versionstamp")
+                            .tag("key", hex(key));
+                    return -1;
+                }
+                std::vector<std::tuple<std::variant<int64_t, std::string>, int, int>> components;
+                if (!decode_components(logical_key, 8, &components)) {
+                    LOG_WARNING("failed to decode Versioned Stream Offset key")
+                            .tag("key", hex(key));
+                    return -1;
+                }
+                TableStreamOffsetPB offset;
+                if (!offset.ParseFromArray(value.data(), value.size())) {
+                    LOG_WARNING("failed to parse Versioned Stream Offset").tag("key", hex(key));
+                    return -1;
+                }
+                int64_t base_db_id = std::get<int64_t>(std::get<0>(components[3]));
+                int64_t base_table_id = std::get<int64_t>(std::get<0>(components[4]));
+                int64_t stream_db_id = std::get<int64_t>(std::get<0>(components[5]));
+                int64_t stream_id = std::get<int64_t>(std::get<0>(components[6]));
+                int64_t partition_id = std::get<int64_t>(std::get<0>(components[7]));
+                int validation = validate_offset(base_db_id, base_table_id, stream_db_id, stream_id,
+                                                 partition_id, offset);
+                if (validation == 2) {
+                    return 0;
+                }
+                if (validation != 0) {
+                    return validation;
+                }
+
+                std::string latest_key =
+                        table_stream_offset_key({instance_id_, base_db_id, base_table_id,
+                                                 stream_db_id, stream_id, partition_id});
+                auto it = versioned_offsets.find(latest_key);
+                if (it == versioned_offsets.end() || it->second.versionstamp < versionstamp) {
+                    versioned_offsets[std::move(latest_key)] =
+                            VersionedOffset {versionstamp, std::move(offset)};
+                }
+                return 0;
+            });
+    if (ret < 0) {
+        return ret;
+    }
+    check_ret = std::max(check_ret, ret);
+
+    if (table_stream_versioned_write_) {
+        std::unordered_set<std::string> apparent_inconsistencies;
+        for (const auto& [key, latest] : latest_offsets) {
+            auto it = versioned_offsets.find(key);
+            if (it == versioned_offsets.end() ||
+                latest.SerializeAsString() != it->second.offset.SerializeAsString()) {
+                apparent_inconsistencies.insert(key);
+            }
+        }
+        for (const auto& entry : versioned_offsets) {
+            const std::string& key = entry.first;
+            if (!latest_offsets.contains(key)) {
+                apparent_inconsistencies.insert(key);
+            }
+        }
+
+        auto recheck_projection = [&](const std::string& latest_key) -> int {
+            std::vector<std::tuple<std::variant<int64_t, std::string>, int, int>> components;
+            if (!decode_components(latest_key, 8, &components)) {
+                LOG_WARNING("failed to decode Latest Stream Offset key during recheck")
+                        .tag("instance_id", instance_id_)
+                        .tag("latest_key", hex(latest_key));
+                return -1;
+            }
+            int64_t base_db_id = std::get<int64_t>(std::get<0>(components[3]));
+            int64_t base_table_id = std::get<int64_t>(std::get<0>(components[4]));
+            int64_t stream_db_id = std::get<int64_t>(std::get<0>(components[5]));
+            int64_t stream_id = std::get<int64_t>(std::get<0>(components[6]));
+            int64_t partition_id = std::get<int64_t>(std::get<0>(components[7]));
+
+            std::unique_ptr<Transaction> txn;
+            TxnErrorCode err = txn_kv_->create_txn(&txn);
+            if (err != TxnErrorCode::TXN_OK) {
+                LOG_WARNING("failed to create transaction for Table Stream Offset recheck")
+                        .tag("instance_id", instance_id_)
+                        .tag("latest_key", hex(latest_key))
+                        .tag("error", err);
+                return -1;
+            }
+
+            std::string recycle_value;
+            err = txn->get(recycle_index_key({instance_id_, stream_id}), &recycle_value, true);
+            if (err == TxnErrorCode::TXN_OK) {
+                RecycleIndexPB recycle_index;
+                if (!recycle_index.ParseFromString(recycle_value)) {
+                    LOG_WARNING("failed to parse Recycle Index during Table Stream Offset recheck")
+                            .tag("instance_id", instance_id_)
+                            .tag("stream_id", stream_id);
+                    return -1;
+                }
+                int action = classify_recycle_index(&recycle_index, base_db_id, base_table_id,
+                                                    stream_db_id, stream_id);
+                if (action != 0) {
+                    return action == 2 ? 0 : action;
+                }
+            }
+            if (err != TxnErrorCode::TXN_OK && err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
+                LOG_WARNING("failed to read Recycle Index during Table Stream Offset recheck")
+                        .tag("instance_id", instance_id_)
+                        .tag("stream_id", stream_id)
+                        .tag("error", err);
+                return -1;
+            }
+
+            std::string latest_value;
+            const TxnErrorCode latest_err = txn->get(latest_key, &latest_value, true);
+            if (latest_err != TxnErrorCode::TXN_OK &&
+                latest_err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
+                LOG_WARNING("failed to read Latest Stream Offset during recheck")
+                        .tag("instance_id", instance_id_)
+                        .tag("latest_key", hex(latest_key))
+                        .tag("error", latest_err);
+                return -1;
+            }
+
+            const std::string versioned_key =
+                    versioned::table_stream_offset_key({instance_id_, base_db_id, base_table_id,
+                                                        stream_db_id, stream_id, partition_id});
+            std::string versioned_value;
+            const TxnErrorCode versioned_err =
+                    versioned_get(txn.get(), versioned_key, nullptr, &versioned_value, true);
+            if (versioned_err != TxnErrorCode::TXN_OK &&
+                versioned_err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
+                LOG_WARNING("failed to read Versioned Stream Offset during recheck")
+                        .tag("instance_id", instance_id_)
+                        .tag("versioned_key", hex(versioned_key))
+                        .tag("error", versioned_err);
+                return -1;
+            }
+            if (latest_err == TxnErrorCode::TXN_KEY_NOT_FOUND &&
+                versioned_err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
+                return 0;
+            }
+            if (latest_err == TxnErrorCode::TXN_KEY_NOT_FOUND ||
+                versioned_err == TxnErrorCode::TXN_KEY_NOT_FOUND) {
+                return 1;
+            }
+
+            TableStreamOffsetPB latest_offset;
+            TableStreamOffsetPB versioned_offset;
+            if (!latest_offset.ParseFromString(latest_value) ||
+                !versioned_offset.ParseFromString(versioned_value)) {
+                return 1;
+            }
+            return latest_offset.SerializeAsString() == versioned_offset.SerializeAsString() ? 0
+                                                                                             : 1;
+        };
+
+        for (const std::string& key : apparent_inconsistencies) {
+            int recheck = recheck_projection(key);
+            if (recheck < 0) {
+                return recheck;
+            }
+            if (recheck > 0) {
+                LOG_WARNING("Latest and Versioned Stream Offset heads are inconsistent")
+                        .tag("instance_id", instance_id_)
+                        .tag("latest_key", hex(key));
+                check_ret = 1;
+            }
+        }
+    }
+
+    return check_ret;
+}
+
 int InstanceChecker::do_version_key_check() {
-    std::unique_ptr<RangeGetIterator> it;
+    std::unique_ptr<RangeGetIterator> table_it;
     std::string begin = table_version_key({instance_id_, 0, 0});
     std::string end = table_version_key({instance_id_, INT64_MAX, 0});
     bool check_res = true;
-    do {
+    while (table_it == nullptr /* may be not init */ || (table_it->more() && !stopped())) {
         std::unique_ptr<Transaction> txn;
         TxnErrorCode err = txn_kv_->create_txn(&txn);
         if (err != TxnErrorCode::TXN_OK) {
             LOG(WARNING) << "failed to create txn";
             return -1;
         }
-        err = txn->get(begin, end, &it);
+        err = txn->get(begin, end, &table_it);
         if (err != TxnErrorCode::TXN_OK) {
             LOG(WARNING) << "failed to get mow tablet job key, err=" << err;
             return -1;
         }
-        while (it->has_next() && !stopped()) {
-            auto [k, v] = it->next();
+        while (table_it->has_next() && !stopped()) {
+            auto [k, v] = table_it->next();
             std::string_view k1 = k;
             k1.remove_prefix(1);
             std::vector<std::tuple<std::variant<int64_t, std::string>, int, int>> out;
@@ -2183,20 +2703,21 @@ int InstanceChecker::do_version_key_check() {
                     partition_version_key({instance_id_, db_id, table_id, INT64_MAX});
             VersionPB partition_version_pb;
 
-            do {
+            std::unique_ptr<RangeGetIterator> part_it;
+            while (part_it == nullptr /* may be not init */ || (part_it->more() && !stopped())) {
                 std::unique_ptr<Transaction> txn;
                 TxnErrorCode err = txn_kv_->create_txn(&txn);
                 if (err != TxnErrorCode::TXN_OK) {
                     LOG(WARNING) << "failed to create txn";
                     return -1;
                 }
-                err = txn->get(partition_version_key_begin, partition_version_key_end, &it);
+                err = txn->get(partition_version_key_begin, partition_version_key_end, &part_it);
                 if (err != TxnErrorCode::TXN_OK) {
                     LOG(WARNING) << "failed to get mow tablet job key, err=" << err;
                     return -1;
                 }
-                while (it->has_next() && !stopped()) {
-                    auto [k, v] = it->next();
+                while (part_it->has_next() && !stopped()) {
+                    auto [k, v] = part_it->next();
                     // 0x01 "version" ${instance_id} "partition" ${db_id} ${tbl_id} ${partition_id}
                     std::string_view k1 = k;
                     k1.remove_prefix(1);
@@ -2217,11 +2738,11 @@ int InstanceChecker::do_version_key_check() {
                                 << " partition_version: " << partition_version;
                     }
                 }
-                partition_version_key_begin = it->next_begin_key();
-            } while (it->more() && !stopped());
+                partition_version_key_begin = part_it->next_begin_key();
+            }
         }
-        begin = it->next_begin_key(); // Update to next smallest key for iteration
-    } while (it->more() && !stopped());
+        begin = table_it->next_begin_key(); // Update to next smallest key for iteration
+    }
     return check_res ? 0 : -1;
 }
 
@@ -2261,7 +2782,7 @@ int InstanceChecker::do_restore_job_check() {
     job_restore_tablet_key(restore_job_key_info0, &begin);
     job_restore_tablet_key(restore_job_key_info1, &end);
     std::unique_ptr<RangeGetIterator> it;
-    do {
+    while (it == nullptr /* may be not init */ || (it->more() && !stopped())) {
         std::unique_ptr<Transaction> txn;
         TxnErrorCode err = txn_kv_->create_txn(&txn);
         if (err != TxnErrorCode::TXN_OK) {
@@ -2325,7 +2846,7 @@ int InstanceChecker::do_restore_job_check() {
                 break;
             }
         }
-    } while (it->more() && !stopped());
+    }
     return 0;
 }
 
@@ -2750,12 +3271,24 @@ int InstanceChecker::do_packed_file_check() {
 
     // Step 1: Scan all rowset metas to collect packed_slice_locations references
     // Use efficient range scan instead of iterating through each tablet_id
+    auto collect_packed_refs = [&](const doris::RowsetMetaCloudPB& rs_meta) {
+        const auto& index_map = rs_meta.packed_slice_locations();
+        for (const auto& [small_file_path, index_pb] : index_map) {
+            if (!index_pb.has_packed_file_path() || index_pb.packed_file_path().empty()) {
+                continue;
+            }
+            const std::string& packed_file_path = index_pb.packed_file_path();
+            expected_ref_counts[packed_file_path]++;
+            packed_file_small_files[packed_file_path].insert(small_file_path);
+        }
+    };
+
     {
         std::string start_key = meta_rowset_key({instance_id_, 0, 0});
         std::string end_key = meta_rowset_key({instance_id_, INT64_MAX, 0});
 
         std::unique_ptr<RangeGetIterator> it;
-        do {
+        while (it == nullptr /* may be not init */ || (it->more() && !stopped())) {
             if (stopped()) {
                 return -1;
             }
@@ -2789,19 +3322,59 @@ int InstanceChecker::do_packed_file_check() {
 
                 num_scanned_rowsets++;
 
-                // Check packed_slice_locations in rowset meta
-                const auto& index_map = rs_meta.packed_slice_locations();
-                for (const auto& [small_file_path, index_pb] : index_map) {
-                    if (!index_pb.has_packed_file_path() || index_pb.packed_file_path().empty()) {
-                        continue;
-                    }
-                    const std::string& packed_file_path = index_pb.packed_file_path();
-                    expected_ref_counts[packed_file_path]++;
-                    packed_file_small_files[packed_file_path].insert(small_file_path);
-                }
+                collect_packed_refs(rs_meta);
             }
             start_key.push_back('\x00'); // Update to next smallest key for iteration
-        } while (it->more() && !stopped());
+        }
+    }
+
+    // Rowsets in recycle keys may still hold packed file references while ref count
+    // updates are pending, so include them when calculating expected references.
+    {
+        std::string start_key = recycle_rowset_key({instance_id_, 0, ""});
+        std::string end_key = recycle_rowset_key({instance_id_, INT64_MAX, "\xff"});
+
+        std::unique_ptr<RangeGetIterator> it;
+        while (it == nullptr /* may be not init */ || it->more()) {
+            if (stopped()) {
+                return -1;
+            }
+            std::unique_ptr<Transaction> txn;
+            TxnErrorCode err = txn_kv_->create_txn(&txn);
+            if (err != TxnErrorCode::TXN_OK) {
+                LOG(WARNING) << "failed to create txn for recycle rowset scan in packed file check";
+                return -1;
+            }
+
+            err = txn->get(start_key, end_key, &it);
+            if (err != TxnErrorCode::TXN_OK) {
+                LOG(WARNING) << "failed to scan recycle rowset metas, err=" << err;
+                check_ret = -1;
+                break;
+            }
+
+            while (it->has_next() && !stopped()) {
+                auto [k, v] = it->next();
+                if (!it->has_next()) {
+                    start_key = k;
+                }
+
+                RecycleRowsetPB recycle_rowset;
+                if (!recycle_rowset.ParseFromArray(v.data(), v.size())) {
+                    LOG(WARNING) << "malformed recycle rowset, key=" << hex(k);
+                    check_ret = -1;
+                    continue;
+                }
+
+                if (!recycle_rowset.has_rowset_meta()) {
+                    continue;
+                }
+
+                num_scanned_rowsets++;
+                collect_packed_refs(recycle_rowset.rowset_meta());
+            }
+            start_key.push_back('\x00'); // Update to next smallest key for iteration
+        }
     }
 
     // Step 2: Scan all packed file metadata and verify

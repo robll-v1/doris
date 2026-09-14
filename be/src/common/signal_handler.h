@@ -33,6 +33,7 @@
 
 #pragma once
 
+#include <butil/macros.h> // ARRAYSIZE_UNSAFE
 #include <glog/logging.h>
 
 #include <boost/stacktrace.hpp>
@@ -243,9 +244,6 @@ void DumpTimeInfo() {
     formatter.AppendUint64(query_id_hi, 16);
     formatter.AppendString("-");
     formatter.AppendUint64(query_id_lo, 16);
-    formatter.AppendString(" ***\n");
-    formatter.AppendString("*** is nereids: ");
-    formatter.AppendUint64(is_nereids, 10);
     formatter.AppendString(" ***\n");
     formatter.AppendString("*** tablet id: ");
     formatter.AppendUint64(tablet_id, 10);

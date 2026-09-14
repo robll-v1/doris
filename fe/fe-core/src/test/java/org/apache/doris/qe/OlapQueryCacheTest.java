@@ -26,7 +26,6 @@ import org.apache.doris.analysis.UserIdentity;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
-import org.apache.doris.catalog.FunctionSet;
 import org.apache.doris.catalog.KeysType;
 import org.apache.doris.catalog.MaterializedIndex;
 import org.apache.doris.catalog.MaterializedIndex.IndexState;
@@ -45,6 +44,7 @@ import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.jmockit.Deencapsulation;
 import org.apache.doris.common.util.Util;
+import org.apache.doris.datasource.CatalogMgr;
 import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.metric.MetricRepo;
 import org.apache.doris.mysql.MysqlChannel;
@@ -56,6 +56,7 @@ import org.apache.doris.nereids.parser.NereidsParser;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 import org.apache.doris.planner.OlapScanNode;
 import org.apache.doris.planner.PlanNodeId;
+import org.apache.doris.planner.ScanContext;
 import org.apache.doris.planner.ScanNode;
 import org.apache.doris.proto.Types;
 import org.apache.doris.qe.cache.Cache;
@@ -73,19 +74,17 @@ import org.apache.doris.thrift.TUniqueId;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Range;
-import mockit.Expectations;
-import mockit.Mock;
-import mockit.MockUp;
-import mockit.Mocked;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.junit.Assert;
-import org.junit.Before;
-import org.junit.BeforeClass;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.MockedStatic;
+import org.mockito.Mockito;
 
 import java.net.UnknownHostException;
-import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -105,10 +104,13 @@ public class OlapQueryCacheTest {
     private ConnectContext ctx;
     private QueryState state;
     private ConnectScheduler scheduler;
-    @Mocked
-    private MysqlChannel channel = null;
+    private MysqlChannel channel = Mockito.mock(MysqlChannel.class);
 
-    @BeforeClass
+    private MockedStatic<Util> mockedUtil;
+    private MockedStatic<Env> mockedEnv;
+    private MockedStatic<ConnectContext> mockedConnectContext;
+
+    @BeforeAll
     public static void start() {
         MetricRepo.init();
         try {
@@ -124,132 +126,63 @@ public class OlapQueryCacheTest {
         }
     }
 
-    @Before
+    @BeforeEach
     public void setUp() throws Exception {
         state = new QueryState();
         scheduler = new ConnectScheduler(10);
-        ctx = new ConnectContext();
-
         SessionVariable sessionVariable = new SessionVariable();
+        sessionVariable.parallelPipelineTaskNum = 2;
         Deencapsulation.setField(sessionVariable, "beNumberForTest", 1);
         MysqlSerializer serializer = MysqlSerializer.newInstance();
         env = AccessTestUtil.fetchAdminCatalog();
+        ctx = Mockito.spy(new ConnectContext());
+        InternalCatalog currentCatalog = (InternalCatalog) env.getCurrentCatalog();
+        Mockito.doReturn(new Database()).when(currentCatalog).getDbNullable(Mockito.<String>isNull());
+        CatalogMgr catalogMgr = env.getCatalogMgr();
+        Mockito.doReturn(currentCatalog).when(catalogMgr).getCatalog(Mockito.<String>isNull());
 
-        new MockUp<Util>() {
-            @Mock
-            public boolean showHiddenColumns() {
-                return true;
-            }
-        };
-        new MockUp<Env>() {
-            @Mock
-            Env getCurrentEnv() {
-                return env;
-            }
-        };
+        mockedUtil = Mockito.mockStatic(Util.class, Mockito.CALLS_REAL_METHODS);
+        mockedUtil.when(Util::showHiddenColumns).thenReturn(true);
 
-        FunctionSet fs = new FunctionSet();
-        Deencapsulation.setField(env, "functionSet", fs);
+        mockedEnv = Mockito.mockStatic(Env.class, Mockito.CALLS_REAL_METHODS);
+        mockedEnv.when(Env::getCurrentEnv).thenReturn(env);
 
         channel.reset();
 
-        new Expectations(channel) {
-            {
-                channel.sendOnePacket((ByteBuffer) any);
-                minTimes = 0;
+        Mockito.when(channel.getSerializer()).thenReturn(serializer);
+        ctx.setEnv(env);
+        ctx.setSessionVariable(sessionVariable);
+        ctx.setConnectScheduler(scheduler);
+        ctx.setConnectionId(1);
+        ctx.setDatabase(fullDbName);
+        ctx.setRemoteIP("192.168.1.1");
+        UserIdentity userIdentity = new UserIdentity(userName, "%");
+        userIdentity.setIsAnalyzed();
+        ctx.setCurrentUserIdentity(userIdentity);
 
-                channel.reset();
-                minTimes = 0;
+        Mockito.doReturn(channel).when(ctx).getMysqlChannel();
+        Mockito.doReturn(env).when(ctx).getEnv();
+        Mockito.doReturn(state).when(ctx).getState();
+        Mockito.doReturn(scheduler).when(ctx).getConnectScheduler();
+        Mockito.doReturn(1).when(ctx).getConnectionId();
+        Mockito.doReturn(userName).when(ctx).getQualifiedUser();
+        Mockito.doReturn(123L).when(ctx).getForwardedStmtId();
+        Mockito.doNothing().when(ctx).setKilled();
+        Mockito.doNothing().when(ctx).updateReturnRows(Mockito.anyInt());
+        Mockito.doNothing().when(ctx).setQueryId(Mockito.any(TUniqueId.class));
+        Mockito.doReturn(new TUniqueId()).when(ctx).queryId();
+        Mockito.doReturn(0L).when(ctx).getStartTime();
+        Mockito.doReturn(fullDbName).when(ctx).getDatabase();
+        Mockito.doReturn(sessionVariable).when(ctx).getSessionVariable();
+        Mockito.doNothing().when(ctx).setStmtId(Mockito.anyLong());
+        Mockito.doReturn(1L).when(ctx).getStmtId();
+        Mockito.doReturn(currentCatalog).when(ctx).getCurrentCatalog();
+        Mockito.doReturn(currentCatalog).when(ctx).getCatalog(Mockito.nullable(String.class));
+        Mockito.doReturn("192.168.1.1").when(ctx).getRemoteIP();
+        Mockito.doReturn(userIdentity).when(ctx).getCurrentUserIdentity();
 
-                channel.getSerializer();
-                minTimes = 0;
-                result = serializer;
-            }
-        };
-
-        new Expectations(ctx) {
-            {
-                ctx.getMysqlChannel();
-                minTimes = 0;
-                result = channel;
-
-                ctx.getEnv();
-                minTimes = 0;
-                result = env;
-
-                ctx.getState();
-                minTimes = 0;
-                result = state;
-
-                ctx.getConnectScheduler();
-                minTimes = 0;
-                result = scheduler;
-
-                ctx.getConnectionId();
-                minTimes = 0;
-                result = 1;
-
-                ctx.getQualifiedUser();
-                minTimes = 0;
-                result = userName;
-
-                ctx.getForwardedStmtId();
-                minTimes = 0;
-                result = 123L;
-
-                ctx.setKilled();
-                minTimes = 0;
-                ctx.updateReturnRows(anyInt);
-                minTimes = 0;
-                ctx.setQueryId((TUniqueId) any);
-                minTimes = 0;
-
-                ctx.queryId();
-                minTimes = 0;
-                result = new TUniqueId();
-
-                ctx.getStartTime();
-                minTimes = 0;
-                result = 0L;
-
-                ctx.getDatabase();
-                minTimes = 0;
-                result = fullDbName;
-
-                ctx.getSessionVariable();
-                minTimes = 0;
-                result = sessionVariable;
-
-                ctx.setStmtId(anyLong);
-                minTimes = 0;
-
-                ctx.getStmtId();
-                minTimes = 0;
-                result = 1L;
-
-                ctx.getCurrentCatalog();
-                minTimes = 0;
-                result = env.getCurrentCatalog();
-
-                ctx.getCatalog(anyString);
-                minTimes = 0;
-                result = env.getCurrentCatalog();
-
-                ConnectContext.get();
-                minTimes = 0;
-                result = ctx;
-
-                ctx.getRemoteIP();
-                minTimes = 0;
-                result = "192.168.1.1";
-
-                ctx.getCurrentUserIdentity();
-                minTimes = 0;
-                UserIdentity userIdentity = new UserIdentity(userName, "%");
-                userIdentity.setIsAnalyzed();
-                result = userIdentity;
-            }
-        };
+        mockedConnectContext = Mockito.mockStatic(ConnectContext.class, Mockito.CALLS_REAL_METHODS);
+        mockedConnectContext.when(ConnectContext::get).thenReturn(ctx);
 
         newRangeList = Lists.newArrayList();
 
@@ -272,6 +205,19 @@ public class OlapQueryCacheTest {
         db.registerTable(view3);
         View view4 = createEventNestedView();
         db.registerTable(view4);
+    }
+
+    @AfterEach
+    public void tearDown() {
+        if (mockedUtil != null) {
+            mockedUtil.close();
+        }
+        if (mockedEnv != null) {
+            mockedEnv.close();
+        }
+        if (mockedConnectContext != null) {
+            mockedConnectContext.close();
+        }
     }
 
     private OlapTable createOrderTable() {
@@ -330,7 +276,7 @@ public class OlapQueryCacheTest {
             partInfo.setItem(partition.getId(), false, new RangePartitionItem(rangeP1));
         } catch (AnalysisException e) {
             LOG.warn("Part,an_ex={}", e);
-            Assert.fail(e.getMessage());
+            Assertions.fail(e.getMessage());
         }
     }
 
@@ -378,7 +324,7 @@ public class OlapQueryCacheTest {
         OlapTable table = createProfileTable();
         TupleDescriptor desc = new TupleDescriptor(new TupleId(20004));
         desc.setTable(table);
-        OlapScanNode node = new OlapScanNode(new PlanNodeId(20008), desc, "userprofilenode");
+        OlapScanNode node = new OlapScanNode(new PlanNodeId(20008), desc, "userprofilenode", ScanContext.EMPTY);
         node.setSelectedPartitionIds(selectedPartitionIds);
         return node;
     }
@@ -491,7 +437,7 @@ public class OlapQueryCacheTest {
         OlapTable table = createEventTable();
         TupleDescriptor desc = new TupleDescriptor(new TupleId(30002));
         desc.setTable(table);
-        OlapScanNode node = new OlapScanNode(new PlanNodeId(30004), desc, "appeventnode");
+        OlapScanNode node = new OlapScanNode(new PlanNodeId(30004), desc, "appeventnode", ScanContext.EMPTY);
         node.setSelectedPartitionIds(selectedPartitionIds);
         return node;
     }
@@ -510,7 +456,7 @@ public class OlapQueryCacheTest {
             stmt = adapter;
         } catch (Throwable throwable) {
             LOG.warn("Part,an_ex={}", throwable);
-            Assert.fail(throwable.getMessage());
+            Assertions.fail(throwable.getMessage());
         }
         return stmt;
     }
@@ -531,13 +477,13 @@ public class OlapQueryCacheTest {
 
         Types.PUniqueId key1 = Types.PUniqueId.newBuilder().setHi(1L).setLo(1L).build();
         Backend bk = cp.findBackend(key1);
-        Assert.assertNotNull(bk);
-        Assert.assertEquals(bk.getId(), 3);
+        Assertions.assertNotNull(bk);
+        Assertions.assertEquals(bk.getId(), 3);
 
         key1 = key1.toBuilder().setHi(669560558156283345L).build();
         bk = cp.findBackend(key1);
-        Assert.assertNotNull(bk);
-        Assert.assertEquals(bk.getId(), 1);
+        Assertions.assertNotNull(bk);
+        Assertions.assertEquals(bk.getId(), 1);
     }
 
     @Test
@@ -546,7 +492,7 @@ public class OlapQueryCacheTest {
         List<ScanNode> scanNodes = Lists.newArrayList();
         CacheAnalyzer ca = new CacheAnalyzer(context, parseStmt, scanNodes);
         ca.checkCacheModeForNereids(0);
-        Assert.assertEquals(ca.getCacheMode(), CacheMode.NoNeed);
+        Assertions.assertEquals(ca.getCacheMode(), CacheMode.NoNeed);
     }
 
     @Test
@@ -559,7 +505,7 @@ public class OlapQueryCacheTest {
         List<ScanNode> scanNodes = Lists.newArrayList(createProfileScanNode(selectedPartitionIds));
         CacheAnalyzer ca = new CacheAnalyzer(context, parseStmt, scanNodes);
         ca.checkCacheModeForNereids(0);
-        Assert.assertEquals(ca.getCacheMode(), CacheMode.Sql);
+        Assertions.assertEquals(ca.getCacheMode(), CacheMode.Sql);
     }
 
     @Test
@@ -572,7 +518,7 @@ public class OlapQueryCacheTest {
         List<ScanNode> scanNodes = Lists.newArrayList(createProfileScanNode(selectedPartitionIds));
         CacheAnalyzer ca = new CacheAnalyzer(context, parseStmt, scanNodes);
         ca.checkCacheModeForNereids(1579024800000L);  // 2020-1-15 02:00:00
-        Assert.assertEquals(ca.getCacheMode(), CacheMode.None);
+        Assertions.assertEquals(ca.getCacheMode(), CacheMode.None);
     }
 
     @Test
@@ -581,10 +527,10 @@ public class OlapQueryCacheTest {
         byte[] buffer = new byte[] {10, 50, 48, 50, 48, 45, 48, 51, 45, 49, 48, 1, 51, 2, 67, 78};
         PartitionRange.PartitionKeyType key1 = sb.getKeyFromRow(buffer, 0, Type.DATE);
         LOG.info("real value key1 {}", key1.realValue());
-        Assert.assertEquals(key1.realValue(), 20200310);
+        Assertions.assertEquals(key1.realValue(), 20200310);
         PartitionRange.PartitionKeyType key2 = sb.getKeyFromRow(buffer, 1, Type.INT);
         LOG.info("real value key2 {}", key2.realValue());
-        Assert.assertEquals(key2.realValue(), 3);
+        Assertions.assertEquals(key2.realValue(), 3);
     }
 
     @Test
@@ -598,7 +544,7 @@ public class OlapQueryCacheTest {
         List<ScanNode> scanNodes = Lists.newArrayList(createEventScanNode(selectedPartitionIds));
         CacheAnalyzer ca = new CacheAnalyzer(context, parseStmt, scanNodes);
         ca.checkCacheModeForNereids(1579053661000L); // 2020-1-15 10:01:01
-        Assert.assertEquals(ca.getCacheMode(), CacheMode.Sql);
+        Assertions.assertEquals(ca.getCacheMode(), CacheMode.Sql);
     }
 
     @Test
@@ -612,13 +558,13 @@ public class OlapQueryCacheTest {
         List<ScanNode> scanNodes = Lists.newArrayList(createEventScanNode(selectedPartitionIds));
         CacheAnalyzer ca = new CacheAnalyzer(context, parseStmt, scanNodes);
         ca.checkCacheModeForNereids(1579053661000L); // 2020-1-15 10:01:01
-        Assert.assertEquals(ca.getCacheMode(), CacheMode.Sql);
+        Assertions.assertEquals(ca.getCacheMode(), CacheMode.Sql);
 
         SqlCache sqlCache = (SqlCache) ca.getCache();
         String cacheKey = sqlCache.getSqlWithViewStmt();
-        Assert.assertEquals(cacheKey,
+        Assertions.assertEquals(cacheKey,
                 "SELECT eventdate, COUNT(userid) FROM appevent WHERE eventdate>=\"2020-01-12\" and eventdate<=\"2020-01-14\" GROUP BY eventdate|");
-        Assert.assertEquals(selectedPartitionIds.size(), sqlCache.getSumOfPartitionNum());
+        Assertions.assertEquals(selectedPartitionIds.size(), sqlCache.getSumOfPartitionNum());
     }
 
     @Test
@@ -632,12 +578,12 @@ public class OlapQueryCacheTest {
         List<ScanNode> scanNodes = Lists.newArrayList(createEventScanNode(selectedPartitionIds));
         CacheAnalyzer ca = new CacheAnalyzer(context, parseStmt, scanNodes);
         ca.checkCacheModeForNereids(1579053661000L); // 2020-1-15 10:01:01
-        Assert.assertEquals(ca.getCacheMode(), CacheMode.Sql);
+        Assertions.assertEquals(ca.getCacheMode(), CacheMode.Sql);
         SqlCache sqlCache = (SqlCache) ca.getCache();
         String cacheKey = sqlCache.getSqlWithViewStmt();
         Types.PUniqueId sqlKey2 = CacheProxy.getMd5(cacheKey.replace("北京", "上海"));
-        Assert.assertNotEquals(CacheProxy.getMd5(sqlCache.getSqlWithViewStmt()), sqlKey2);
-        Assert.assertEquals(selectedPartitionIds.size(), sqlCache.getSumOfPartitionNum());
+        Assertions.assertNotEquals(CacheProxy.getMd5(sqlCache.getSqlWithViewStmt()), sqlKey2);
+        Assertions.assertEquals(selectedPartitionIds.size(), sqlCache.getSumOfPartitionNum());
     }
 
     @Test
@@ -648,14 +594,14 @@ public class OlapQueryCacheTest {
         List<ScanNode> scanNodes = Lists.newArrayList(createEventScanNode(selectedPartitionIds));
         CacheAnalyzer ca = new CacheAnalyzer(context, parseStmt, scanNodes);
         ca.checkCacheModeForNereids(1579053661000L); // 2020-1-15 10:01:01
-        Assert.assertEquals(ca.getCacheMode(), CacheMode.Sql);
+        Assertions.assertEquals(ca.getCacheMode(), CacheMode.Sql);
 
         SqlCache sqlCache = (SqlCache) ca.getCache();
         String cacheKey = sqlCache.getSqlWithViewStmt();
-        Assert.assertEquals(cacheKey, "SELECT * from testDb.view1|SELECT `eventdate` AS `eventdate`, "
+        Assertions.assertEquals(cacheKey, "SELECT * from testDb.view1|SELECT `eventdate` AS `eventdate`, "
                 + "count(`userid`) AS `__count_1` FROM `testDb`.`appevent` "
                 + "WHERE ((`eventdate` >= '2020-01-12') AND (`eventdate` <= '2020-01-14')) GROUP BY `eventdate`");
-        Assert.assertEquals(selectedPartitionIds.size(), sqlCache.getSumOfPartitionNum());
+        Assertions.assertEquals(selectedPartitionIds.size(), sqlCache.getSumOfPartitionNum());
     }
 
     @Test
@@ -673,17 +619,17 @@ public class OlapQueryCacheTest {
         List<ScanNode> scanNodes = Lists.newArrayList(createEventScanNode(selectedPartitionIds));
         CacheAnalyzer ca = new CacheAnalyzer(context, parseStmt, scanNodes);
         ca.checkCacheModeForNereids(1579053661000L); // 2020-1-15 10:01:01
-        Assert.assertEquals(ca.getCacheMode(), CacheMode.Sql);
+        Assertions.assertEquals(ca.getCacheMode(), CacheMode.Sql);
 
         SqlCache sqlCache = (SqlCache) ca.getCache();
         String cacheKey = sqlCache.getSqlWithViewStmt();
-        Assert.assertEquals(cacheKey, "select origin.eventdate as eventdate, origin.userid as userid\n"
+        Assertions.assertEquals(cacheKey, "select origin.eventdate as eventdate, origin.userid as userid\n"
                 + "from (\n"
                 + "    select view2.eventdate as eventdate, view2.userid as userid \n"
                 + "    from testDb.view2 view2 \n"
                 + "    where view2.eventdate >=\"2020-01-12\" and view2.eventdate <= \"2020-01-14\"\n"
                 + ") origin|SELECT `eventdate` AS `eventdate`, `userid` AS `userid` FROM `testDb`.`appevent`");
-        Assert.assertEquals(selectedPartitionIds.size(), sqlCache.getSumOfPartitionNum());
+        Assertions.assertEquals(selectedPartitionIds.size(), sqlCache.getSumOfPartitionNum());
     }
 
     @Test
@@ -694,15 +640,15 @@ public class OlapQueryCacheTest {
         List<ScanNode> scanNodes = Lists.newArrayList(createEventScanNode(selectedPartitionIds));
         CacheAnalyzer ca = new CacheAnalyzer(context, parseStmt, scanNodes);
         ca.checkCacheModeForNereids(1579053661000L); // 2020-1-15 10:01:01
-        Assert.assertEquals(ca.getCacheMode(), CacheMode.Sql);
+        Assertions.assertEquals(ca.getCacheMode(), CacheMode.Sql);
 
         SqlCache sqlCache = (SqlCache) ca.getCache();
         String cacheKey = sqlCache.getSqlWithViewStmt();
-        Assert.assertEquals(cacheKey, "SELECT * from testDb.view4|SELECT `eventdate` AS `eventdate`, "
+        Assertions.assertEquals(cacheKey, "SELECT * from testDb.view4|SELECT `eventdate` AS `eventdate`, "
                 + "count(`userid`) AS `__count_1` FROM `testDb`.`view2` WHERE ((`eventdate` >= '2020-01-12') "
                 + "AND (`eventdate` <= '2020-01-14')) GROUP BY `eventdate`|SELECT `eventdate` AS `eventdate`, "
                 + "`userid` AS `userid` FROM `testDb`.`appevent`");
-        Assert.assertEquals(selectedPartitionIds.size(), sqlCache.getSumOfPartitionNum());
+        Assertions.assertEquals(selectedPartitionIds.size(), sqlCache.getSumOfPartitionNum());
     }
 
     @Test
@@ -723,7 +669,7 @@ public class OlapQueryCacheTest {
         List<ScanNode> scanNodes = Lists.newArrayList(scanNode, scanNode, scanNode);
         CacheAnalyzer ca = new CacheAnalyzer(context, parseStmt, scanNodes);
         ca.checkCacheModeForNereids(0);
-        Assert.assertEquals(ca.getCacheMode(), CacheMode.Sql);
-        Assert.assertEquals(selectedPartitionIds.size() * 3, ((SqlCache) ca.getCache()).getSumOfPartitionNum());
+        Assertions.assertEquals(ca.getCacheMode(), CacheMode.Sql);
+        Assertions.assertEquals(selectedPartitionIds.size() * 3, ((SqlCache) ca.getCache()).getSumOfPartitionNum());
     }
 }

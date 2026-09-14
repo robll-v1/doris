@@ -26,9 +26,9 @@
 #include <thread>
 
 #include "common/logging.h"
+#include "core/string_ref.h"
 #include "io/fs/err_utils.h"
 #include "io/hdfs_builder.h"
-#include "vec/common/string_ref.h"
 
 namespace doris::io {
 
@@ -41,6 +41,7 @@ bvar::LatencyRecorder hdfs_close_latency("hdfs_close");
 bvar::LatencyRecorder hdfs_flush_latency("hdfs_flush");
 bvar::LatencyRecorder hdfs_hflush_latency("hdfs_hflush");
 bvar::LatencyRecorder hdfs_hsync_latency("hdfs_hsync");
+bvar::LatencyRecorder hdfs_get_path_info_latency("hdfs_get_path_info");
 }; // namespace hdfs_bvar
 
 Path convert_path(const Path& path, const std::string& namenode) {

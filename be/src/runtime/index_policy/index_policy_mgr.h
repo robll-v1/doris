@@ -19,16 +19,23 @@
 
 #include <gen_cpp/AgentService_types.h>
 
+#include <cstdint>
+#include <functional>
+#include <map>
 #include <shared_mutex>
+#include <string>
+#include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 
-#include "olap/rowset/segment_v2/inverted_index/analyzer/custom_analyzer.h"
-#include "olap/rowset/segment_v2/inverted_index/normalizer/custom_normalizer.h"
+#include "storage/index/inverted/analyzer/custom_analyzer.h"
+#include "storage/index/inverted/normalizer/custom_normalizer.h"
 
 namespace doris {
 
 using Policys = std::unordered_map<int64_t, TIndexPolicy>;
 using AnalyzerPtr = std::shared_ptr<lucene::analysis::Analyzer>;
+using AnalyzerProviderPtr = segment_v2::inverted_index::AnalyzerProviderPtr;
 
 class IndexPolicyMgr {
 public:
@@ -38,10 +45,19 @@ public:
     void apply_policy_changes(const std::vector<TIndexPolicy>& policies_to_update,
                               const std::vector<int64_t>& policies_to_delete);
 
-    const Policys& get_index_policys();
+    Policys get_index_policys();
     AnalyzerPtr get_policy_by_name(const std::string& name);
+    AnalyzerPtr get_analyzer_by_name(const std::string& name);
+    AnalyzerProviderPtr get_analyzer_provider_by_name(
+            const std::string& name,
+            const std::map<std::string, std::string>& outer_char_filter_map = {});
 
 private:
+    segment_v2::inverted_index::CustomAnalyzerConfigPtr build_analyzer_config_from_policy(
+            const TIndexPolicy& index_policy_analyzer);
+    AnalyzerProviderPtr build_analyzer_provider_from_config(
+            segment_v2::inverted_index::CustomAnalyzerConfigPtr config,
+            const std::map<std::string, std::string>& outer_char_filter_map);
     AnalyzerPtr build_analyzer_from_policy(const TIndexPolicy& index_policy_analyzer);
     AnalyzerPtr build_normalizer_from_policy(const TIndexPolicy& index_policy_normalizer);
 
@@ -53,6 +69,9 @@ private:
 
     bool is_builtin_normalizer(const std::string& name);
     AnalyzerPtr build_builtin_normalizer(const std::string& name);
+
+    // Normalize policy name to lowercase for case-insensitive lookup
+    static std::string normalize_name(const std::string& name);
 
     constexpr static auto PROP_TOKENIZER = "tokenizer";
     constexpr static auto PROP_CHAR_FILTER = "char_filter";

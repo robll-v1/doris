@@ -19,31 +19,33 @@ package org.apache.doris.httpv2.rest;
 
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
+import org.apache.doris.common.jmockit.Deencapsulation;
 import org.apache.doris.http.DorisHttpTestCase;
 import org.apache.doris.httpv2.util.ExecutionResultSet;
+import org.apache.doris.httpv2.util.StatementSubmitter;
 import org.apache.doris.httpv2.util.StatementSubmitter.StmtContext;
 import org.apache.doris.metric.MetricRepo;
 import org.apache.doris.utframe.MockedMetaServerFactory;
 import org.apache.doris.utframe.UtFrameUtils;
 
-import mockit.Expectations;
 import okhttp3.Credentials;
 import okhttp3.Request;
 import okhttp3.RequestBody;
 import okhttp3.Response;
 import org.json.simple.JSONObject;
 import org.json.simple.JSONValue;
-import org.junit.Assert;
-import org.junit.BeforeClass;
-import org.junit.Ignore;
-import org.junit.Test;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Disabled;
+import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 
 import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.FutureTask;
+import java.util.concurrent.Future;
 
 public class CopyIntoTest extends DorisHttpTestCase {
     protected static final String runningDir = "fe/mocked/" + CopyIntoTest.class.getSimpleName() + "/" + UUID.randomUUID() + "/";
@@ -53,13 +55,13 @@ public class CopyIntoTest extends DorisHttpTestCase {
 
     protected String rootAuth = Credentials.basic("root", "");
 
-    @BeforeClass
+    @BeforeAll
     public static void beforeClass() throws Exception {
         MetricRepo.init();
         port = UtFrameUtils.createMetaServer(MockedMetaServerFactory.METASERVER_DEFAULT_IP);
     }
 
-    @Ignore
+    @Disabled
     @Test
     public void testUpload() throws IOException {
         FeConstants.runningUnitTest = true;
@@ -68,12 +70,12 @@ public class CopyIntoTest extends DorisHttpTestCase {
                 .addHeader("Authorization", rootAuth)
                 .addHeader("Content-Type", "text/plain; charset=UTF-8").url(CloudURI + UPDATE_URI).build();
         Response response = networkClient.newCall(request).execute();
-        Assert.assertNotNull(response.body());
+        Assertions.assertNotNull(response.body());
         String respStr = response.body().string();
         JSONObject jsonObject = (JSONObject) JSONValue.parse(respStr);
-        Assert.assertEquals(403, (long) jsonObject.get("code"));
+        Assertions.assertEquals(403, (long) jsonObject.get("code"));
         String exception = (String) jsonObject.get("data");
-        Assert.assertTrue(exception.contains("http header must have filename entry"));
+        Assertions.assertTrue(exception.contains("http header must have filename entry"));
 
         // case 1
         request = new Request.Builder()
@@ -85,7 +87,7 @@ public class CopyIntoTest extends DorisHttpTestCase {
         Config.cloud_unique_id = "Internal-MetaServiceCode.OK";
         Config.meta_service_endpoint = MockedMetaServerFactory.METASERVER_DEFAULT_IP + ":" + port;
         response = networkClient.newCall(request).execute();
-        Assert.assertTrue(response.request().url().toString().contains("http://bucketbucket.cos.ap-beijing.myqcloud.internal.com/ut-test/test.csv"));
+        Assertions.assertTrue(response.request().url().toString().contains("http://bucketbucket.cos.ap-beijing.myqcloud.internal.com/ut-test/test.csv"));
 
         // case 2 add header endpointHeader, __USE_ENDPOINT__
         request = new Request.Builder()
@@ -98,7 +100,7 @@ public class CopyIntoTest extends DorisHttpTestCase {
         Config.cloud_unique_id = "Internal-MetaServiceCode.OK";
         Config.meta_service_endpoint = MockedMetaServerFactory.METASERVER_DEFAULT_IP + ":" + port;
         response = networkClient.newCall(request).execute();
-        Assert.assertTrue(response.request().url().toString().contains("http://bucketbucket.cos.ap-beijing.myqcloud.internal.com/ut-test/test.csv"));
+        Assertions.assertTrue(response.request().url().toString().contains("http://bucketbucket.cos.ap-beijing.myqcloud.internal.com/ut-test/test.csv"));
 
         // case 3 add header endpointHeader, __USE_ENDPOINT__
         request = new Request.Builder()
@@ -111,7 +113,7 @@ public class CopyIntoTest extends DorisHttpTestCase {
         Config.cloud_unique_id = "Internal-MetaServiceCode.OK";
         Config.meta_service_endpoint = MockedMetaServerFactory.METASERVER_DEFAULT_IP + ":" + port;
         response = networkClient.newCall(request).execute();
-        Assert.assertTrue(response.request().url().toString().contains("http://bucketbucket.cos.ap-beijing.myqcloud.com/ut-test/test.csv"));
+        Assertions.assertTrue(response.request().url().toString().contains("http://bucketbucket.cos.ap-beijing.myqcloud.com/ut-test/test.csv"));
 
         // case 4 add header endpointHeader, host
         request = new Request.Builder()
@@ -124,7 +126,7 @@ public class CopyIntoTest extends DorisHttpTestCase {
         Config.cloud_unique_id = "Internal-MetaServiceCode.OK";
         Config.meta_service_endpoint = MockedMetaServerFactory.METASERVER_DEFAULT_IP + ":" + port;
         response = networkClient.newCall(request).execute();
-        Assert.assertTrue(response.request().url().toString().contains("http://bucketbucket.cos.ap-beijing.myqcloud.com/ut-test/test.csv"));
+        Assertions.assertTrue(response.request().url().toString().contains("http://bucketbucket.cos.ap-beijing.myqcloud.com/ut-test/test.csv"));
     }
 
     @Test
@@ -133,14 +135,12 @@ public class CopyIntoTest extends DorisHttpTestCase {
         Request request = new Request.Builder().post(RequestBody.create(emptySql.getBytes())).addHeader("Authorization", rootAuth)
                 .addHeader("Content-Type", "application/json").url(CloudURI + QUERY_URI).build();
         Response response = networkClient.newCall(request).execute();
-        Assert.assertNotNull(response.body());
+        Assertions.assertNotNull(response.body());
         String respStr = response.body().string();
         JSONObject jsonObject = (JSONObject) JSONValue.parse(respStr);
-        Assert.assertEquals(403, (long) jsonObject.get("code"));
+        Assertions.assertEquals(403, (long) jsonObject.get("code"));
         String exception = (String) jsonObject.get("data");
-        Assert.assertTrue(exception.contains("POST body must contain [sql] root object"));
-
-        java.util.concurrent.FutureTask<ExecutionResultSet> ret = new FutureTask<>(() -> new ExecutionResultSet(new HashMap<>()));
+        Assertions.assertTrue(exception.contains("POST body must contain [sql] root object"));
 
         HashMap<String, Object> om = new HashMap<>();
         HashMap<String, Object> im = new HashMap<>();
@@ -155,17 +155,13 @@ public class CopyIntoTest extends DorisHttpTestCase {
         om.put("result", im);
         ExecutionResultSet e = new ExecutionResultSet(om);
 
-        new Expectations(CopyIntoAction.getStmtSubmitter(), ret) {
-            {
-                CopyIntoAction.getStmtSubmitter().submitBlock((StmtContext) any);
-                minTimes = 0;
-                result = ret;
-
-                ret.get();
-                minTimes = 0;
-                result = e;
-            }
-        };
+        CopyIntoAction.getStmtSubmitter();
+        StatementSubmitter mockSubmitter = Mockito.mock(StatementSubmitter.class);
+        @SuppressWarnings("unchecked")
+        Future<ExecutionResultSet> mockRet = Mockito.mock(Future.class);
+        Mockito.when(mockSubmitter.submitBlock(Mockito.any(StmtContext.class))).thenReturn(mockRet);
+        Mockito.when(mockRet.get()).thenReturn(e);
+        Deencapsulation.setField(CopyIntoAction.class, "stmtSubmitter", mockSubmitter);
 
         Map<String, String> m = new HashMap<>();
         m.put("sql", "copy into db1.t2 from @~(\"{t3.dat}\")");
@@ -177,10 +173,10 @@ public class CopyIntoTest extends DorisHttpTestCase {
         // {"msg":"success","code":0,"data":{"result":{"copyId":"copy_1296997def6d4887_9e7ff31a7f3842cc","msg":"","loadedRows":"","state":"CANCELLED","type":"LOAD_RUN_FAIL","filterRows":"","unselectRows":"","url":null}},"count":0}
         System.out.println(respStr);
         jsonObject = (JSONObject) JSONValue.parse(respStr);
-        Assert.assertEquals(0, (long) jsonObject.get("code"));
+        Assertions.assertEquals(0, (long) jsonObject.get("code"));
         JSONObject data = (JSONObject) jsonObject.get("data");
         JSONObject result = (JSONObject) data.get("result");
         String copyId = (String) result.get("copyId");
-        Assert.assertEquals(copyId, "copy_1296997def6d4887_9e7ff31a7f3842cc");
+        Assertions.assertEquals(copyId, "copy_1296997def6d4887_9e7ff31a7f3842cc");
     }
 }

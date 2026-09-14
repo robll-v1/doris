@@ -26,6 +26,8 @@ import org.apache.doris.nereids.trees.expressions.shape.BinaryExpression;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
 import org.apache.doris.nereids.types.BigIntType;
 import org.apache.doris.nereids.types.DateTimeV2Type;
+import org.apache.doris.nereids.types.TimeStampNsType;
+import org.apache.doris.nereids.types.TimeStampTzType;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
@@ -39,7 +41,10 @@ public class MinutesAdd extends ScalarFunction implements BinaryExpression, Expl
         PropagateNullable, DateAddSubMonotonic {
 
     public static final List<FunctionSignature> SIGNATURES = ImmutableList.of(FunctionSignature
-            .ret(DateTimeV2Type.WILDCARD).args(DateTimeV2Type.WILDCARD, BigIntType.INSTANCE));
+            .ret(DateTimeV2Type.WILDCARD).args(DateTimeV2Type.WILDCARD, BigIntType.INSTANCE), FunctionSignature
+            .ret(TimeStampNsType.INSTANCE).args(TimeStampNsType.INSTANCE, BigIntType.INSTANCE),
+            FunctionSignature.ret(TimeStampTzType.WILDCARD).args(TimeStampTzType.WILDCARD, BigIntType.INSTANCE)
+    );
 
     public MinutesAdd(Expression arg0, Expression arg1) {
         super("minutes_add", arg0, arg1);

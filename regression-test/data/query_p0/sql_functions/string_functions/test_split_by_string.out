@@ -111,3 +111,69 @@
 3	[]	[]	[]	[]
 4	[]	[]	[]	[]
 
+-- !sql_alias --
+["a", "b", "c", "d", "e"]
+
+-- !sql_alias --
+["你", "a", "好", "b", "世", "c", "界"]
+
+-- !sql_alias --
+["1", "2", "5", "5", "3"]
+
+-- !sql_alias --
+[]
+
+-- !sql_alias --
+[]
+
+-- !sql_alias --
+[]
+
+-- !sql_alias --
+["a", "b", "c", "d"]
+
+-- !sql_alias --
+["", "", "", ""]
+
+-- !sql_alias --
+["a", "b", "c", "abcde"]
+
+-- !sql_alias --
+["", "", "a", "b", "c", ""]
+
+-- !sql_alias --
+["null"]
+
+-- !sql_alias --
+["1", "2,3", "4,5", "abcde"]
+
+-- !sql_alias --
+["a", "b", "c", "d", "e"]
+
+-- !sql_alias --
+[]
+
+-- !sql_alias --
+[]
+
+-- !sql_alias --
+[]
+
+-- !sql_alias --
+["1", "2,3", "", "", "4,5, abcde"]
+
+-- !sql_alias --
+["", "", ""]
+
+-- !sql_alias --
+["a", "b", "c"]
+
+-- !sql_alias --
+["a", "b", "c", ""]
+
+-- !sql_alias --
+["", "a", "b", "c", ""]
+
+-- !sql_alias --
+["null"]
+

@@ -924,7 +924,7 @@ class UniqueFunctionTest extends SqlTestBase {
         String sql = "select random(), a + random(), sum(random()), sum(a + random()), max(random()) over(), max(a + random()) over()"
                 + " from t"
                 + " group by grouping sets((), (random()), (random(), random()), (random(), a + random()))";
-
+        connectContext.getSessionVariable().setDisableNereidsRules("PRUNE_EMPTY_PARTITION, DECOMPOSE_REPEAT");
         Plan root = PlanChecker.from(connectContext)
                 .analyze(sql)
                 .rewrite()
@@ -1044,7 +1044,7 @@ class UniqueFunctionTest extends SqlTestBase {
                 if (output instanceof Alias) {
                     Alias alias = (Alias) output;
                     exprIdToExpressionMap.put(alias.getExprId(), alias.child());
-                    if (output.containsUniqueFunction()) {
+                    if (output.containsVolatileExpression()) {
                         boolean notExists = uniqueOutputExpressions.add(alias.child());
                         Assertions.assertTrue(notExists);
                     }

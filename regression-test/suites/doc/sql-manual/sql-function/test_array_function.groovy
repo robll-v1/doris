@@ -16,7 +16,8 @@
 // under the License.
 
 suite("test_array_function_doc", "p0") {
-    
+    def variantV2Function = "parse_to_variant"
+
     def tableName = "array_table"
     sql """
         drop table if exists ${tableName};
@@ -216,7 +217,7 @@ suite("test_array_function_doc", "p0") {
     """
 
     sql """ INSERT INTO ${tableName2} (id, boolean_column, tinyint_column, smallint_column, int_column, bigint_column, largeint_column, float_column, double_column, decimal32_column, decimal64_column, decimal128_column, decimal256_column, string_column, varchar_column, char_column, date_column, datetime_column, ipv4_column, ipv6_column, struct_column, array_column, map_column, json_column, variant_column) VALUES
-    (1, true, 1, 1, 1, 1, 1, 1.1, 1.1, 1.1, 1.1, 1.1, 1.1, 'hello', 'hello', 'hello', '2021-01-01', '2021-01-01 00:00:00', '192.168.1.1', '::1', STRUCT(1, 'John'), [1, 2, 3], MAP('key1', 1), '{"a": 1}', '{"b" : "c"}'); """
+    (1, true, 1, 1, 1, 1, 1, 1.1, 1.1, 1.1, 1.1, 1.1, 1.1, 'hello', 'hello', 'hello', '2021-01-01', '2021-01-01 00:00:00', '192.168.1.1', '::1', STRUCT(1, 'John'), [1, 2, 3], MAP('key1', 1), '{"a": 1}', ${variantV2Function}('{"b" : "c"}')); """
 
     qt_sql """ SELECT ARRAY_WITH_CONSTANT(2, boolean_column) from ${tableName2}; """
 
@@ -277,7 +278,7 @@ suite("test_array_function_doc", "p0") {
         sql """ SELECT ARRAY_WITH_CONSTANT(1000001, 'hello');"""
         exception "Array size should in range(0, 1000000) in function: array_with_constant"
     }
-    
+
     qt_sql """ SELECT ARRAY_WITH_CONSTANT(0, 'hello'); """
 
     qt_sql """ SELECT ARRAY_WITH_CONSTANT(NULL, 'hello'); """
@@ -357,47 +358,47 @@ suite("test_array_function_doc", "p0") {
     qt_sql """ SELECT ARRAY_REPEAT(NULL, 3); """
 
     qt_sql """ SELECT ARRAY_REPEAT(NULL, NULL); """
-    
+
     qt_sql """ SELECT ARRAY_REPEAT(NULL, 'hello'); """
-    
-    qt_sql """ SELECT ARRAY_UNION(array_boolean, array_boolean) from ${tableName}; """
 
-    qt_sql """ SELECT ARRAY_UNION(array_tinyint, array_tinyint) from ${tableName}; """
+    qt_sql """ SELECT array_sort(ARRAY_UNION(array_boolean, array_boolean)) from ${tableName}; """
 
-    qt_sql """ SELECT ARRAY_UNION(array_smallint, array_smallint) from ${tableName}; """
+    qt_sql """ SELECT array_sort(ARRAY_UNION(array_tinyint, array_tinyint)) from ${tableName}; """
 
-    qt_sql """ SELECT ARRAY_UNION(array_int, array_int) from ${tableName}; """
+    qt_sql """ SELECT array_sort(ARRAY_UNION(array_smallint, array_smallint)) from ${tableName}; """
 
-    qt_sql """ SELECT ARRAY_UNION(array_bigint, array_bigint) from ${tableName}; """
+    qt_sql """ SELECT array_sort(ARRAY_UNION(array_int, array_int)) from ${tableName}; """
 
-    qt_sql """ SELECT ARRAY_UNION(array_largeint, array_largeint) from ${tableName}; """
+    qt_sql """ SELECT array_sort(ARRAY_UNION(array_bigint, array_bigint)) from ${tableName}; """
 
-    qt_sql """ SELECT ARRAY_UNION(array_float, array_float) from ${tableName}; """
+    qt_sql """ SELECT array_sort(ARRAY_UNION(array_largeint, array_largeint)) from ${tableName}; """
 
-    qt_sql """ SELECT ARRAY_UNION(array_double, array_double) from ${tableName}; """
+    qt_sql """ SELECT array_sort(ARRAY_UNION(array_float, array_float)) from ${tableName}; """
 
-    qt_sql """ SELECT ARRAY_UNION(array_decimal32, array_decimal32) from ${tableName}; """
+    qt_sql """ SELECT array_sort(ARRAY_UNION(array_double, array_double)) from ${tableName}; """
 
-    qt_sql """ SELECT ARRAY_UNION(array_decimal64, array_decimal64) from ${tableName}; """
+    qt_sql """ SELECT array_sort(ARRAY_UNION(array_decimal32, array_decimal32)) from ${tableName}; """
 
-    qt_sql """ SELECT ARRAY_UNION(array_decimal128, array_decimal128) from ${tableName}; """
+    qt_sql """ SELECT array_sort(ARRAY_UNION(array_decimal64, array_decimal64)) from ${tableName}; """
 
-    qt_sql """ SELECT ARRAY_UNION(array_decimal256, array_decimal256) from ${tableName}; """
+    qt_sql """ SELECT array_sort(ARRAY_UNION(array_decimal128, array_decimal128)) from ${tableName}; """
 
-    qt_sql """ SELECT ARRAY_UNION(array_string, array_string) from ${tableName}; """
+    qt_sql """ SELECT array_sort(ARRAY_UNION(array_decimal256, array_decimal256)) from ${tableName}; """
 
-    qt_sql """ SELECT ARRAY_UNION(array_varchar, array_varchar) from ${tableName}; """
+    qt_sql """ SELECT array_sort(ARRAY_UNION(array_string, array_string)) from ${tableName}; """
 
-    qt_sql """ SELECT ARRAY_UNION(array_char, array_char) from ${tableName}; """
+    qt_sql """ SELECT array_sort(ARRAY_UNION(array_varchar, array_varchar)) from ${tableName}; """
 
-    qt_sql """ SELECT ARRAY_UNION(array_date, array_date) from ${tableName}; """
+    qt_sql """ SELECT array_sort(ARRAY_UNION(array_char, array_char)) from ${tableName}; """
 
-    qt_sql """ SELECT ARRAY_UNION(array_datetime, array_datetime) from ${tableName}; """
+    qt_sql """ SELECT array_sort(ARRAY_UNION(array_date, array_date)) from ${tableName}; """
 
-    qt_sql """ SELECT ARRAY_UNION(array_ipv4, array_ipv4) from ${tableName}; """
+    qt_sql """ SELECT array_sort(ARRAY_UNION(array_datetime, array_datetime)) from ${tableName}; """
 
-    qt_sql """ SELECT ARRAY_UNION(array_ipv6, array_ipv6) from ${tableName}; """
-    
+    qt_sql """ SELECT array_sort(ARRAY_UNION(array_ipv4, array_ipv4)) from ${tableName}; """
+
+    qt_sql """ SELECT array_sort(ARRAY_UNION(array_ipv6, array_ipv6)) from ${tableName}; """
+
     test {
         sql """ SELECT ARRAY_UNION(array_struct, array_struct) from ${tableName}; """
         exception "array_union does not support types: ARRAY<STRUCT<id:INT,name:TEXT>>"
@@ -412,22 +413,22 @@ suite("test_array_function_doc", "p0") {
         sql """ SELECT ARRAY_UNION(array_map, array_map) from ${tableName}; """
         exception "array_union does not support types: ARRAY<MAP<TEXT,INT>>"
     }
-    
-    qt_sql """ SELECT ARRAY_UNION(NULL, array_boolean) from ${tableName}; """
 
-    qt_sql """ SELECT ARRAY_UNION(array_boolean, NULL) from ${tableName}; """
+    qt_sql """ SELECT array_sort(ARRAY_UNION(NULL, array_boolean)) from ${tableName}; """
 
-    qt_sql """ SELECT ARRAY_UNION(NULL, NULL); """
+    qt_sql """ SELECT array_sort(ARRAY_UNION(array_boolean, NULL)) from ${tableName}; """
 
-    qt_sql """ SELECT ARRAY_UNION(ARRAY(1, 2, 3), ARRAY(3, 5, 6)); """
+    qt_sql """ SELECT array_sort(ARRAY_UNION(NULL, NULL)); """
 
-    qt_sql """ SELECT ARRAY_UNION(ARRAY('hello', 'world'), ARRAY('hello', 'world')); """
+    qt_sql """ SELECT array_sort(ARRAY_UNION(ARRAY(1, 2, 3), ARRAY(3, 5, 6))); """
 
-    qt_sql """ SELECT ARRAY_UNION(ARRAY('hello', 'world'), ARRAY('hello', 'world'), NULL); """
- 
-    qt_sql """ SELECT ARRAY_UNION(ARRAY('hello', 'world'), ARRAY('hello', NULL)); """
+    qt_sql """ SELECT array_sort(ARRAY_UNION(ARRAY('hello', 'world'), ARRAY('hello', 'world'))); """
 
-    qt_sql """SELECT ARRAY_UNION(ARRAY(NULL, 'world'), ARRAY('hello', NULL)); """
+    qt_sql """ SELECT array_sort(ARRAY_UNION(ARRAY('hello', 'world'), ARRAY('hello', 'world'), NULL)); """
+
+    qt_sql """ SELECT array_sort(ARRAY_UNION(ARRAY('hello', 'world'), ARRAY('hello', NULL))); """
+
+    qt_sql """SELECT array_sort(ARRAY_UNION(ARRAY(NULL, 'world'), ARRAY('hello', NULL))); """
 
     qt_sql """ SELECT ARRAY_SUM(array_tinyint) from ${tableName}; """
 
@@ -443,21 +444,6 @@ suite("test_array_function_doc", "p0") {
     test {
         sql """ SELECT CountEqual(array(array(1, 2), array(3, 4)), array(1, 2)); """
         exception "countequal does not support types: ARRAY<ARRAY<TINYINT>>"
-    }
-
-    test {
-        sql """ SELECT ARRAY_SORTBY(array(array(1, 2), array(3, 4)), array(1, 2)); """
-        exception "array_reverse_sort does not support types: ARRAY<ARRAY<TINYINT>>"
-    }
-
-    test {
-        sql """ SELECT ARRAY_SORT(array(array(1, 2), array(3, 4))); """
-        exception "array_sort does not support types: ARRAY<ARRAY<TINYINT>>"
-    }
-
-    test {
-        sql """ SELECT ARRAY_REVERSE_SORT(array(array(1, 2), array(3, 4))); """
-        exception "array_reverse_sort does not support types: ARRAY<ARRAY<TINYINT>>"
     }
 
     qt_sql """ SELECT ARRAY_REMOVE(ARRAY(1, 2, 3, 2, null), 2); """
@@ -531,4 +517,8 @@ suite("test_array_function_doc", "p0") {
     qt_sql """ SELECT ARRAY_REMOVE(array_datetime, null) from ${tableName}; """
     qt_sql """ SELECT ARRAY_REMOVE(array_ipv4, null) from ${tableName}; """
     qt_sql """ SELECT ARRAY_REMOVE(array_ipv6, null) from ${tableName}; """
+
+    qt_sql """ SELECT ARRAY_SORTBY(x -> x[1], [[1,2],[3,4]]); """
+    qt_sql """ SELECT ARRAY_SORT([[1,2],[3,4]]); """
+    qt_sql """ SELECT ARRAY_REVERSE_SORT([[1,2],[3,4]]); """
 }

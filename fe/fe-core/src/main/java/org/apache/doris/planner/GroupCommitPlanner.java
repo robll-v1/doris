@@ -28,11 +28,11 @@ import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
-import org.apache.doris.common.FormatOptions;
 import org.apache.doris.common.LoadException;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.util.DebugUtil;
+import org.apache.doris.foundation.format.FormatOptions;
 import org.apache.doris.nereids.StatementContext;
 import org.apache.doris.nereids.load.NereidsStreamLoadPlanner;
 import org.apache.doris.nereids.load.NereidsStreamLoadTask;
@@ -44,6 +44,7 @@ import org.apache.doris.proto.InternalService.PGroupCommitInsertRequest;
 import org.apache.doris.proto.InternalService.PGroupCommitInsertResponse;
 import org.apache.doris.proto.Types;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.qe.CoordinatorContext;
 import org.apache.doris.qe.PreparedStatementContext;
 import org.apache.doris.qe.StmtExecutor;
 import org.apache.doris.rpc.BackendServiceProxy;
@@ -94,7 +95,7 @@ public class GroupCommitPlanner {
     private int targetColumnSize;
     private TUniqueId loadId;
     private long backendId;
-    private ByteString execPlanFragmentParamsBytes;
+    private TPipelineFragmentParamsList execPlanFragmentParams;
 
     public GroupCommitPlanner(Database db, OlapTable table, List<String> targetColumnNames, TUniqueId queryId,
             String groupCommit)
@@ -144,14 +145,17 @@ public class GroupCommitPlanner {
         // see BackendServiceProxy#execPlanFragmentsAsync
         TPipelineFragmentParamsList paramsList = new TPipelineFragmentParamsList();
         paramsList.addToParamsList(tRequest);
-        execPlanFragmentParamsBytes = ByteString.copyFrom(new TSerializer().serialize(paramsList));
+        execPlanFragmentParams = paramsList;
     }
 
     public PGroupCommitInsertResponse executeGroupCommitInsert(ConnectContext ctx,
             List<InternalService.PDataRow> rows)
-            throws DdlException, RpcException, ExecutionException, InterruptedException, LoadException {
+            throws DdlException, RpcException, ExecutionException, InterruptedException, LoadException, TException {
         Backend backend = Env.getCurrentEnv().getGroupCommitManager().selectBackendForGroupCommit(table.getId(), ctx);
         backendId = backend.getId();
+        TPipelineFragmentParamsList paramsList = refreshExecPlanFragmentParams(execPlanFragmentParams, ctx);
+        ByteString execPlanFragmentParamsBytes =
+                ByteString.copyFrom(new TSerializer().serialize(paramsList));
         PGroupCommitInsertRequest request = PGroupCommitInsertRequest.newBuilder()
                 .setExecPlanFragmentRequest(InternalService.PExecPlanFragmentRequest.newBuilder()
                         .setRequest(execPlanFragmentParamsBytes)
@@ -164,6 +168,16 @@ public class GroupCommitPlanner {
         Future<PGroupCommitInsertResponse> future = BackendServiceProxy.getInstance()
                 .groupCommitInsert(new TNetworkAddress(backend.getHost(), backend.getBrpcPort()), request);
         return future.get();
+    }
+
+    static TPipelineFragmentParamsList refreshExecPlanFragmentParams(
+            TPipelineFragmentParamsList execPlanFragmentParams, ConnectContext ctx) {
+        TPipelineFragmentParamsList paramsList = execPlanFragmentParams.deepCopy();
+        for (TPipelineFragmentParams params : paramsList.getParamsList()) {
+            Preconditions.checkState(params.isSetQueryGlobals());
+            CoordinatorContext.refreshQueryGlobals(params.getQueryGlobals(), ctx);
+        }
+        return paramsList;
     }
 
     public long getBackendId() {

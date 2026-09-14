@@ -18,10 +18,23 @@
 #pragma once
 
 #include <bvar/bvar.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <sys/types.h>
 
+#include <array>
+#include <atomic>
+#include <condition_variable>
+#include <cstdint>
+#include <filesystem>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include "io/cache/cache_block_meta_store.h"
 #include "io/cache/file_cache_common.h"
@@ -58,18 +71,22 @@ public:
     /// version 1.0: cache_base_path / key / offset
     /// version 2.0: cache_base_path / key_prefix / key / offset
     static constexpr int KEY_PREFIX_LENGTH = 3;
+    static constexpr std::string META_DIR_NAME = "meta";
 
-    FSFileCacheStorage() = default;
+    FSFileCacheStorage();
     ~FSFileCacheStorage() override;
     Status init(BlockFileCache* _mgr) override;
     Status append(const FileCacheKey& key, const Slice& value) override;
+    Status appendv(const FileCacheKey& key, const Slice* values, size_t value_cnt) override;
+    Status append_iobuf(const FileCacheKey& key, const butil::IOBuf& value) override;
+    Status abort(const FileCacheKey& key);
     Status finalize(const FileCacheKey& key, const size_t size) override;
     Status read(const FileCacheKey& key, size_t value_offset, Slice buffer) override;
+    Status read_to_iobuf(const FileCacheKey& key, size_t value_offset, size_t bytes_req,
+                         butil::IOBuf* out, size_t* bytes_read) override;
     Status remove(const FileCacheKey& key) override;
     Status change_key_meta_type(const FileCacheKey& key, const FileCacheType type,
                                 const size_t size) override;
-    Status change_key_meta_expiration(const FileCacheKey& key, const uint64_t expiration,
-                                      const size_t size) override;
     void load_blocks_directly_unlocked(BlockFileCache* _mgr, const FileCacheKey& key,
                                        std::lock_guard<std::mutex>& cache_lock) override;
     Status clear(std::string& msg) override;
@@ -92,7 +109,57 @@ public:
     // Get the meta store instance (only available for DISK storage type)
     CacheBlockMetaStore* get_meta_store() { return _meta_store.get(); }
 
+    struct InodeKey {
+        dev_t device;
+        ino_t inode;
+        bool operator==(const InodeKey& other) const {
+            return device == other.device && inode == other.inode;
+        }
+    };
+    struct InodeKeyHash {
+        size_t operator()(const InodeKey& key) const {
+            return std::hash<uint64_t>()((static_cast<uint64_t>(key.device) << 32) ^
+                                         static_cast<uint64_t>(key.inode));
+        }
+    };
+
+#ifdef BE_TEST
+    struct InodeEstimationTestHooks {
+        std::function<int(const std::string&, struct statvfs*)> statvfs_override;
+        std::function<int(const std::string&, struct stat*)> lstat_override;
+        std::function<size_t(const FSFileCacheStorage&)> non_cache_override;
+        std::function<size_t(const FSFileCacheStorage&)> cache_dir_override;
+        std::function<std::filesystem::path(const FSFileCacheStorage&, dev_t)>
+                find_mount_root_override;
+        std::function<size_t(const FSFileCacheStorage&, const std::filesystem::path&, dev_t,
+                             const std::filesystem::path&,
+                             std::unordered_set<InodeKey, InodeKeyHash>&)>
+                count_inodes_override;
+    };
+    static void set_inode_estimation_test_hooks(InodeEstimationTestHooks* hooks);
+
+    void set_file_writer_for_test(const FileCacheKey& key, FileWriterPtr writer) {
+        auto file_writer_map_key = std::make_pair(key.hash, key.offset);
+        auto& shard = shard_of(file_writer_map_key);
+        std::lock_guard lock(shard.mtx);
+        shard.map[file_writer_map_key] = std::move(writer);
+    }
+#endif
+
 private:
+    struct WriterShard {
+        std::mutex mtx;
+        std::unordered_map<FileWriterMapKey, FileWriterPtr, FileWriterMapKeyHash> map;
+    };
+
+    static constexpr size_t kWriterShardNum = 1024; // must be power-of-2
+    static constexpr size_t kWriterShardMask = kWriterShardNum - 1;
+    static_assert((kWriterShardNum & kWriterShardMask) == 0);
+
+    inline WriterShard& shard_of(const FileWriterMapKey& k) const {
+        return *_writer_shards[(FileWriterMapKeyHash {}(k)) & kWriterShardMask];
+    }
+
     void remove_old_version_directories();
 
     Status collect_directory_entries(const std::filesystem::path& dir_path,
@@ -113,9 +180,33 @@ private:
 
     void load_cache_info_into_memory(BlockFileCache* _mgr) const;
 
+    bool handle_already_loaded_block(BlockFileCache* mgr, const UInt128Wrapper& hash, size_t offset,
+                                     size_t new_size, int64_t tablet_id,
+                                     std::lock_guard<std::mutex>& cache_lock) const;
+
+    [[nodiscard]] std::vector<std::string> get_path_in_local_cache_all_candidates(
+            const std::string& dir, size_t offset);
+    Status get_or_open_file_reader(const FileCacheKey& key, FileReaderSPtr* file_reader);
+    Status get_or_create_file_writer(const FileCacheKey& key, FileWriter** writer);
+
 private:
-    // Helper function to count files in cache directory using statfs
-    size_t estimate_file_count_from_statfs() const;
+    // Helper function to count files in cache directory using inode stats
+    size_t estimate_file_count_from_inode() const;
+    size_t estimate_non_cache_inode_usage() const;
+    size_t estimate_cache_directory_inode_usage() const;
+    size_t count_inodes_for_path(const std::filesystem::path& path, dev_t target_dev,
+                                 const std::filesystem::path& excluded_root,
+                                 std::unordered_set<InodeKey, InodeKeyHash>& visited) const;
+    std::filesystem::path find_mount_root(dev_t cache_dev) const;
+    bool is_cache_prefix_directory(const std::filesystem::directory_entry& entry) const;
+    size_t snapshot_metadata_block_count(BlockFileCache* mgr) const;
+    std::vector<size_t> snapshot_metadata_for_hash_offsets(BlockFileCache* mgr,
+                                                           const UInt128Wrapper& hash) const;
+    void start_leak_cleaner(BlockFileCache* mgr);
+    void stop_leak_cleaner();
+    void leak_cleaner_loop();
+    void run_leak_cleanup(BlockFileCache* mgr);
+    void cleanup_leaked_files(BlockFileCache* mgr, size_t metadata_block_count);
     void load_cache_info_into_memory_from_fs(BlockFileCache* _mgr) const;
     void load_cache_info_into_memory_from_db(BlockFileCache* _mgr) const;
 
@@ -123,12 +214,16 @@ private:
                                 std::lock_guard<std::mutex>& cache_lock) const override;
 
     std::string _cache_base_path;
+    BlockFileCache* _mgr {nullptr};
     std::thread _cache_background_load_thread;
+    std::thread _cache_leak_cleaner_thread;
+    std::atomic<bool> _stop_leak_cleaner {false};
+    std::condition_variable _leak_cleaner_cv;
+    std::mutex _leak_cleaner_mutex;
     const std::shared_ptr<LocalFileSystem>& fs = global_local_filesystem();
-    // TODO(Lchangliang): use a more efficient data structure
-    std::mutex _mtx;
-    std::unordered_map<FileWriterMapKey, FileWriterPtr, FileWriterMapKeyHash> _key_to_writer;
+    std::array<std::unique_ptr<WriterShard>, kWriterShardNum> _writer_shards;
     std::shared_ptr<bvar::LatencyRecorder> _iterator_dir_retry_cnt;
+    std::shared_ptr<bvar::Adder<size_t>> _leak_scan_removed_files;
     std::unique_ptr<CacheBlockMetaStore> _meta_store;
 };
 

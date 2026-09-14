@@ -18,6 +18,7 @@
 package org.apache.doris.qe;
 
 import org.apache.doris.analysis.DescriptorTable;
+import org.apache.doris.analysis.DescriptorToThriftConverter;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.Status;
@@ -67,7 +68,7 @@ import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
-import java.time.LocalDateTime;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -103,6 +104,7 @@ public class CoordinatorContext {
     public final Supplier<Set<TUniqueId>> instanceIds = Suppliers.memoize(this::getInstanceIds);
     public final Supplier<Map<TNetworkAddress, Long>> backends = Suppliers.memoize(this::getBackends);
     public final Supplier<Integer> scanRangeNum = Suppliers.memoize(this::getScanRangeNum);
+    public final Supplier<Boolean> isSingleBackendQuery = Suppliers.memoize(this::computeIsSingleBackendQuery);
     public final Supplier<TNetworkAddress> directConnectFrontendAddress
             = Suppliers.memoize(this::computeDirectConnectCoordinator);
 
@@ -276,7 +278,7 @@ public class CoordinatorContext {
         ConnectContext connectContext = planner.getCascadesContext().getConnectContext();
         TQueryOptions queryOptions = initQueryOptions(connectContext);
         TQueryGlobals queryGlobals = createQueryGlobals(connectContext);
-        TDescriptorTable descriptorTable = planner.getDescTable().toThrift();
+        TDescriptorTable descriptorTable = DescriptorToThriftConverter.toThrift(planner.getDescTable());
 
         ExecutionProfile executionProfile = new ExecutionProfile(
                 connectContext.queryId,
@@ -307,12 +309,11 @@ public class CoordinatorContext {
         queryOptions.setProfileLevel(2);
         queryOptions.setBeExecVersion(Config.be_exec_version);
         queryOptions.setNewVersionUnixTimestamp(true);
+        queryOptions.setNewVersionPercentile(true);
+        queryOptions.setNewVersionBitmapOpCount(true);
 
         TQueryGlobals queryGlobals = new TQueryGlobals();
-        queryGlobals.setNowString(TimeUtils.getDatetimeFormatWithTimeZone().format(LocalDateTime.now()));
-        queryGlobals.setTimestampMs(System.currentTimeMillis());
-        queryGlobals.setTimeZone(timezone);
-        queryGlobals.setLoadZeroTolerance(loadZeroTolerance);
+        setQueryGlobalsForLoad(queryGlobals, timezone, loadZeroTolerance);
 
         ExecutionProfile executionProfile = new ExecutionProfile(
                 queryId,
@@ -322,7 +323,7 @@ public class CoordinatorContext {
         );
 
         return new CoordinatorContext(coordinator, jobId, fragments, distributedPlans,
-                scanNodes, queryId, queryOptions, queryGlobals, descTable.toThrift(),
+                scanNodes, queryId, queryOptions, queryGlobals, DescriptorToThriftConverter.toThrift(descTable),
                 executionProfile);
     }
 
@@ -343,17 +344,36 @@ public class CoordinatorContext {
 
     public static TQueryGlobals createQueryGlobals(ConnectContext context) {
         TQueryGlobals queryGlobals = new TQueryGlobals();
-        queryGlobals.setNowString(TimeUtils.getDatetimeFormatWithTimeZone().format(LocalDateTime.now()));
-        queryGlobals.setTimestampMs(System.currentTimeMillis());
-        queryGlobals.setNanoSeconds(LocalDateTime.now().getNano());
+        refreshQueryGlobals(queryGlobals, context);
         queryGlobals.setLoadZeroTolerance(false);
+        return queryGlobals;
+    }
+
+    public static void setQueryGlobalsCurrentTime(TQueryGlobals queryGlobals) {
+        setQueryGlobalsCurrentTime(queryGlobals, Instant.now());
+    }
+
+    public static void setQueryGlobalsForLoad(
+            TQueryGlobals queryGlobals, String timezone, boolean loadZeroTolerance) {
+        setQueryGlobalsCurrentTime(queryGlobals);
+        queryGlobals.setTimeZone(timezone);
+        queryGlobals.setLoadZeroTolerance(loadZeroTolerance);
+    }
+
+    static void setQueryGlobalsCurrentTime(TQueryGlobals queryGlobals, Instant currentTime) {
+        queryGlobals.setNowString(TimeUtils.getDatetimeFormatWithTimeZone().format(currentTime));
+        queryGlobals.setTimestampMs(currentTime.toEpochMilli());
+        queryGlobals.setNanoSeconds(currentTime.getNano());
+    }
+
+    public static void refreshQueryGlobals(TQueryGlobals queryGlobals, ConnectContext context) {
+        setQueryGlobalsCurrentTime(queryGlobals, context.getStartTimeInstant());
         if (context.getSessionVariable().getTimeZone().equals("CST")) {
             queryGlobals.setTimeZone(TimeUtils.DEFAULT_TIME_ZONE);
         } else {
             queryGlobals.setTimeZone(context.getSessionVariable().getTimeZone());
         }
         queryGlobals.setLcTimeNames(context.getSessionVariable().getLcTimeNames());
-        return queryGlobals;
     }
 
     private static void setOptionsFromUserProperty(ConnectContext connectContext, TQueryOptions queryOptions) {
@@ -445,6 +465,10 @@ public class CoordinatorContext {
             }
         }
         return scanRangeNum;
+    }
+
+    private boolean computeIsSingleBackendQuery() {
+        return backends.get().size() == 1;
     }
 
     private int computeScanRangeNumByScanRange(TScanRangeParams param) {

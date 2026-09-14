@@ -27,7 +27,6 @@
 #include "common/cast_set.h"
 #include "common/config.h"
 #include "common/status.h"
-#include "fs/http_file_reader.h"
 #include "io/fs/broker_file_system.h"
 #include "io/fs/broker_file_writer.h"
 #include "io/fs/file_reader.h"
@@ -36,6 +35,7 @@
 #include "io/fs/hdfs_file_reader.h"
 #include "io/fs/hdfs_file_system.h"
 #include "io/fs/hdfs_file_writer.h"
+#include "io/fs/http_file_reader.h"
 #include "io/fs/http_file_system.h"
 #include "io/fs/local_file_system.h"
 #include "io/fs/multi_table_pipe.h"
@@ -45,34 +45,35 @@
 #include "io/fs/stream_load_pipe.h"
 #include "io/hdfs_builder.h"
 #include "io/hdfs_util.h"
+#include "load/stream_load/new_load_stream_mgr.h"
+#include "load/stream_load/stream_load_context.h"
 #include "runtime/exec_env.h"
 #include "runtime/runtime_state.h"
-#include "runtime/stream_load/new_load_stream_mgr.h"
-#include "runtime/stream_load/stream_load_context.h"
+#include "service/backend_options.h"
 #include "util/s3_uri.h"
 #include "util/s3_util.h"
+#include "util/string_util.h"
 #include "util/uid_util.h"
 
 namespace doris {
-#include "common/compile_check_begin.h"
 
 constexpr std::string_view RANDOM_CACHE_BASE_PATH = "random";
 
-io::FileReaderOptions FileFactory::get_reader_options(RuntimeState* state,
+io::FileReaderOptions FileFactory::get_reader_options(const TQueryOptions& option,
                                                       const io::FileDescription& fd) {
     io::FileReaderOptions opts {
             .cache_base_path {},
             .file_size = fd.file_size,
             .mtime = fd.mtime,
+            .storage_resource_id {},
     };
-    if (config::enable_file_cache && state != nullptr &&
-        state->query_options().__isset.enable_file_cache &&
-        state->query_options().enable_file_cache) {
+    if (config::enable_file_cache && option.__isset.enable_file_cache && option.enable_file_cache &&
+        fd.file_cache_admission) {
         opts.cache_type = io::FileCachePolicy::FILE_BLOCK_CACHE;
     }
-    if (state != nullptr && state->query_options().__isset.file_cache_base_path &&
-        state->query_options().file_cache_base_path != RANDOM_CACHE_BASE_PATH) {
-        opts.cache_base_path = state->query_options().file_cache_base_path;
+    if (option.__isset.file_cache_base_path &&
+        option.file_cache_base_path != RANDOM_CACHE_BASE_PATH) {
+        opts.cache_base_path = option.file_cache_base_path;
     }
     return opts;
 }
@@ -122,7 +123,7 @@ Result<io::FileSystemSPtr> FileFactory::create_fs(const io::FSPropertiesRef& fs_
     case TFileType::FILE_HDFS: {
         std::string fs_name = _get_fs_name(file_description);
         return io::HdfsFileSystem::create(*fs_properties.properties, fs_name,
-                                          io::FileSystem::TMP_FS_ID, nullptr);
+                                          io::FileSystem::TMP_FS_ID);
     }
     case TFileType::FILE_HTTP: {
         const auto& kv = *fs_properties.properties;
@@ -203,6 +204,18 @@ Result<io::FileReaderSPtr> FileFactory::create_file_reader(
         const io::FileSystemProperties& system_properties,
         const io::FileDescription& file_description, const io::FileReaderOptions& reader_options,
         RuntimeProfile* profile) {
+    auto reader_res = _create_file_reader_internal(system_properties, file_description,
+                                                   reader_options, profile);
+    if (!reader_res.has_value()) {
+        return unexpected(std::move(reader_res).error());
+    }
+    return std::move(reader_res).value();
+}
+
+Result<io::FileReaderSPtr> FileFactory::_create_file_reader_internal(
+        const io::FileSystemProperties& system_properties,
+        const io::FileDescription& file_description, const io::FileReaderOptions& reader_options,
+        RuntimeProfile* profile) {
     TFileType::type type = system_properties.system_type;
     switch (type) {
     case TFileType::FILE_LOCAL: {
@@ -236,7 +249,7 @@ Result<io::FileReaderSPtr> FileFactory::create_file_reader(
         RETURN_IF_ERROR_RESULT(ExecEnv::GetInstance()->hdfs_mgr()->get_or_create_fs(
                 system_properties.hdfs_params, *fs_name, &handler));
         return io::HdfsFileReader::create(file_description.path, handler->hdfs_fs, *fs_name,
-                                          reader_options, profile)
+                                          reader_options)
                 .and_then([&](auto&& reader) {
                     return io::create_cached_file_reader(std::move(reader), reader_options);
                 });
@@ -259,10 +272,16 @@ Result<io::FileReaderSPtr> FileFactory::create_file_reader(
                 });
     }
     case TFileType::FILE_HTTP: {
+        auto options = reader_options;
+        auto chunk_response = system_properties.properties.find("http.enable.chunk.response");
+        if (chunk_response != system_properties.properties.end() &&
+            (iequal(chunk_response->second, "true") || chunk_response->second == "1")) {
+            options.cache_type = io::FileCachePolicy::NO_CACHE;
+        }
         return io::HttpFileReader::create(file_description.path, system_properties.properties,
-                                          reader_options, profile)
-                .and_then([&](auto&& reader) {
-                    return io::create_cached_file_reader(std::move(reader), reader_options);
+                                          options, profile)
+                .and_then([&options](auto&& reader) {
+                    return io::create_cached_file_reader(std::move(reader), options);
                 });
     }
     default:
@@ -294,6 +313,5 @@ Status FileFactory::create_pipe_reader(const TUniqueId& load_id, io::FileReaderS
 
     return Status::OK();
 }
-#include "common/compile_check_end.h"
 
 } // namespace doris

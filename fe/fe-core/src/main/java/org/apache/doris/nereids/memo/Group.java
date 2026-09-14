@@ -19,18 +19,22 @@ package org.apache.doris.nereids.memo;
 
 import org.apache.doris.common.Pair;
 import org.apache.doris.nereids.cost.Cost;
+import org.apache.doris.nereids.properties.DistributionSpec;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.properties.PhysicalProperties;
 import org.apache.doris.nereids.trees.expressions.literal.Literal;
+import org.apache.doris.nereids.trees.plans.GroupPlan;
 import org.apache.doris.nereids.trees.plans.JoinType;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalJoin;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalProject;
+import org.apache.doris.nereids.trees.plans.physical.PhysicalDistribute;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalPlan;
+import org.apache.doris.nereids.trees.plans.physical.PhysicalQuickSort;
 import org.apache.doris.nereids.util.TreeStringUtils;
 import org.apache.doris.nereids.util.Utils;
-import org.apache.doris.statistics.Statistics;
+import org.apache.doris.statistics.model.Statistics;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
@@ -60,6 +64,8 @@ public class Group {
     private final List<GroupExpression> logicalExpressions = Lists.newArrayList();
     private final List<GroupExpression> physicalExpressions = Lists.newArrayList();
     private final Map<GroupExpression, GroupExpression> enforcers = Maps.newHashMap();
+    private final Map<DistributionSpec, GroupExpression> enforcerSpecs = Maps.newHashMap();
+    private final GroupPlan groupPlan;
     private boolean isStatsReliable = true;
     private LogicalProperties logicalProperties;
 
@@ -89,6 +95,7 @@ public class Group {
         this.groupId = groupId;
         addGroupExpression(groupExpression);
         this.logicalProperties = logicalProperties;
+        this.groupPlan = new GroupPlan(this);
     }
 
     /**
@@ -99,6 +106,7 @@ public class Group {
     public Group(GroupId groupId, LogicalProperties logicalProperties) {
         this.groupId = groupId;
         this.logicalProperties = logicalProperties;
+        this.groupPlan = new GroupPlan(this);
     }
 
     public GroupId getGroupId() {
@@ -173,6 +181,10 @@ public class Group {
         return physicalExpressions;
     }
 
+    public GroupPlan getGroupPlan() {
+        return groupPlan;
+    }
+
     /**
      * Remove groupExpression from this group.
      *
@@ -243,13 +255,44 @@ public class Group {
         return null;
     }
 
+    /**
+     * extract the best physical plan's corresponding logical plan
+     */
+    public Plan getBestLogicalPlan(GroupExpression groupExpression) {
+        List<Group> childrenGroups = groupExpression.children();
+        for (GroupExpression logicalExpression : logicalExpressions) {
+            if (childrenGroups.equals(logicalExpression.children())) {
+                return logicalExpression.getPlan();
+            }
+        }
+        if (groupExpression.getPlan() instanceof PhysicalDistribute
+                || groupExpression.getPlan() instanceof PhysicalQuickSort || logicalExpressions.isEmpty()) {
+            return null;
+        } else {
+            return getLogicalExpression().getPlan();
+        }
+    }
+
+    /**
+     * add a new enforcer to this group.
+     */
     public void addEnforcer(GroupExpression enforcer) {
         enforcer.setOwnerGroup(this);
+        if (enforcer.getPlan() instanceof PhysicalDistribute) {
+            DistributionSpec distributionSpec = ((PhysicalDistribute) enforcer.getPlan()).getDistributionSpec();
+            if (null != enforcerSpecs.put(distributionSpec, enforcer)) {
+                return;
+            }
+        }
         enforcers.put(enforcer, enforcer);
     }
 
     public Map<GroupExpression, GroupExpression> getEnforcers() {
         return enforcers;
+    }
+
+    public Map<DistributionSpec, GroupExpression> getEnforcerSpecs() {
+        return enforcerSpecs;
     }
 
     /**
@@ -263,6 +306,10 @@ public class Group {
         } else {
             lowestCostPlans.put(properties, Pair.of(cost, expression));
         }
+    }
+
+    public void putBestPlan(GroupExpression expression, Cost cost, PhysicalProperties properties) {
+        setBestPlan(expression, cost, properties);
     }
 
     /**
@@ -356,6 +403,7 @@ public class Group {
         // TODO: dedup?
         enforcers.forEach((k, v) -> target.addEnforcer(k));
         enforcers.clear();
+        enforcerSpecs.clear();
 
         // move LogicalExpression PhysicalExpression Ownership
         Map<GroupExpression, GroupExpression> logicalSet = target.getLogicalExpressions().stream()
@@ -390,10 +438,16 @@ public class Group {
         lowestCostPlans.forEach((physicalProperties, costAndGroupExpr) -> {
             // move lowestCostPlans Ownership
             if (!target.lowestCostPlans.containsKey(physicalProperties)) {
+                // we must set owner group here, because the instance in logical expression, physical expression
+                // and enforcer maybe not same with the instance in the lowestCostPlans map
+                costAndGroupExpr.second.setOwnerGroup(target);
                 target.lowestCostPlans.put(physicalProperties, costAndGroupExpr);
             } else {
                 if (costAndGroupExpr.first.getValue()
                         < target.lowestCostPlans.get(physicalProperties).first.getValue()) {
+                    // we must set owner group here, because the instance in logical expression, physical expression
+                    // and enforcer maybe not same with the instance in the lowestCostPlans map
+                    costAndGroupExpr.second.setOwnerGroup(target);
                     target.lowestCostPlans.put(physicalProperties, costAndGroupExpr);
                 }
             }
@@ -455,51 +509,125 @@ public class Group {
     @Override
     public String toString() {
         StringBuilder str = new StringBuilder("Group[" + groupId + "]\n");
-        str.append("  logical expressions:\n");
-        for (GroupExpression logicalExpression : logicalExpressions) {
-            str.append("    ").append(logicalExpression).append("\n");
+        // Logical expressions with numbering
+        str.append("  Logical Expressions:\n");
+        if (logicalExpressions.isEmpty()) {
+            str.append("    (none)\n");
+        } else {
+            int index = 1;
+            for (GroupExpression logicalExpression : logicalExpressions) {
+                str.append("    [").append(index++).append("] ").append(logicalExpression).append("\n");
+            }
         }
-        str.append("  physical expressions:\n");
-        for (GroupExpression physicalExpression : physicalExpressions) {
-            str.append("    ").append(physicalExpression).append("\n");
+        // Physical expressions with numbering
+        str.append("  Physical Expressions:\n");
+        if (physicalExpressions.isEmpty()) {
+            str.append("    (none)\n");
+        } else {
+            int index = 1;
+            for (GroupExpression physicalExpression : physicalExpressions) {
+                str.append("    [").append(index++).append("] ").append(physicalExpression).append("\n");
+            }
         }
-        str.append("  enforcers:\n");
+        // Enforcers with numbering
+        str.append("  Enforcers:\n");
         List<GroupExpression> enforcerList = enforcers.keySet().stream()
                 .sorted(java.util.Comparator.comparing(e1 -> e1.getId().asInt()))
                 .collect(Collectors.toList());
 
-        for (GroupExpression enforcer : enforcerList) {
-            str.append("    ").append(enforcer).append("\n");
+        if (enforcerList.isEmpty()) {
+            str.append("    (none)\n");
+        } else {
+            int index = 1;
+            for (GroupExpression enforcer : enforcerList) {
+                str.append("    [").append(index++).append("] ").append(enforcer).append("\n");
+            }
         }
         if (!chosenEnforcerIdList.isEmpty()) {
-            str.append("  chosen enforcer(id, requiredProperties):\n");
+            str.append("  Chosen Enforcer(ID, RequiredProperties):\n");
             for (int i = 0; i < chosenEnforcerIdList.size(); i++) {
                 str.append("      (").append(i).append(")").append(chosenEnforcerIdList.get(i)).append(",  ")
                         .append(chosenEnforcerPropertiesList.get(i)).append("\n");
             }
         }
         if (chosenGroupExpressionId != -1) {
-            str.append("  chosen expression id: ").append(chosenGroupExpressionId).append("\n");
-            str.append("  chosen properties: ").append(chosenProperties).append("\n");
+            str.append("  Chosen Expression ID: ").append(chosenGroupExpressionId).append("\n");
+            str.append("  Chosen Properties: ").append(chosenProperties).append("\n");
         }
-        str.append("  stats").append("\n");
+        str.append("  Statistics").append("\n");
         str.append(getStatistics() == null ? "" : getStatistics().detail("    "));
 
-        str.append("  lowest Plan(cost, properties, plan, childrenRequires)");
+        str.append("  Lowest Plan");
         DecimalFormat format = new DecimalFormat("#,###.##");
-        for (Map.Entry<PhysicalProperties, Pair<Cost, GroupExpression>> entry : lowestCostPlans.entrySet()) {
+        // Sort by cost for better readability
+        List<Map.Entry<PhysicalProperties, Pair<Cost, GroupExpression>>> sortedEntries =
+                lowestCostPlans.entrySet().stream()
+                        .sorted(Map.Entry.comparingByValue((a, b) ->
+                                Double.compare(a.first.getValue(), b.first.getValue())))
+                        .collect(Collectors.toList());
+        int planIndex = 0;
+        for (Map.Entry<PhysicalProperties, Pair<Cost, GroupExpression>> entry : sortedEntries) {
             PhysicalProperties prop = entry.getKey();
             Pair<Cost, GroupExpression> costGroupExpressionPair = entry.getValue();
             Cost cost = costGroupExpressionPair.first;
             GroupExpression child = costGroupExpressionPair.second;
-            str.append("\n\n    ").append(format.format(cost.getValue())).append(" ").append(prop)
-                .append("\n     ").append(child).append("\n     ")
-                .append(child.getInputPropertiesListOrEmpty(prop));
+            List<PhysicalProperties> inputProps = child.getInputPropertiesListOrEmpty(prop);
+            boolean isChosen = false;
+            // Check if it's a chosen physical expression
+            if (chosenGroupExpressionId != -1
+                    && child.getId().asInt() == chosenGroupExpressionId
+                    && prop.equals(chosenProperties)) {
+                isChosen = true;
+            }
+            // Check if it's a chosen enforcer
+            if (!isChosen && !chosenEnforcerIdList.isEmpty()) {
+                for (int i = 0; i < chosenEnforcerIdList.size(); i++) {
+                    if (child.getId().asInt() == chosenEnforcerIdList.get(i)
+                            && prop.equals(chosenEnforcerPropertiesList.get(i))) {
+                        isChosen = true;
+                        break;
+                    }
+                }
+            }
+            String marker = isChosen ? " BEST" : "";
+            str.append("\n    ── Entry #").append(++planIndex)
+                    .append(" ──────────────────────────────").append(marker);
+            str.append("\n    Cost: ").append(format.format(cost.getValue()));
+            str.append("\n    Properties: ").append(prop);
+            str.append("\n    Expression ID: ").append(child.getId().asInt()).append("#").append(groupId.asInt());
+            if (!inputProps.isEmpty()) {
+                str.append("\n    ChildrenRequires:");
+                for (int i = 0; i < inputProps.size(); i++) {
+                    str.append("\n      [").append(i).append("] ").append(inputProps.get(i));
+                }
+            }
         }
         str.append("\n").append("  struct info map").append("\n");
         str.append(structInfoMap);
 
         return str.toString();
+    }
+
+    /**
+     * Simplify plan string by removing redundant information.
+     */
+    private String simplifyPlanString(String planStr) {
+        // Remove redundant information that doesn't add value
+        String simplified = planStr;
+        // Remove stats=null (common and not informative)
+        simplified = simplified.replaceAll("\\s*stats=null,?", "");
+        // Remove markJoinSlotReference=Optional.empty (only show if present)
+        simplified = simplified.replaceAll("\\s*markJoinSlotReference=Optional\\.empty,?", "");
+        // Remove empty otherCondition=[]
+        simplified = simplified.replaceAll("\\s*otherCondition=\\[\\],?", "");
+        // Remove empty markCondition=[]
+        simplified = simplified.replaceAll("\\s*markCondition=\\[\\],?", "");
+        // Clean up multiple spaces and commas
+        simplified = simplified.replaceAll(",\\s*,+", ","); // Remove multiple commas
+        simplified = simplified.replaceAll("\\s+", " "); // Normalize spaces
+        simplified = simplified.replaceAll("\\(\\s*,", "("); // Remove leading comma after (
+        simplified = simplified.replaceAll(",\\s*\\)", ")"); // Remove trailing comma before )
+        return simplified.trim();
     }
 
     /**

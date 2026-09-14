@@ -17,22 +17,23 @@
 
 #pragma once
 
+#include <gen_cpp/cloud.pb.h>
+
 #include <cstdint>
 #include <string>
 #include <string_view>
 
 #include "common/status.h"
-#include "gen_cpp/cloud.pb.h"
 
 namespace doris::io {
 
 constexpr uint32_t kPackedFileTrailerVersion = 1;
 constexpr size_t kPackedFileTrailerSuffixSize = sizeof(uint32_t) * 2;
 
-Status parse_packed_file_trailer(std::string_view data, cloud::PackedFileDebugInfoPB* debug_pb,
+Status parse_packed_file_trailer(std::string_view data, cloud::PackedFileFooterPB* debug_pb,
                                  uint32_t* version);
 
-Status read_packed_file_trailer(const std::string& file_path,
-                                cloud::PackedFileDebugInfoPB* debug_pb, uint32_t* version);
+Status read_packed_file_trailer(const std::string& file_path, cloud::PackedFileFooterPB* debug_pb,
+                                uint32_t* version);
 
 } // namespace doris::io

@@ -27,6 +27,7 @@ import org.apache.doris.nereids.trees.plans.physical.AbstractPhysicalPlan;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalCTEConsumer;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalCTEProducer;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalFileScan;
+import org.apache.doris.nereids.trees.plans.physical.PhysicalFilter;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalHashAggregate;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalLazyMaterializeFileScan;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalLazyMaterializeOlapScan;
@@ -39,20 +40,25 @@ import org.apache.doris.nereids.trees.plans.physical.PhysicalRepeat;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalSetOperation;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalTVFRelation;
 import org.apache.doris.nereids.trees.plans.visitor.DefaultPlanRewriter;
+import org.apache.doris.qe.SessionVariable;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Lists;
 
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.stream.Collectors;
 
 /**
- * prune lazy materialized slot
+ prune lazy materialized slot
  */
 public class LazySlotPruning extends DefaultPlanRewriter<LazySlotPruning.Context> {
     /**
-     * Context
+     Context
      */
     public static class Context {
         private PhysicalRelation scan;
@@ -74,12 +80,23 @@ public class LazySlotPruning extends DefaultPlanRewriter<LazySlotPruning.Context
         }
     }
 
-    @Override
+    /**
+     * Whether the given child should be pruned. Default checks if the child's
+     * output contains all lazy slots. Override to bypass when logical properties
+     * are stale after plan restructuring.
+     */
+    protected boolean shouldPruneChild(Plan child, Context context) {
+        return child.getOutput().containsAll(context.lazySlots);
+    }
+
+    /**
+     * visit
+     */
     public Plan visit(Plan plan, Context context) {
         ImmutableList.Builder<Plan> newChildren = ImmutableList.builderWithExpectedSize(plan.arity());
         boolean hasNewChildren = false;
         for (Plan child : plan.children()) {
-            if (child.getOutput().containsAll(context.lazySlots)) {
+            if (shouldPruneChild(child, context)) {
                 Plan newChild = child.accept(this, context);
                 if (newChild != child) {
                     hasNewChildren = true;
@@ -96,6 +113,55 @@ public class LazySlotPruning extends DefaultPlanRewriter<LazySlotPruning.Context
                     .copyStatsAndGroupIdFrom(physicalPlan).resetLogicalProperties();
         }
         return plan;
+    }
+
+    @Override
+    public Plan visitPhysicalFilter(PhysicalFilter<? extends Plan> filter, Context context) {
+        if (SessionVariable.getTopNLazyMaterializationUsingIndex() && filter.child() instanceof PhysicalOlapScan) {
+            /*
+             materialization(materializedSlots=[a, b], lazy=[c])
+             ->topn(b)
+               ->filter(a=1, output=(rowid, a, b))
+                ->materializeOlapScan(rowid, lazy=[c], T[a,b,c])
+             =>
+             materialization(materializedSlots=[b], lazy=[a, c])
+             ->topn(b)
+              ->project(rowid, b)
+               ->filter(a=1, output=(rowid, a, b))
+                ->materializeOlapScan(rowid, lazy=[a,c], T[a,b,c])
+             */
+            List<Slot> lazySlotsToScan = new ArrayList<>();
+            boolean lazySlotsChanged = false;
+
+            for (Slot slot : context.lazySlots) {
+                if (!filter.getInputSlots().contains(slot)) {
+                    lazySlotsToScan.add(slot);
+                } else {
+                    lazySlotsChanged = true;
+                }
+            }
+            if (lazySlotsChanged) {
+                Context contextForScan = context.withLazySlots(lazySlotsToScan);
+                filter = (PhysicalFilter<? extends Plan>) filter.withChildren(
+                        filter.child().accept(this, contextForScan));
+                filter = (PhysicalFilter<? extends Plan>) filter
+                        .copyStatsAndGroupIdFrom(filter).resetLogicalProperties();
+                // Predicate slots that are not lazy can still be required by TopN order keys.
+                List<Slot> filterOutput = computeFilterOutput(filter.getOutput(), context.lazySlots);
+                return new PhysicalProject<>(
+                        filterOutput.stream().map(s -> (SlotReference) s).collect(Collectors.toList()),
+                        Optional.empty(), null,
+                        filter.getPhysicalProperties(), filter.getStats(), filter);
+            }
+        }
+        return visit(filter, context);
+    }
+
+    @VisibleForTesting
+    static List<Slot> computeFilterOutput(List<Slot> output, List<Slot> lazySlots) {
+        List<Slot> filterOutput = Lists.newArrayList(output);
+        filterOutput.removeAll(lazySlots);
+        return filterOutput;
     }
 
     @Override
@@ -196,6 +262,7 @@ public class LazySlotPruning extends DefaultPlanRewriter<LazySlotPruning.Context
             }
             Context childContext = context.withLazySlots(childLazySlots);
             child = child.accept(this, childContext);
+            context.updateRowIdSlot(childContext.rowIdSlot);
         }
         if (child.getOutput().contains(context.rowIdSlot)) {
             List<NamedExpression> newProjections = new ArrayList<>();
@@ -237,9 +304,11 @@ public class LazySlotPruning extends DefaultPlanRewriter<LazySlotPruning.Context
                 SlotReference rowIdSlot = (SlotReference) plan.getOutput().get(rowIdPos);
                 if (join.getJoinType().isFullOuterJoin()) {
                     context.updateRowIdSlot(rowIdSlot.withNullable(true));
-                } else if (join.getJoinType().isLeftOuterJoin() && plan.child(1).getOutput().contains(rowIdSlot)) {
+                } else if ((join.getJoinType().isLeftOuterJoin() || join.getJoinType().isAsofLeftOuterJoin())
+                        && plan.child(1).getOutput().contains(rowIdSlot)) {
                     context.updateRowIdSlot(rowIdSlot.withNullable(true));
-                } else if (join.getJoinType().isRightOuterJoin() && plan.child(0).getOutput().contains(rowIdSlot)) {
+                } else if ((join.getJoinType().isRightOuterJoin() || join.getJoinType().isAsofRightOuterJoin())
+                        && plan.child(0).getOutput().contains(rowIdSlot)) {
                     context.updateRowIdSlot(rowIdSlot.withNullable(true));
                 }
             }

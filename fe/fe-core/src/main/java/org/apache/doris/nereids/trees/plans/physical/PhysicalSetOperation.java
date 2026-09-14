@@ -18,7 +18,8 @@
 package org.apache.doris.nereids.trees.plans.physical;
 
 import org.apache.doris.nereids.memo.GroupExpression;
-import org.apache.doris.nereids.processor.post.runtimefilterv2.RuntimeFilterV2;
+import org.apache.doris.nereids.properties.DistributionSpec;
+import org.apache.doris.nereids.properties.DistributionSpecHash;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.properties.PhysicalProperties;
 import org.apache.doris.nereids.trees.expressions.Expression;
@@ -28,8 +29,10 @@ import org.apache.doris.nereids.trees.expressions.SlotReference;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.PlanType;
 import org.apache.doris.nereids.trees.plans.algebra.SetOperation;
+import org.apache.doris.nereids.trees.plans.algebra.ShuffleType;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
-import org.apache.doris.statistics.Statistics;
+import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.statistics.model.Statistics;
 
 import com.google.common.collect.ImmutableList;
 
@@ -153,12 +156,37 @@ public abstract class PhysicalSetOperation extends AbstractPhysicalPlan implemen
     public String shapeInfo() {
         StringBuilder sb = new StringBuilder();
         sb.append(this.getClass().getSimpleName());
-        if (!runtimeFiltersV2.isEmpty()) {
-            sb.append(" RFV2:");
-            for (RuntimeFilterV2 rf : runtimeFiltersV2) {
-                sb.append(rf.shapeInfo());
+
+        boolean ignoreDistribute = ConnectContext.get() != null
+                && ConnectContext.get().getSessionVariable().getIgnoreShapePlanNodes()
+                .contains(PhysicalDistribute.class.getSimpleName());
+
+        ShuffleType shuffleType = shuffleType();
+        if (!ignoreDistribute && shuffleType != ShuffleType.shuffle) {
+            sb.append("[").append(shuffleType).append("]");
+        }
+
+        if (!runtimeFilters.isEmpty()) {
+            sb.append(" build RFs:");
+            for (RuntimeFilter rf : runtimeFilters) {
+                sb.append(rf.shapeInfo()).append(" ");
             }
         }
         return sb.toString();
+    }
+
+    protected ShuffleType shuffleType() {
+        for (Plan child : children) {
+            if (child instanceof PhysicalDistribute) {
+                DistributionSpec distributionSpec = ((PhysicalDistribute<?>) child).getDistributionSpec();
+                if (distributionSpec instanceof DistributionSpecHash) {
+                    if (((DistributionSpecHash) distributionSpec).getShuffleType()
+                            == DistributionSpecHash.ShuffleType.STORAGE_BUCKETED) {
+                        return ShuffleType.bucketShuffle;
+                    }
+                }
+            }
+        }
+        return ShuffleType.shuffle;
     }
 }

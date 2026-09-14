@@ -19,6 +19,7 @@ package org.apache.doris.nereids.load;
 
 import org.apache.doris.analysis.BrokerDesc;
 import org.apache.doris.analysis.DescriptorTable;
+import org.apache.doris.analysis.DescriptorToThriftConverter;
 import org.apache.doris.analysis.TupleDescriptor;
 import org.apache.doris.catalog.AggregateType;
 import org.apache.doris.catalog.Column;
@@ -29,7 +30,6 @@ import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.UserException;
-import org.apache.doris.common.util.TimeUtils;
 import org.apache.doris.load.loadv2.LoadTask;
 import org.apache.doris.nereids.StatementContext;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
@@ -38,8 +38,10 @@ import org.apache.doris.planner.FileLoadScanNode;
 import org.apache.doris.planner.PlanFragment;
 import org.apache.doris.planner.PlanFragmentId;
 import org.apache.doris.planner.PlanNodeId;
+import org.apache.doris.planner.ScanContext;
 import org.apache.doris.planner.ScanNode;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.qe.CoordinatorContext;
 import org.apache.doris.service.FrontendOptions;
 import org.apache.doris.thrift.PaloInternalServiceVersion;
 import org.apache.doris.thrift.TBrokerFileStatus;
@@ -51,6 +53,7 @@ import org.apache.doris.thrift.TPipelineInstanceParams;
 import org.apache.doris.thrift.TQueryGlobals;
 import org.apache.doris.thrift.TQueryOptions;
 import org.apache.doris.thrift.TQueryType;
+import org.apache.doris.thrift.TResourceInfo;
 import org.apache.doris.thrift.TScanRangeLocations;
 import org.apache.doris.thrift.TScanRangeParams;
 import org.apache.doris.thrift.TUniqueId;
@@ -62,7 +65,6 @@ import org.apache.commons.collections4.CollectionUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
-import java.time.LocalDateTime;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -145,20 +147,9 @@ public class NereidsStreamLoadPlanner {
             }
         }
 
-        if (uniquekeyUpdateMode == TUniqueKeyUpdateMode.UPDATE_FLEXIBLE_COLUMNS && !destTable.hasSkipBitmapColumn()) {
-            String tblName = destTable.getName();
-            throw new UserException("Flexible partial update can only support table with skip bitmap hidden column."
-                    + " But table " + tblName + " doesn't have it. You can use `ALTER TABLE " + tblName
-                    + " ENABLE FEATURE \"UPDATE_FLEXIBLE_COLUMNS\";` to add it to the table.");
-        }
-        if (uniquekeyUpdateMode == TUniqueKeyUpdateMode.UPDATE_FLEXIBLE_COLUMNS
-                && !destTable.getEnableLightSchemaChange()) {
-            throw new UserException("Flexible partial update can only support table with light_schema_change enabled."
-                    + " But table " + destTable.getName() + "'s property light_schema_change is false");
-        }
-        if (uniquekeyUpdateMode == TUniqueKeyUpdateMode.UPDATE_FLEXIBLE_COLUMNS
-                && destTable.hasVariantColumns()) {
-            throw new UserException("Flexible partial update can only support table without variant columns.");
+        if (uniquekeyUpdateMode == TUniqueKeyUpdateMode.UPDATE_FLEXIBLE_COLUMNS) {
+            // Validate table-level constraints for flexible partial update
+            destTable.validateForFlexiblePartialUpdate();
         }
         HashSet<String> partialUpdateInputColumns = new HashSet<>();
         if (uniquekeyUpdateMode == TUniqueKeyUpdateMode.UPDATE_FIXED_COLUMNS) {
@@ -167,21 +158,17 @@ public class NereidsStreamLoadPlanner {
                 if (col.hasOnUpdateDefaultValue()) {
                     partialUpdateInputColumns.add(col.getName());
                 }
-                for (NereidsImportColumnDesc importColumnDesc : taskInfo.getColumnExprDescs().descs) {
-                    if (importColumnDesc.getColumnName() != null
-                            && importColumnDesc.getColumnName().equals(col.getName())) {
-                        if (!col.isVisible() && !Column.DELETE_SIGN.equals(col.getName())) {
-                            throw new UserException("Partial update should not include invisible column except"
-                                    + " delete sign column: " + col.getName());
-                        }
-                        partialUpdateInputColumns.add(col.getName());
-                        if (destTable.hasSequenceCol()
-                                && (taskInfo.hasSequenceCol() || (destTable.getSequenceMapCol() != null
-                                        && destTable.getSequenceMapCol().equalsIgnoreCase(col.getName())))) {
-                            partialUpdateInputColumns.add(Column.SEQUENCE_COL);
-                        }
-                        existInExpr = true;
-                        break;
+                existInExpr = NereidsLoadUtils.hasImportColumn(taskInfo.getColumnExprDescs().descs, col);
+                if (existInExpr) {
+                    if (!col.isVisible() && !Column.DELETE_SIGN.equals(col.getName())) {
+                        throw new UserException("Partial update should not include invisible column except"
+                                + " delete sign column: " + col.getName());
+                    }
+                    partialUpdateInputColumns.add(col.getName());
+                    if (destTable.hasSequenceCol()
+                            && (taskInfo.hasSequenceCol() || (destTable.getSequenceMapCol() != null
+                                    && destTable.getSequenceMapCol().equalsIgnoreCase(col.getName())))) {
+                        partialUpdateInputColumns.add(Column.SEQUENCE_COL);
                     }
                 }
                 if (!existInExpr) {
@@ -264,7 +251,10 @@ public class NereidsStreamLoadPlanner {
         scanTupleDesc.setTable(destTable);
         NereidsLoadPlanInfoCollector.LoadPlanInfo loadPlanInfo = planInfoCollector.collectLoadPlanInfo(streamLoadPlan,
                 descriptorTable, scanTupleDesc);
-        FileLoadScanNode fileScanNode = new FileLoadScanNode(new PlanNodeId(0), loadPlanInfo.getDestTuple());
+        String clusterName = ConnectContext.get() == null ? ""
+                : ConnectContext.get().getSessionVariable().resolveCloudClusterName();
+        FileLoadScanNode fileScanNode = new FileLoadScanNode(new PlanNodeId(0), loadPlanInfo.getDestTuple(),
+                ScanContext.builder().clusterName(clusterName).build());
         fileScanNode.finalizeForNereids(loadId, Lists.newArrayList(fileGroupInfo), Lists.newArrayList(context),
                 Lists.newArrayList(loadPlanInfo));
         scanNode = fileScanNode;
@@ -280,9 +270,16 @@ public class NereidsStreamLoadPlanner {
         params.setProtocolVersion(PaloInternalServiceVersion.V1);
         params.setFragment(fragment.toThrift());
 
-        params.setDescTbl(descriptorTable.toThrift());
+        params.setDescTbl(DescriptorToThriftConverter.toThrift(descriptorTable));
         params.setCoord(new TNetworkAddress(FrontendOptions.getLocalHostAddress(), Config.rpc_port));
         params.setCurrentConnectFe(new TNetworkAddress(FrontendOptions.getLocalHostAddress(), Config.rpc_port));
+
+        if (ConnectContext.get() != null && ConnectContext.get().getCurrentUserIdentity() != null) {
+            TResourceInfo resourceInfo = new TResourceInfo();
+            resourceInfo.setUser(ConnectContext.get().getCurrentUserIdentity().getQualifiedUser());
+            resourceInfo.setGroup("");
+            params.setResourceInfo(resourceInfo);
+        }
 
         TPipelineInstanceParams execParams = new TPipelineInstanceParams();
         // user load id (streamLoadTask.id) as query id
@@ -324,21 +321,21 @@ public class NereidsStreamLoadPlanner {
                 : false;
         queryOptions.setEnableMemtableOnSinkNode(enableMemtableOnSinkNode);
         queryOptions.setNewVersionUnixTimestamp(true);
+        queryOptions.setNewVersionPercentile(true);
+        queryOptions.setNewVersionBitmapOpCount(true);
         params.setQueryOptions(queryOptions);
         TQueryGlobals queryGlobals = new TQueryGlobals();
-        queryGlobals.setNowString(TimeUtils.getDatetimeFormatWithTimeZone().format(LocalDateTime.now()));
-        queryGlobals.setTimestampMs(System.currentTimeMillis());
+        CoordinatorContext.setQueryGlobalsCurrentTime(queryGlobals);
         queryGlobals.setTimeZone(taskInfo.getTimezone());
         if (taskInfo instanceof NereidsRoutineLoadTaskInfo) {
             queryGlobals.setLoadZeroTolerance(false);
         } else {
             queryGlobals.setLoadZeroTolerance(taskInfo.getMaxFilterRatio() <= 0.0);
         }
-        queryGlobals.setNanoSeconds(LocalDateTime.now().getNano());
-
         params.setQueryGlobals(queryGlobals);
         params.setTableName(destTable.getName());
         params.setIsMowTable(destTable.getEnableUniqueKeyMergeOnWrite());
+        params.setEnableTso(destTable.enableTso());
         return params;
     }
 }

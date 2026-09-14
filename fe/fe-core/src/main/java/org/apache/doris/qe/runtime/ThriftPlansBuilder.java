@@ -17,11 +17,14 @@
 
 package org.apache.doris.qe.runtime;
 
+import org.apache.doris.analysis.Expr;
+import org.apache.doris.analysis.ExprToThriftVisitor;
 import org.apache.doris.catalog.AIResource;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.Resource;
 import org.apache.doris.common.Config;
-import org.apache.doris.datasource.FileQueryScanNode;
+import org.apache.doris.datasource.scan.FileQueryScanNode;
+import org.apache.doris.nereids.StatementContext;
 import org.apache.doris.nereids.trees.plans.distribute.DistributedPlan;
 import org.apache.doris.nereids.trees.plans.distribute.PipelineDistributedPlan;
 import org.apache.doris.nereids.trees.plans.distribute.worker.DistributedPlanWorker;
@@ -38,24 +41,35 @@ import org.apache.doris.planner.DataSink;
 import org.apache.doris.planner.DataStreamSink;
 import org.apache.doris.planner.ExchangeNode;
 import org.apache.doris.planner.MultiCastDataSink;
-import org.apache.doris.planner.OlapScanNode;
 import org.apache.doris.planner.OlapTableSink;
 import org.apache.doris.planner.PlanFragment;
+import org.apache.doris.planner.PlanFragmentId;
+import org.apache.doris.planner.PlanNode;
+import org.apache.doris.planner.RecursiveCteNode;
+import org.apache.doris.planner.RecursiveCteScanNode;
+import org.apache.doris.planner.RuntimeFilter;
 import org.apache.doris.planner.ScanNode;
 import org.apache.doris.planner.SortNode;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.CoordinatorContext;
 import org.apache.doris.thrift.PaloInternalServiceVersion;
 import org.apache.doris.thrift.TAIResource;
+import org.apache.doris.thrift.TDataSink;
 import org.apache.doris.thrift.TDataSinkType;
+import org.apache.doris.thrift.TExpr;
 import org.apache.doris.thrift.TFileScanRangeParams;
 import org.apache.doris.thrift.TNetworkAddress;
+import org.apache.doris.thrift.TOlapTableSink;
 import org.apache.doris.thrift.TPipelineFragmentParams;
 import org.apache.doris.thrift.TPipelineFragmentParamsList;
 import org.apache.doris.thrift.TPipelineInstanceParams;
 import org.apache.doris.thrift.TPlanFragment;
 import org.apache.doris.thrift.TPlanFragmentDestination;
 import org.apache.doris.thrift.TQueryOptions;
+import org.apache.doris.thrift.TRecCTENode;
+import org.apache.doris.thrift.TRecCTEResetInfo;
+import org.apache.doris.thrift.TRecCTETarget;
+import org.apache.doris.thrift.TResourceInfo;
 import org.apache.doris.thrift.TRuntimeFilterInfo;
 import org.apache.doris.thrift.TRuntimeFilterParams;
 import org.apache.doris.thrift.TScanRangeParams;
@@ -75,12 +89,16 @@ import org.apache.logging.log4j.Logger;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.function.BiConsumer;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
 public class ThriftPlansBuilder {
     private static final Logger LOG = LogManager.getLogger(ThriftPlansBuilder.class);
@@ -89,12 +107,23 @@ public class ThriftPlansBuilder {
             CoordinatorContext coordinatorContext) {
 
         List<PipelineDistributedPlan> distributedPlans = coordinatorContext.distributedPlans;
+        Set<Integer> fragmentToNotifyClose = setParamsForRecursiveCteNode(distributedPlans,
+                coordinatorContext.runtimeFilters);
+
+        // Determine whether this query is assigned to a single backend and propagate it to
+        // TQueryOptions so that BE can apply more appropriate optimization strategies (e.g.
+        // streaming aggregation hash table thresholds).
+        coordinatorContext.queryOptions.setSingleBackendQuery(coordinatorContext.isSingleBackendQuery.get());
 
         // we should set runtime predicate first, then we can use heap sort and to thrift
         setRuntimePredicateIfNeed(coordinatorContext.scanNodes);
 
+        int broadcastRuntimeFilterProducerNum = coordinatorContext.connectContext == null
+                ? 0
+                : coordinatorContext.connectContext.getSessionVariable()
+                        .getRuntimeFilterBroadcastJoinProducerNum();
         RuntimeFiltersThriftBuilder runtimeFiltersThriftBuilder = RuntimeFiltersThriftBuilder.compute(
-                coordinatorContext.runtimeFilters, distributedPlans);
+                coordinatorContext.runtimeFilters, distributedPlans, broadcastRuntimeFilterProducerNum);
         Supplier<List<TTopnFilterDesc>> topNFilterThriftSupplier
                 = topNFilterToThrift(coordinatorContext.topnFilters);
 
@@ -114,7 +143,8 @@ public class ThriftPlansBuilder {
                 TPipelineFragmentParams currentFragmentParam = fragmentToThriftIfAbsent(
                         currentFragmentPlan, instanceJob, workerToCurrentFragment,
                         instancesPerWorker, exchangeSenderNum, sharedFileScanRangeParams,
-                        workerProcessInstanceNum, coordinatorContext);
+                        workerProcessInstanceNum, fragmentToNotifyClose, coordinatorContext,
+                        runtimeFiltersThriftBuilder);
 
                 TPipelineInstanceParams instanceParam = instanceToThrift(
                         currentFragmentParam, instanceJob, currentInstanceIndex++);
@@ -167,12 +197,10 @@ public class ThriftPlansBuilder {
         return workerToInstances;
     }
 
-    private static void setRuntimePredicateIfNeed(Collection<ScanNode> scanNodes) {
+    static void setRuntimePredicateIfNeed(Collection<ScanNode> scanNodes) {
         for (ScanNode scanNode : scanNodes) {
-            if (scanNode instanceof OlapScanNode) {
-                for (SortNode topnFilterSortNode : scanNode.getTopnFilterSortNodes()) {
-                    topnFilterSortNode.setHasRuntimePredicate();
-                }
+            for (SortNode topnFilterSortNode : scanNode.getTopnFilterSortNodes()) {
+                topnFilterSortNode.setHasRuntimePredicate();
             }
         }
     }
@@ -191,6 +219,27 @@ public class ThriftPlansBuilder {
         });
     }
 
+    static Map<String, TAIResource> collectAiResources(ConnectContext connectContext) {
+        Map<String, TAIResource> aiResourceMap = Maps.newLinkedHashMap();
+        if (connectContext == null) {
+            return aiResourceMap;
+        }
+
+        StatementContext statementContext = connectContext.getStatementContext();
+        if (statementContext == null) {
+            return aiResourceMap;
+        }
+
+        for (String resourceName : statementContext.getUsedAIResourceNames()) {
+            Resource resource = Env.getCurrentEnv().getResourceMgr().getResource(resourceName);
+            if (!(resource instanceof AIResource)) {
+                throw new IllegalStateException("AI resource '" + resourceName + "' does not exist");
+            }
+            aiResourceMap.put(resourceName, ((AIResource) resource).toThrift());
+        }
+        return aiResourceMap;
+    }
+
     private static void setParamsForOlapTableSink(List<PipelineDistributedPlan> distributedPlans,
             Map<DistributedPlanWorker, TPipelineFragmentParamsList> fragmentsGroupByWorker,
             CoordinatorContext coordinatorContext) {
@@ -206,7 +255,22 @@ public class ThriftPlansBuilder {
             }
         }
 
+        Map<Integer, List<TPipelineFragmentParams>> olapSinkParamsByFragmentId = Maps.newLinkedHashMap();
+        for (Entry<DistributedPlanWorker, TPipelineFragmentParamsList> kv : fragmentsGroupByWorker.entrySet()) {
+            for (TPipelineFragmentParams fragmentParams : kv.getValue().getParamsList()) {
+                TDataSink outputSink = fragmentParams.getFragment().getOutputSink();
+                if (outputSink != null && outputSink.getType() == TDataSinkType.OLAP_TABLE_SINK) {
+                    olapSinkParamsByFragmentId.computeIfAbsent(fragmentParams.getFragmentId(),
+                            ignored -> new ArrayList<>()).add(fragmentParams);
+                }
+            }
+        }
+        for (List<TPipelineFragmentParams> sinkParams : olapSinkParamsByFragmentId.values()) {
+            assignAdaptiveRandomBucketForSinkParams(sinkParams);
+        }
+
         ConnectContext connectContext = coordinatorContext.connectContext;
+
         for (Entry<DistributedPlanWorker, TPipelineFragmentParamsList> kv : fragmentsGroupByWorker.entrySet()) {
             TPipelineFragmentParamsList fragments = kv.getValue();
             for (TPipelineFragmentParams fragmentParams : fragments.getParamsList()) {
@@ -225,6 +289,49 @@ public class ThriftPlansBuilder {
         }
     }
 
+    private static void assignAdaptiveRandomBucketForSinkParams(List<TPipelineFragmentParams> sinkParams) {
+        if (sinkParams.isEmpty()) {
+            return;
+        }
+        TOlapTableSink sink = sinkParams.get(0).getFragment().getOutputSink().getOlapTableSink();
+        if (!OlapTableSink.shouldAssignAdaptiveRandomBucket(sink)) {
+            return;
+        }
+        List<Long> sinkBackendIds = sinkParams.stream()
+                .map(TPipelineFragmentParams::getBackendId)
+                .distinct()
+                .sorted()
+                .collect(Collectors.toList());
+        int sinkInstanceNum = sinkParams.stream()
+                .mapToInt(TPipelineFragmentParams::getLocalParamsSize)
+                .sum();
+        if (LOG.isInfoEnabled()) {
+            LOG.info("Adaptive random bucket planning in nereids fragment={}, sinkBackendIds={}, "
+                            + "sinkInstanceNum={}",
+                    sinkParams.get(0).getFragmentId(), sinkBackendIds, sinkInstanceNum);
+        }
+        Map<Long, Map<Long, OlapTableSink.AdaptiveBucketAssignment>> assignments =
+                OlapTableSink.computeAdaptiveRandomBucketAssignments(sinkBackendIds,
+                        sink.getPartition().getPartitions(), sink.getLocation().getTablets(), sinkInstanceNum);
+        for (TPipelineFragmentParams sinkParam : sinkParams) {
+            Map<Long, OlapTableSink.AdaptiveBucketAssignment> partitionAssignments =
+                    assignments.get(sinkParam.getBackendId());
+            if (partitionAssignments == null) {
+                continue;
+            }
+            TOlapTableSink copiedSink = deepCopyOlapTableSinkForCurrentBackend(sinkParam);
+            OlapTableSink.applyAdaptiveRandomBucketAssignments(
+                    copiedSink.getPartition().getPartitions(),
+                    partitionAssignments);
+        }
+    }
+
+    private static TOlapTableSink deepCopyOlapTableSinkForCurrentBackend(TPipelineFragmentParams sinkParam) {
+        TDataSink copiedOutputSink = sinkParam.getFragment().getOutputSink().deepCopy();
+        sinkParam.getFragment().setOutputSink(copiedOutputSink);
+        return copiedOutputSink.getOlapTableSink();
+    }
+
     private static Multiset<DistributedPlanWorker> computeInstanceNumPerWorker(
             List<PipelineDistributedPlan> distributedPlans) {
         Multiset<DistributedPlanWorker> workerCounter = LinkedHashMultiset.create();
@@ -236,7 +343,8 @@ public class ThriftPlansBuilder {
         return workerCounter;
     }
 
-    private static Map<Integer, Integer> computeExchangeSenderNum(PipelineDistributedPlan distributedPlan) {
+    private static Map<Integer, Integer> computeExchangeSenderNum(
+            PipelineDistributedPlan distributedPlan) {
         Map<Integer, Integer> senderNum = Maps.newLinkedHashMap();
         for (Entry<ExchangeNode, DistributedPlan> kv : distributedPlan.getInputs().entries()) {
             ExchangeNode exchangeNode = kv.getKey();
@@ -325,7 +433,9 @@ public class ThriftPlansBuilder {
             Map<Integer, Integer> exchangeSenderNum,
             Map<Integer, TFileScanRangeParams> fileScanRangeParamsMap,
             Multiset<DistributedPlanWorker> workerProcessInstanceNum,
-            CoordinatorContext coordinatorContext) {
+            Set<Integer> fragmentToNotifyClose,
+            CoordinatorContext coordinatorContext,
+            RuntimeFiltersThriftBuilder runtimeFiltersThriftBuilder) {
         DistributedPlanWorker worker = assignedJob.getAssignedWorker();
         return workerToFragmentParams.computeIfAbsent(worker, w -> {
             PlanFragment fragment = fragmentPlan.getFragmentJob().getFragment();
@@ -338,6 +448,9 @@ public class ThriftPlansBuilder {
             params.setDescTbl(coordinatorContext.descriptorTable);
             params.setQueryId(coordinatorContext.queryId);
             params.setFragmentId(fragment.getFragmentId().asInt());
+            if (fragmentToNotifyClose.contains(params.getFragmentId())) {
+                params.setNeedNotifyClose(true);
+            }
 
             // Each tParam will set the total number of Fragments that need to be executed on the same BE,
             // and the BE will determine whether all Fragments have been executed based on this information.
@@ -377,10 +490,18 @@ public class ThriftPlansBuilder {
             params.setSendQueryStatisticsWithEveryBatch(fragment.isTransferQueryStatisticsWithEveryBatch());
 
             TPlanFragment planThrift = fragment.toThrift();
+            runtimeFiltersThriftBuilder.pruneBroadcastRuntimeFilterProducers(planThrift, worker);
             planThrift.query_cache_param = fragment.queryCacheParam;
             params.setFragment(planThrift);
             params.setLocalParams(Lists.newArrayList());
             params.setWorkloadGroups(coordinatorContext.getWorkloadGroups());
+
+            if (connectContext != null && connectContext.getCurrentUserIdentity() != null) {
+                TResourceInfo resourceInfo = new TResourceInfo();
+                resourceInfo.setUser(connectContext.getCurrentUserIdentity().getQualifiedUser());
+                resourceInfo.setGroup("");
+                params.setResourceInfo(resourceInfo);
+            }
 
             params.setFileScanParams(fileScanRangeParamsMap);
 
@@ -400,13 +521,7 @@ public class ThriftPlansBuilder {
             params.setShuffleIdxToInstanceIdx(computeDestIdToInstanceId(fragmentPlan, w, instanceToIndex));
 
             // Only used for AI Functions
-            Map<String, TAIResource> aiResourceMap = Maps.newLinkedHashMap();
-            for (Resource resource : Env.getCurrentEnv().getResourceMgr().getResource(Resource.ResourceType.AI)) {
-                if (resource instanceof AIResource) {
-                    aiResourceMap.put(resource.getName(), ((AIResource) resource).toThrift());
-                }
-            }
-            params.setAiResources(aiResourceMap);
+            params.setAiResources(collectAiResources(connectContext));
 
             return params;
         });
@@ -552,13 +667,32 @@ public class ThriftPlansBuilder {
             PipelineDistributedPlan receivePlan, DistributedPlanWorker filterWorker,
             BiConsumer<AssignedJob, Integer> computeFn) {
 
-        // current only support all input plans have same destination with same order,
-        // so we can get first input plan to compute shuffle index to instance id
-        Set<Entry<ExchangeNode, DistributedPlan>> exchangeToChildPlanSet = receivePlan.getInputs().entries();
-        if (exchangeToChildPlanSet.isEmpty()) {
+        // When a fragment has multiple ExchangeNode inputs (e.g. NLJ with probe + BROADCAST
+        // build), pick the one with the most destinations on this worker. A BROADCAST input has
+        // 1 dest per BE while HASH-partitioned has N; using BROADCAST would produce a 1-entry
+        // map and cause 'Rows mismatched' for GLOBAL_HASH LOCAL_EXCHANGE.
+        Entry<ExchangeNode, DistributedPlan> exchangeToChildPlan = null;
+        int maxDestsOnWorker = -1;
+        for (Entry<ExchangeNode, DistributedPlan> entry : receivePlan.getInputs().entries()) {
+            ExchangeNode exchNode = entry.getKey();
+            PipelineDistributedPlan childPlan = (PipelineDistributedPlan) entry.getValue();
+            for (Entry<DataSink, List<AssignedJob>> kv : childPlan.getDestinations().entrySet()) {
+                if (kv.getKey().getExchNodeId().asInt() != exchNode.getId().asInt()) {
+                    continue;
+                }
+                int destsOnWorker = (int) kv.getValue().stream()
+                        .filter(j -> j.getAssignedWorker().id() == filterWorker.id())
+                        .count();
+                if (destsOnWorker > maxDestsOnWorker) {
+                    maxDestsOnWorker = destsOnWorker;
+                    exchangeToChildPlan = entry;
+                }
+                break;
+            }
+        }
+        if (exchangeToChildPlan == null) {
             return;
         }
-        Entry<ExchangeNode, DistributedPlan> exchangeToChildPlan = exchangeToChildPlanSet.iterator().next();
         ExchangeNode linkNode = exchangeToChildPlan.getKey();
         PipelineDistributedPlan firstInputPlan = (PipelineDistributedPlan) exchangeToChildPlan.getValue();
         Map<DataSink, List<AssignedJob>> sinkToDestInstances = firstInputPlan.getDestinations();
@@ -572,6 +706,252 @@ public class ThriftPlansBuilder {
                     }
                 }
                 break;
+            }
+        }
+    }
+
+    private static Set<Integer> setParamsForRecursiveCteNode(List<PipelineDistributedPlan> distributedPlans,
+            List<RuntimeFilter> runtimeFilters) {
+        /*
+         * Populate and attach recursive-CTE related Thrift structures used by
+         * backends (BE) to coordinate recursive Common Table Expression (CTE)
+         * execution across fragments and fragment instances.
+         *
+         * This method performs the following responsibilities:
+         * - Traverse the provided `distributedPlans` in bottom-up order (this
+         *   ordering is expected by callers) and collect the set of network
+         *   addresses (host + brpcPort) for every fragment. These addresses are
+         *   used to reset and control recursive CTE child fragments from the
+         *   producer side.
+         * - Detect `RecursiveCteScanNode` within fragments and build a
+         *   `TRecCTETarget` for each such scan. A `TRecCTETarget` captures the
+         *   network address and a representative fragment instance id and the
+         *   scan node id that the recursive producer should send data to.
+         *   Exactly one `RecursiveCteScanNode` is expected per fragment that
+         *   contains a scan for a recursive CTE; otherwise an
+         *   IllegalStateException is thrown.
+         * - For every `RecursiveCteNode` (producer/union node), collect its
+         *   child fragments that implement the recursive side. For each child
+         *   fragment, add the corresponding `TRecCTETarget` (if present) to
+         *   the producer's target list and create `TRecCTEResetInfo` entries
+         *   for all instances of that fragment. `TRecCTEResetInfo` entries
+         *   carry the fragment id and addresses to be reset by the producer
+         *   when a new recursion iteration begins.
+         * - Populate the `TRecCTENode` object attached to the
+         *   `RecursiveCteNode`, including: whether it's `UNION ALL`, result
+         *   expression lists (materialized result expressions converted to
+         *   Thrift `TExpr`), list of targets, fragments-to-reset, runtime
+         *   filter ids that must be reset on the recursive side, and a flag
+         *   indicating whether this recursive CTE node is used by other
+         *   recursive CTEs.
+         *
+         * How runtime filters are handled:
+         * - Build `runtimeFiltersToReset` by scanning provided
+         *   `runtimeFilters`. A filter id is added if the filter has remote
+         *   targets and if the recursive side (right child) contains the
+         *   runtime-filter builder node. These filter ids are attached to the
+         *   `TRecCTENode` so BE can reset the corresponding runtime filters
+         *   between recursive iterations.
+         *
+         * Important assumptions and invariants:
+         * - `distributedPlans` must be ordered bottom-up so that child
+         *   fragments (containing `RecursiveCteScanNode`) are visited before
+         *   their producers. The implementation relies on this to pop
+         *   consumed `TRecCTETarget` entries from `fragmentIdToRecCteTargetMap`
+         *   to avoid a parent producer incorrectly picking up grandchild
+         *   scan nodes.
+         * - Each fragment containing a `RecursiveCteScanNode` must have at
+         *   least one assigned job (instance). If not, an
+         *   IllegalStateException is thrown.
+         * - At most one `RecursiveCteScanNode` per fragment is supported; if
+         *   more than one is found an IllegalStateException is thrown.
+         *
+         * @param distributedPlans ordered list of PipelineDistributedPlan in
+         *                         bottom-up traversal order
+         * @param runtimeFilters   list of runtime filters to consider for reset
+         * @return set of fragment ids (as integers) that need to be notified
+         *         to close for recursive CTE handling
+         */
+        // fragments whose child recursive fragments need to be notified to close
+        Set<Integer> fragmentToNotifyClose = new HashSet<>();
+        // mapping from fragment id -> TRecCTETarget (the scan node target info)
+        Map<PlanFragmentId, List<TRecCTETarget>> fragmentIdToRecCteTargetMap = new TreeMap<>();
+        // mapping from fragment id -> set of network addresses for all instances
+        Map<PlanFragmentId, Set<TNetworkAddress>> fragmentIdToNetworkAddressMap = new TreeMap<>();
+        // distributedPlans is ordered in bottom up way, so does the fragments
+        for (PipelineDistributedPlan plan : distributedPlans) {
+            // collect all assigned instance network addresses for this fragment
+            List<AssignedJob> fragmentAssignedJobs = plan.getInstanceJobs();
+            Set<TNetworkAddress> networkAddresses = new TreeSet<>();
+            for (AssignedJob assignedJob : fragmentAssignedJobs) {
+                DistributedPlanWorker distributedPlanWorker = assignedJob.getAssignedWorker();
+                // use brpc port + host as the address used by BE for control/reset
+                TNetworkAddress networkAddress = new TNetworkAddress(distributedPlanWorker.host(),
+                        distributedPlanWorker.brpcPort());
+                networkAddresses.add(networkAddress);
+            }
+            PlanFragment planFragment = plan.getFragmentJob().getFragment();
+            // remember addresses for later when building reset infos
+            fragmentIdToNetworkAddressMap.put(planFragment.getFragmentId(), networkAddresses);
+
+            // find RecursiveCteScanNode in this fragment (scan side of recursive CTE)
+            List<RecursiveCteScanNode> recursiveCteScanNodes = planFragment.getPlanRoot()
+                    .collectInCurrentFragment(RecursiveCteScanNode.class::isInstance);
+            if (!recursiveCteScanNodes.isEmpty()) {
+                // validate there is exactly one scan node per fragment
+                if (recursiveCteScanNodes.size() != 1) {
+                    throw new IllegalStateException(
+                            String.format("one fragment can only have 1 recursive cte scan node, but there is %d",
+                                    recursiveCteScanNodes.size()));
+                }
+                // scan fragments must have at least one assigned instance
+                if (fragmentAssignedJobs.isEmpty()) {
+                    throw new IllegalStateException(
+                            "fragmentAssignedJobs is empty for recursive cte scan node");
+                }
+                List<TRecCTETarget> recCTETargets = buildRecCTETargets(
+                        fragmentAssignedJobs, recursiveCteScanNodes.get(0));
+                // store the target for producers to reference later
+                fragmentIdToRecCteTargetMap.put(planFragment.getFragmentId(), recCTETargets);
+            }
+
+            List<RecursiveCteNode> recursiveCteNodes = planFragment.getPlanRoot()
+                    .collectInCurrentFragment(RecursiveCteNode.class::isInstance);
+            for (RecursiveCteNode recursiveCteNode : recursiveCteNodes) {
+                // list of scan targets this producer should send recursive rows to
+                List<TRecCTETarget> targets = new ArrayList<>();
+                // reset infos for all instances of child fragments (used to reset state)
+                List<TRecCTEResetInfo> fragmentsToReset = new ArrayList<>();
+                Set<String> resetFragmentKeys = new HashSet<>();
+                // The recursive side is under the right child; collect all fragments
+                List<PlanFragment> childFragments = new ArrayList<>();
+                recursiveCteNode.getChild(1).getChild(0).getFragment().collectAll(PlanFragment.class::isInstance,
+                        childFragments);
+                for (PlanFragment child : childFragments) {
+                    PlanFragmentId childFragmentId = child.getFragmentId();
+                    // mark this child fragment id so it will be notified to close
+                    fragmentToNotifyClose.add(childFragmentId.asInt());
+                    // add target if a matching RecursiveCteScanNode was recorded
+                    List<TRecCTETarget> recCTETargets = fragmentIdToRecCteTargetMap.getOrDefault(childFragmentId, null);
+                    if (recCTETargets != null) {
+                        // each producer can only map to one scan node target per child
+                        targets.addAll(recCTETargets);
+                        // remove the entry so ancestor producers won't reuse a grandchild scan node
+                        fragmentIdToRecCteTargetMap.remove(childFragmentId);
+                    }
+                    // get all instance addresses for this child fragment and build reset infos
+                    Set<TNetworkAddress> tNetworkAddresses = fragmentIdToNetworkAddressMap.get(childFragmentId);
+                    if (tNetworkAddresses == null) {
+                        throw new IllegalStateException(
+                                String.format("can't find TNetworkAddress for fragment %d", childFragmentId));
+                    }
+                    for (TNetworkAddress address : tNetworkAddresses) {
+                        String resetFragmentKey = childFragmentId.asInt() + "@"
+                                + address.getHostname() + ":" + address.getPort();
+                        if (!resetFragmentKeys.add(resetFragmentKey)) {
+                            continue;
+                        }
+                        TRecCTEResetInfo tRecCTEResetInfo = new TRecCTEResetInfo();
+                        tRecCTEResetInfo.setFragmentId(childFragmentId.asInt());
+                        tRecCTEResetInfo.setAddr(address);
+                        fragmentsToReset.add(tRecCTEResetInfo);
+                    }
+                }
+
+                // convert materialized result expression lists to Thrift TExpr lists
+                List<List<Expr>> materializedResultExprLists = recursiveCteNode.getMaterializedResultExprLists();
+                List<List<TExpr>> texprLists = new ArrayList<>(materializedResultExprLists.size());
+                for (List<Expr> exprList : materializedResultExprLists) {
+                    texprLists.add(ExprToThriftVisitor.treesToThrift(exprList));
+                }
+                // the recursive side's rf need to be reset
+                // determine which runtime filters on the recursive side must be reset
+                List<Integer> runtimeFiltersToReset = new ArrayList<>(runtimeFilters.size());
+                for (RuntimeFilter rf : runtimeFilters) {
+                    // only consider filters that have remote targets and whose builder
+                    // node is present in the recursive side (right child)
+                    if (rf.hasRemoteTargets()
+                            && recursiveCteNode.getChild(1).contains(node -> node == rf.getBuilderNode())) {
+                        runtimeFiltersToReset.add(rf.getFilterId().asInt());
+                    }
+                }
+                // find recursiveCte used by other recursive cte
+                // detect whether this recursive CTE node is referenced by other
+                // recursive CTEs in the recursive side; needed to correctly
+                // indicate sharing/usage across recursive nodes
+                Set<RecursiveCteNode> recursiveCteNodesInRecursiveSide = new HashSet<>();
+                PlanNode rootPlan = distributedPlans.get(distributedPlans.size() - 1)
+                        .getFragmentJob().getFragment().getPlanRoot();
+                collectAllRecursiveCteNodesInRecursiveSide(rootPlan, false, recursiveCteNodesInRecursiveSide);
+                boolean isUsedByOtherRecCte = recursiveCteNodesInRecursiveSide.contains(recursiveCteNode);
+
+                // build the Thrift TRecCTENode and attach it to the RecursiveCteNode
+                TRecCTENode tRecCTENode = new TRecCTENode();
+                tRecCTENode.setIsUnionAll(recursiveCteNode.isUnionAll());
+                tRecCTENode.setTargets(targets);
+                tRecCTENode.setFragmentsToReset(fragmentsToReset);
+                tRecCTENode.setResultExprLists(texprLists);
+                tRecCTENode.setRecSideRuntimeFilterIds(runtimeFiltersToReset);
+                tRecCTENode.setIsUsedByOtherRecCte(isUsedByOtherRecCte);
+                // attach Thrift node to plan node for BE consumption
+                recursiveCteNode.settRecCTENode(tRecCTENode);
+            }
+        }
+        return fragmentToNotifyClose;
+    }
+
+    static List<TRecCTETarget> buildRecCTETargets(List<AssignedJob> fragmentAssignedJobs,
+            RecursiveCteScanNode recursiveCteScanNode) {
+        List<AssignedJob> targetJobs = selectRecCTETargetJobs(fragmentAssignedJobs);
+        List<TRecCTETarget> targets = new ArrayList<>(targetJobs.size());
+        for (AssignedJob assignedJob : targetJobs) {
+            DistributedPlanWorker worker = assignedJob.getAssignedWorker();
+            TRecCTETarget target = new TRecCTETarget();
+            target.setAddr(new TNetworkAddress(worker.host(), worker.brpcPort()));
+            target.setFragmentInstanceId(assignedJob.instanceId());
+            target.setNodeId(recursiveCteScanNode.getId().asInt());
+            targets.add(target);
+        }
+        return targets;
+    }
+
+    static List<AssignedJob> selectRecCTETargetJobs(List<AssignedJob> fragmentAssignedJobs) {
+        List<AssignedJob> targetJobs = new ArrayList<>(fragmentAssignedJobs.size());
+        Map<TNetworkAddress, Integer> localShuffleTargetIndexMap = Maps.newLinkedHashMap();
+        for (AssignedJob assignedJob : fragmentAssignedJobs) {
+            if (!(assignedJob instanceof LocalShuffleAssignedJob)) {
+                targetJobs.add(assignedJob);
+                continue;
+            }
+
+            DistributedPlanWorker worker = assignedJob.getAssignedWorker();
+            TNetworkAddress address = new TNetworkAddress(worker.host(), worker.brpcPort());
+            Integer targetIndex = localShuffleTargetIndexMap.get(address);
+            if (targetIndex == null) {
+                localShuffleTargetIndexMap.put(address, targetJobs.size());
+                targetJobs.add(assignedJob);
+                continue;
+            }
+
+            AssignedJob selectedJob = targetJobs.get(targetIndex);
+            if (assignedJob.indexInUnassignedJob() < selectedJob.indexInUnassignedJob()) {
+                targetJobs.set(targetIndex, assignedJob);
+            }
+        }
+        return targetJobs;
+    }
+
+    private static void collectAllRecursiveCteNodesInRecursiveSide(PlanNode planNode, boolean needCollect,
+            Set<RecursiveCteNode> recursiveCteNodes) {
+        if (planNode instanceof RecursiveCteNode) {
+            if (needCollect) {
+                recursiveCteNodes.add((RecursiveCteNode) planNode);
+            }
+            collectAllRecursiveCteNodesInRecursiveSide(planNode.getChild(0), needCollect, recursiveCteNodes);
+            collectAllRecursiveCteNodesInRecursiveSide(planNode.getChild(1), true, recursiveCteNodes);
+        } else {
+            for (PlanNode child : planNode.getChildren()) {
+                collectAllRecursiveCteNodesInRecursiveSide(child, needCollect, recursiveCteNodes);
             }
         }
     }

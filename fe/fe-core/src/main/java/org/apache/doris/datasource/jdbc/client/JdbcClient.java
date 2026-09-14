@@ -68,6 +68,7 @@ public abstract class JdbcClient {
     protected Map<String, Boolean> includeDatabaseMap;
     protected Map<String, Boolean> excludeDatabaseMap;
     protected boolean enableMappingVarbinary;
+    protected boolean enableMappingTimestampTz;
 
     public static JdbcClient createJdbcClient(JdbcClientConfig jdbcClientConfig) {
         String dbType = parseDbType(jdbcClientConfig.getJdbcUrl());
@@ -113,6 +114,7 @@ public abstract class JdbcClient {
         initializeClassLoader(jdbcClientConfig);
         initializeDataSource(jdbcClientConfig);
         this.enableMappingVarbinary = jdbcClientConfig.isEnableMappingVarbinary();
+        this.enableMappingTimestampTz = jdbcClientConfig.isEnableMappingTimestampTz();
     }
 
     protected void setJdbcDriverSystemProperties() {
@@ -316,7 +318,7 @@ public abstract class JdbcClient {
                 String currentDatabase = conn.getSchema();
                 remoteDatabaseNames.add(currentDatabase);
             } else {
-                rs = conn.getMetaData().getSchemas(conn.getCatalog(), null);
+                rs = conn.getMetaData().getSchemas(conn.getCatalog(), getSchemaPatternForDatabaseNameList());
                 while (rs.next()) {
                     remoteDatabaseNames.add(rs.getString("TABLE_SCHEM"));
                 }
@@ -327,6 +329,18 @@ public abstract class JdbcClient {
             close(rs, conn);
         }
         return filterDatabaseNames(remoteDatabaseNames);
+    }
+
+    /**
+     * Schema pattern passed to {@link java.sql.DatabaseMetaData#getSchemas(String, String)} when listing
+     * remote database names.
+     *
+     * <p>The default {@code null} follows JDBC semantics of "schema name should not be used to narrow
+     * the search", preserving the existing generic behavior. Subclasses should override this only when
+     * a driver treats {@code null} specially and does not return the schemas Doris expects.
+     */
+    protected String getSchemaPatternForDatabaseNameList() {
+        return null;
     }
 
     /**
@@ -404,6 +418,30 @@ public abstract class JdbcClient {
                     true, -1));
         }
         return dorisTableSchema;
+    }
+
+    /**
+     * get primary keys of one table
+     */
+    public List<String> getPrimaryKeys(String remoteDbName, String remoteTableName) {
+        Connection conn = getConnection();
+        ResultSet rs = null;
+        List<String> primaryKeys = Lists.newArrayList();
+        try {
+            DatabaseMetaData databaseMetaData = conn.getMetaData();
+            String catalogName = getCatalogName(conn);
+            rs = databaseMetaData.getPrimaryKeys(catalogName, remoteDbName, remoteTableName);
+            while (rs.next()) {
+                String fieldName = rs.getString("COLUMN_NAME");
+                primaryKeys.add(fieldName);
+            }
+        } catch (SQLException e) {
+            throw new JdbcClientException("failed to get jdbc primary key info for remote table `%s.%s`: %s",
+                    remoteDbName, remoteTableName, Util.getRootCauseMessage(e));
+        } finally {
+            close(rs, conn);
+        }
+        return primaryKeys;
     }
 
     // protected methods, for subclass to override

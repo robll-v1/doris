@@ -18,11 +18,15 @@
 package org.apache.doris.nereids.parser;
 
 import org.apache.doris.analysis.BrokerDesc;
+import org.apache.doris.analysis.UserDesc;
 import org.apache.doris.common.Pair;
-import org.apache.doris.common.util.PrintableMap;
+import org.apache.doris.common.util.DatasourcePrintableMap;
 import org.apache.doris.nereids.DorisParser;
+import org.apache.doris.nereids.DorisParser.DmlStatementBodyContext;
+import org.apache.doris.nereids.DorisParser.DmlStatementContext;
+import org.apache.doris.nereids.DorisParser.ExplainableDmlStatementContext;
 import org.apache.doris.nereids.DorisParser.InsertTableContext;
-import org.apache.doris.nereids.DorisParser.SupportedDmlStatementContext;
+import org.apache.doris.nereids.DorisParser.JobFromToClauseContext;
 import org.apache.doris.nereids.trees.plans.commands.info.SetVarOp;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 
@@ -46,14 +50,14 @@ public class LogicalPlanBuilderForEncryption extends LogicalPlanBuilder {
 
     // select into outfile clause
     @Override
-    public LogicalPlan visitStatementDefault(DorisParser.StatementDefaultContext ctx) {
+    public LogicalPlan visitExplainableStatement(DorisParser.ExplainableStatementContext ctx) {
         if (ctx.outFileClause() != null && ctx.outFileClause().propertyClause() != null) {
             DorisParser.PropertyClauseContext propertyClauseContext = ctx.outFileClause().propertyClause();
             encryptProperty(visitPropertyClause(propertyClauseContext),
                     propertyClauseContext.fileProperties.start.getStartIndex(),
                     propertyClauseContext.fileProperties.stop.getStopIndex());
         }
-        return super.visitStatementDefault(ctx);
+        return super.visitExplainableStatement(ctx);
     }
 
     // export into outfile clause
@@ -84,6 +88,15 @@ public class LogicalPlanBuilderForEncryption extends LogicalPlanBuilder {
         return super.visitSetPassword(ctx);
     }
 
+    // grant user identity clause
+    @Override
+    public UserDesc visitGrantUserIdentify(DorisParser.GrantUserIdentifyContext ctx) {
+        if (ctx.pwd != null) {
+            encryptPassword(ctx.pwd.getStartIndex(), ctx.pwd.getStopIndex());
+        }
+        return super.visitGrantUserIdentify(ctx);
+    }
+
     // set ldap password clause
     @Override
     public SetVarOp visitSetLdapAdminPassword(DorisParser.SetLdapAdminPasswordContext ctx) {
@@ -100,6 +113,30 @@ public class LogicalPlanBuilderForEncryption extends LogicalPlanBuilder {
                     context.fileProperties.stop.getStopIndex());
         }
         return super.visitCreateCatalog(ctx);
+    }
+
+    // create repository clause (CREATE [READ ONLY] REPOSITORY ... WITH <backend> ... PROPERTIES(...))
+    @Override
+    public LogicalPlan visitCreateRepository(DorisParser.CreateRepositoryContext ctx) {
+        if (ctx.storageBackend() != null && ctx.storageBackend().properties != null) {
+            DorisParser.PropertyClauseContext propertyClauseContext = ctx.storageBackend().properties;
+            encryptProperty(visitPropertyClause(propertyClauseContext),
+                    propertyClauseContext.fileProperties.start.getStartIndex(),
+                    propertyClauseContext.fileProperties.stop.getStopIndex());
+        }
+        return super.visitCreateRepository(ctx);
+    }
+
+    // alter repository clause (ALTER REPOSITORY ... PROPERTIES(...))
+    @Override
+    public LogicalPlan visitAlterRepository(DorisParser.AlterRepositoryContext ctx) {
+        if (ctx.propertyClause() != null) {
+            DorisParser.PropertyClauseContext propertyClauseContext = ctx.propertyClause();
+            encryptProperty(visitPropertyClause(propertyClauseContext),
+                    propertyClauseContext.fileProperties.start.getStartIndex(),
+                    propertyClauseContext.fileProperties.stop.getStopIndex());
+        }
+        return super.visitAlterRepository(ctx);
     }
 
     // create table clause
@@ -131,6 +168,18 @@ public class LogicalPlanBuilderForEncryption extends LogicalPlanBuilder {
         return super.visitCreateStorageVault(ctx);
     }
 
+    // create authentication integration clause
+    @Override
+    public LogicalPlan visitCreateAuthenticationIntegration(DorisParser.CreateAuthenticationIntegrationContext ctx) {
+        if (ctx.properties != null && ctx.properties.fileProperties != null) {
+            DorisParser.PropertyClauseContext propertyClauseContext = ctx.properties;
+            encryptProperty(visitPropertyClause(propertyClauseContext),
+                    propertyClauseContext.fileProperties.start.getStartIndex(),
+                    propertyClauseContext.fileProperties.stop.getStopIndex());
+        }
+        return super.visitCreateAuthenticationIntegration(ctx);
+    }
+
     // alter storage vault clause
     @Override
     public LogicalPlan visitAlterStorageVault(DorisParser.AlterStorageVaultContext ctx) {
@@ -141,6 +190,30 @@ public class LogicalPlanBuilderForEncryption extends LogicalPlanBuilder {
                     propertyClauseContext.fileProperties.stop.getStopIndex());
         }
         return super.visitAlterStorageVault(ctx);
+    }
+
+    // alter authentication integration properties clause
+    @Override
+    public LogicalPlan visitAlterAuthenticationIntegrationProperties(
+            DorisParser.AlterAuthenticationIntegrationPropertiesContext ctx) {
+        if (ctx.properties != null && ctx.properties.fileProperties != null) {
+            DorisParser.PropertyClauseContext propertyClauseContext = ctx.properties;
+            encryptProperty(visitPropertyClause(propertyClauseContext),
+                    propertyClauseContext.fileProperties.start.getStartIndex(),
+                    propertyClauseContext.fileProperties.stop.getStopIndex());
+        }
+        return super.visitAlterAuthenticationIntegrationProperties(ctx);
+    }
+
+    @Override
+    public LogicalPlan visitAlterResource(DorisParser.AlterResourceContext ctx) {
+        if (ctx.propertyClause() != null) {
+            DorisParser.PropertyClauseContext propertyClauseContext = ctx.propertyClause();
+            encryptProperty(visitPropertyClause(propertyClauseContext),
+                    propertyClauseContext.fileProperties.start.getStartIndex(),
+                    propertyClauseContext.fileProperties.stop.getStopIndex());
+        }
+        return super.visitAlterResource(ctx);
     }
 
     // select from tvf
@@ -157,24 +230,57 @@ public class LogicalPlanBuilderForEncryption extends LogicalPlanBuilder {
     // create job select tvf
     @Override
     public LogicalPlan visitCreateScheduledJob(DorisParser.CreateScheduledJobContext ctx) {
-        SupportedDmlStatementContext supportedDmlStatementContext = ctx.supportedDmlStatement();
-        visitInsertTable((InsertTableContext) supportedDmlStatementContext);
+        InsertTableContext insertTableContext = getInsertTableContext(ctx.dmlStatement());
+        if (insertTableContext != null) {
+            visitInsertTable(insertTableContext);
+        } else if (ctx.jobFromToClause() != null) {
+            JobFromToClauseContext jobFromToClauseContext = ctx.jobFromToClause();
+            encryptProperty(visitPropertyItemList(jobFromToClauseContext.sourceProperties),
+                    jobFromToClauseContext.sourceProperties.start.getStartIndex(),
+                    jobFromToClauseContext.sourceProperties.stop.getStopIndex());
+
+        }
         return super.visitCreateScheduledJob(ctx);
     }
 
     // alter job select tvf
     @Override
     public LogicalPlan visitAlterJob(DorisParser.AlterJobContext ctx) {
-        SupportedDmlStatementContext supportedDmlStatementContext = ctx.supportedDmlStatement();
-        if (ctx.supportedDmlStatement() != null) {
-            visitInsertTable((InsertTableContext) supportedDmlStatementContext);
+        InsertTableContext insertTableContext = getInsertTableContext(ctx.dmlStatement());
+        if (insertTableContext != null) {
+            visitInsertTable(insertTableContext);
+        } else if (ctx.jobFromToClause() != null) {
+            JobFromToClauseContext jobFromToClauseContext = ctx.jobFromToClause();
+            encryptProperty(visitPropertyItemList(jobFromToClauseContext.sourceProperties),
+                    jobFromToClauseContext.sourceProperties.start.getStartIndex(),
+                    jobFromToClauseContext.sourceProperties.stop.getStopIndex());
+
         }
         return super.visitAlterJob(ctx);
     }
 
+    private InsertTableContext getInsertTableContext(DmlStatementContext ctx) {
+        if (!(ctx instanceof ExplainableDmlStatementContext)) {
+            return null;
+        }
+        DmlStatementBodyContext body = ((ExplainableDmlStatementContext) ctx).dmlStatementBody();
+        return body instanceof InsertTableContext ? (InsertTableContext) body : null;
+    }
+
+    @Override
+    public LogicalPlan visitCreateResource(DorisParser.CreateResourceContext ctx) {
+        if (ctx.properties != null) {
+            DorisParser.PropertyClauseContext propertyClauseContext = ctx.properties;
+            encryptProperty(visitPropertyClause(propertyClauseContext),
+                    propertyClauseContext.fileProperties.start.getStartIndex(),
+                    propertyClauseContext.fileProperties.stop.getStopIndex());
+        }
+        return super.visitCreateResource(ctx);
+    }
+
     private void encryptProperty(Map<String, String> properties, int start, int stop) {
         if (MapUtils.isNotEmpty(properties)) {
-            PrintableMap<String, String> printableMap = new PrintableMap<>(properties, "=",
+            DatasourcePrintableMap<String, String> printableMap = new DatasourcePrintableMap<>(properties, "=",
                     true, false, true);
             indexInSqlToString.put(Pair.of(start, stop), printableMap.toString());
         }

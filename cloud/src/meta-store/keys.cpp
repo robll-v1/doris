@@ -57,6 +57,7 @@ static const char* META_KEY_INFIX_DELETE_BITMAP_PENDING = "delete_bitmap_pending
 static const char* META_KEY_INFIX_MOW_TABLET_JOB        = "mow_tablet_job";
 static const char* META_KEY_INFIX_SCHEMA_DICTIONARY     = "tablet_schema_pb_dict";
 static const char* META_KEY_INFIX_PACKED_FILE          = "packed_file";
+static const char* META_KEY_INFIX_TABLE_STREAM_OFFSET  = "table_stream_offset";
 
 static const char* RECYCLE_KEY_INFIX_INDEX              = "index";
 static const char* RECYCLE_KEY_INFIX_PART               = "partition";
@@ -146,6 +147,7 @@ static void encode_prefix(const T& t, std::string* key) {
         InstanceKeyInfo,
         TxnLabelKeyInfo, TxnInfoKeyInfo, TxnIndexKeyInfo, TxnRunningKeyInfo,
         MetaRowsetKeyInfo, MetaRowsetTmpKeyInfo, MetaTabletKeyInfo, MetaTabletIdxKeyInfo, MetaSchemaKeyInfo,
+        TableStreamOffsetKeyInfo,
         MetaDeleteBitmapInfo, MetaDeleteBitmapUpdateLockInfo, MetaPendingDeleteBitmapInfo, PartitionVersionKeyInfo,
         RecycleIndexKeyInfo, RecyclePartKeyInfo, RecycleRowsetKeyInfo, RecycleTxnKeyInfo, RecycleStageKeyInfo,
         StatsTabletKeyInfo, TableVersionKeyInfo, JobRestoreTabletKeyInfo, JobRestoreRowsetKeyInfo,
@@ -173,7 +175,8 @@ static void encode_prefix(const T& t, std::string* key) {
                       || std::is_same_v<T, MetaDeleteBitmapUpdateLockInfo>
                       || std::is_same_v<T, MetaPendingDeleteBitmapInfo>
                       || std::is_same_v<T, MowTabletJobInfo>
-                      || std::is_same_v<T, PackedFileKeyInfo>) {
+                      || std::is_same_v<T, PackedFileKeyInfo>
+                      || std::is_same_v<T, TableStreamOffsetKeyInfo>) {
         encode_bytes(META_KEY_PREFIX, key);
     } else if constexpr (std::is_same_v<T, PartitionVersionKeyInfo>
                       || std::is_same_v<T, TableVersionKeyInfo>) {
@@ -367,6 +370,31 @@ void meta_schema_pb_dictionary_key(const MetaSchemaPBDictionaryInfo& in, std::st
     encode_prefix(in, out);                              // 0x01 "meta" ${instance_id}
     encode_bytes(META_KEY_INFIX_SCHEMA_DICTIONARY, out); // "tablet_schema_pb_dict"
     encode_int64(std::get<1>(in), out);                  // index_id
+}
+
+static void encode_table_stream_offset_key_prefix(const TableStreamOffsetKeyInfo& in,
+                                                  std::string* out) {
+    encode_prefix(in, out);                                // 0x01 "meta" ${instance_id}
+    encode_bytes(META_KEY_INFIX_TABLE_STREAM_OFFSET, out); // "table_stream_offset"
+    encode_int64(std::get<1>(in), out);                    // base_db_id
+    encode_int64(std::get<2>(in), out);                    // base_table_id
+    encode_int64(std::get<3>(in), out);                    // stream_db_id
+    encode_int64(std::get<4>(in), out);                    // stream_id
+}
+
+std::string table_stream_offset_key_prefix(std::string_view instance_id, int64_t base_db_id,
+                                           int64_t base_table_id, int64_t stream_db_id,
+                                           int64_t stream_id) {
+    TableStreamOffsetKeyInfo info {instance_id,  base_db_id, base_table_id,
+                                   stream_db_id, stream_id,  0};
+    std::string out;
+    encode_table_stream_offset_key_prefix(info, &out);
+    return out;
+}
+
+void table_stream_offset_key(const TableStreamOffsetKeyInfo& in, std::string* out) {
+    encode_table_stream_offset_key_prefix(in, out);
+    encode_int64(std::get<5>(in), out); // partition_id
 }
 
 //==============================================================================
@@ -813,6 +841,33 @@ void meta_delete_bitmap_key(const MetaDeleteBitmapInfo& in, std::string* out) {
     encode_int64(std::get<1>(in), out);              // tablet_id
     encode_bytes(std::get<2>(in), out);              // rowset_id
 }
+
+static void encode_table_stream_offset_key_prefix(const TableStreamOffsetKeyInfo& in,
+                                                  std::string* out) {
+    out->push_back(CLOUD_VERSIONED_KEY_SPACE03);
+    encode_bytes(META_KEY_PREFIX, out);                    // "meta"
+    encode_bytes(std::get<0>(in), out);                    // instance_id
+    encode_bytes(META_KEY_INFIX_TABLE_STREAM_OFFSET, out); // "table_stream_offset"
+    encode_int64(std::get<1>(in), out);                    // base_db_id
+    encode_int64(std::get<2>(in), out);                    // base_table_id
+    encode_int64(std::get<3>(in), out);                    // stream_db_id
+    encode_int64(std::get<4>(in), out);                    // stream_id
+}
+
+std::string table_stream_offset_key_prefix(std::string_view instance_id, int64_t base_db_id,
+                                           int64_t base_table_id, int64_t stream_db_id,
+                                           int64_t stream_id) {
+    TableStreamOffsetKeyInfo info {instance_id,  base_db_id, base_table_id,
+                                   stream_db_id, stream_id,  0};
+    std::string out;
+    encode_table_stream_offset_key_prefix(info, &out);
+    return out;
+}
+
+void table_stream_offset_key(const TableStreamOffsetKeyInfo& in, std::string* out) {
+    encode_table_stream_offset_key_prefix(in, out);
+    encode_int64(std::get<5>(in), out); // partition_id
+}
 //==============================================================================
 // Data keys
 //==============================================================================
@@ -1104,6 +1159,40 @@ bool decode_meta_tablet_key(std::string_view* in, int64_t* tablet_id, Versionsta
     return true;
 }
 
+// Decode tablet inverted index key
+// Return true if decode successfully, otherwise false
+bool decode_tablet_inverted_index_key(std::string_view* in, int64_t* db_id, int64_t* table_id,
+                                      int64_t* index_id, int64_t* partition_id,
+                                      int64_t* tablet_id) {
+    // 0x03 "index" ${instance_id} "tablet_inverted" ${db_id} ${table_id} ${index_id} ${partition} ${tablet}
+    if (in->empty() || static_cast<uint8_t>((*in)[0]) != CLOUD_VERSIONED_KEY_SPACE03) {
+        return false;
+    }
+    in->remove_prefix(1);
+
+    std::vector<std::tuple<std::variant<int64_t, std::string>, int, int>> out;
+    auto res = decode_key(in, &out);
+    if (res != 0 || out.size() != 8) {
+        return false;
+    }
+
+    try {
+        if (std::get<std::string>(std::get<0>(out[0])) != INDEX_KEY_PREFIX ||
+            std::get<std::string>(std::get<0>(out[2])) != TABLET_INVERTED_INDEX_KEY_INFIX) {
+            return false;
+        }
+        *db_id = std::get<int64_t>(std::get<0>(out[3]));
+        *table_id = std::get<int64_t>(std::get<0>(out[4]));
+        *index_id = std::get<int64_t>(std::get<0>(out[5]));
+        *partition_id = std::get<int64_t>(std::get<0>(out[6]));
+        *tablet_id = std::get<int64_t>(std::get<0>(out[7]));
+    } catch (const std::bad_variant_access& e) {
+        return false;
+    }
+
+    return true;
+}
+
 bool decode_snapshot_ref_key(std::string_view* in, std::string* instance_id,
                              Versionstamp* timestamp, std::string* ref_instance_id) {
     // Key format: 0x03 + encode_bytes("snapshot") + encode_bytes(instance_id) +
@@ -1149,6 +1238,34 @@ bool decode_snapshot_ref_key(std::string_view* in, std::string* instance_id,
 
     // Decode ref_instance_id
     if (ref_instance_id && decode_bytes(in, ref_instance_id) != 0) {
+        return false;
+    }
+
+    return true;
+}
+
+bool decode_data_rowset_ref_count_key(std::string_view* in, int64_t* tablet_id,
+                                      std::string* rowset_id) {
+    // 0x03 "data" ${instance_id} "rowset_ref_count" ${tablet_id} ${rowset_id}
+    if (in->empty() || static_cast<uint8_t>((*in)[0]) != CLOUD_VERSIONED_KEY_SPACE03) {
+        return false;
+    }
+    in->remove_prefix(1);
+
+    std::vector<std::tuple<std::variant<int64_t, std::string>, int, int>> out;
+    auto res = decode_key(in, &out);
+    if (res != 0 || out.size() != 5) {
+        return false;
+    }
+
+    try {
+        if (std::get<std::string>(std::get<0>(out[0])) != DATA_KEY_PREFIX ||
+            std::get<std::string>(std::get<0>(out[2])) != META_ROWSET_REF_COUNT_KEY_INFIX) {
+            return false;
+        }
+        *tablet_id = std::get<int64_t>(std::get<0>(out[3]));
+        *rowset_id = std::get<std::string>(std::get<0>(out[4]));
+    } catch (const std::bad_variant_access& e) {
         return false;
     }
 

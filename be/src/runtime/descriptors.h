@@ -38,10 +38,9 @@
 #include "common/global_types.h"
 #include "common/object_pool.h"
 #include "common/status.h"
-#include "olap/utils.h"
-#include "runtime/define_primitive_type.h"
-#include "runtime/types.h"
-#include "vec/data_types/data_type.h"
+#include "core/data_type/data_type.h"
+#include "core/data_type/define_primitive_type.h"
+#include "storage/utils.h"
 
 namespace google::protobuf {
 template <typename Element>
@@ -49,7 +48,6 @@ class RepeatedField;
 } // namespace google::protobuf
 
 namespace doris {
-#include "common/compile_check_begin.h"
 class ObjectPool;
 class PTupleDescriptor;
 class PSlotDescriptor;
@@ -60,7 +58,7 @@ class SlotDescriptor {
 public:
     MOCK_DEFINE(virtual ~SlotDescriptor() = default;)
     SlotId id() const { return _id; }
-    vectorized::DataTypePtr type() const { return _type; }
+    DataTypePtr type() const { return _type; }
     TupleId parent() const { return _parent; }
     // Returns the column index of this slot, including partition keys.
     // (e.g., col_pos - num_partition_keys = the table column this slot corresponds to)
@@ -68,7 +66,7 @@ public:
     // Returns the field index in the generated llvm struct for this slot's tuple
     int field_idx() const { return _field_idx; }
     bool is_nullable() const;
-    vectorized::DataTypePtr get_data_type_ptr() const;
+    DataTypePtr get_data_type_ptr() const;
 
     const std::string& col_name() const { return _col_name; }
     const std::string& col_name_lower_case() const { return _col_name_lower_case; }
@@ -77,7 +75,7 @@ public:
 
     std::string debug_string() const;
 
-    vectorized::MutableColumnPtr get_empty_mutable_column() const;
+    MutableColumnPtr get_empty_mutable_column() const;
 
     MOCK_FUNCTION int32_t col_unique_id() const { return _col_unique_id; }
 
@@ -115,7 +113,7 @@ private:
     friend class TabletSchema;
 
     MOCK_REMOVE(const) SlotId _id;
-    MOCK_REMOVE(const) vectorized::DataTypePtr _type;
+    MOCK_REMOVE(const) DataTypePtr _type;
     const TupleId _parent;
     const int _col_pos;
     MOCK_REMOVE(const) std::string _col_name;
@@ -245,18 +243,20 @@ public:
     std::string endpoint() const { return _endpoint; }
     std::string quota() const { return _quota; }
     Status init_status() const { return _init_status; }
+    std::map<std::string, std::string> properties() const { return _props; }
 
 private:
     std::string _region; //deprecated
     std::string _project;
     std::string _table;
-    std::string _odps_url;   //deprecated
-    std::string _tunnel_url; //deprecated
-    std::string _access_key;
-    std::string _secret_key;
+    std::string _odps_url;      //deprecated
+    std::string _tunnel_url;    //deprecated
+    std::string _access_key;    //deprecated
+    std::string _secret_key;    //deprecated
     std::string _public_access; //deprecated
     std::string _endpoint;
     std::string _quota;
+    std::map<std::string, std::string> _props;
     Status _init_status = Status::OK();
 };
 
@@ -362,6 +362,7 @@ public:
 
     int num_materialized_slots() const { return _num_materialized_slots; }
     MOCK_FUNCTION const std::vector<SlotDescriptor*>& slots() const { return _slots; }
+    int get_column_id(SlotId slot_id) const;
 
     bool has_varlen_slots() const { return _has_varlen_slots; }
     const TableDescriptor* table_desc() const { return _table_desc; }
@@ -470,6 +471,8 @@ public:
         }
     }
 
+    RowDescriptor& operator=(const RowDescriptor&) = default;
+
     RowDescriptor(TupleDescriptor* tuple_desc);
 
     RowDescriptor(const RowDescriptor& lhs_row_desc, const RowDescriptor& rhs_row_desc);
@@ -530,5 +533,4 @@ private:
     int _num_materialized_slots = 0;
     int _num_slots = 0;
 };
-#include "common/compile_check_end.h"
 } // namespace doris

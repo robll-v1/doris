@@ -24,9 +24,10 @@ import org.apache.doris.catalog.DataProperty;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.DistributionInfo;
 import org.apache.doris.catalog.Env;
-import org.apache.doris.catalog.FakeEditLog;
 import org.apache.doris.catalog.HashDistributionInfo;
 import org.apache.doris.catalog.KeysType;
+import org.apache.doris.catalog.LocalReplica;
+import org.apache.doris.catalog.LocalTablet;
 import org.apache.doris.catalog.MaterializedIndex;
 import org.apache.doris.catalog.MaterializedIndex.IndexState;
 import org.apache.doris.catalog.MysqlTable;
@@ -63,7 +64,7 @@ import org.apache.doris.thrift.TStorageType;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Range;
-import mockit.Expectations;
+import org.mockito.Mockito;
 
 import java.util.List;
 import java.util.Map;
@@ -205,22 +206,13 @@ public class CatalogMocker {
     }
 
     private static AccessControllerManager fetchAdminAccess() {
-        AccessControllerManager accessManager = new AccessControllerManager(new Auth());
-        new Expectations(accessManager) {
-            {
-                accessManager.checkGlobalPriv((ConnectContext) any, (PrivPredicate) any);
-                minTimes = 0;
-                result = true;
-
-                accessManager.checkDbPriv((ConnectContext) any, anyString, anyString, (PrivPredicate) any);
-                minTimes = 0;
-                result = true;
-
-                accessManager.checkTblPriv((ConnectContext) any, anyString, anyString, anyString, (PrivPredicate) any);
-                minTimes = 0;
-                result = true;
-            }
-        };
+        AccessControllerManager accessManager = Mockito.spy(new AccessControllerManager(new Auth()));
+        Mockito.doReturn(true).when(accessManager).checkGlobalPriv(Mockito.nullable(ConnectContext.class),
+                Mockito.any(PrivPredicate.class));
+        Mockito.doReturn(true).when(accessManager).checkDbPriv(Mockito.nullable(ConnectContext.class),
+                Mockito.anyString(), Mockito.anyString(), Mockito.any(PrivPredicate.class));
+        Mockito.doReturn(true).when(accessManager).checkTblPriv(Mockito.nullable(ConnectContext.class),
+                Mockito.anyString(), Mockito.anyString(), Mockito.anyString(), Mockito.any(PrivPredicate.class));
         return accessManager;
     }
 
@@ -247,13 +239,14 @@ public class CatalogMocker {
                                             KeysType.AGG_KEYS, partitionInfo, distributionInfo);
         Deencapsulation.setField(olapTable, "baseIndexId", TEST_TBL_ID);
 
-        Tablet tablet0 = new Tablet(TEST_TABLET0_ID);
+        Tablet tablet0 = new LocalTablet(TEST_TABLET0_ID);
         TabletMeta tabletMeta = new TabletMeta(TEST_DB_ID, TEST_TBL_ID, TEST_SINGLE_PARTITION_ID,
-                                               TEST_TBL_ID, SCHEMA_HASH, TStorageMedium.HDD);
+                                               TEST_TBL_ID, SCHEMA_HASH, TStorageMedium.HDD,
+                                               false /* isRowBinlog */);
         baseIndex.addTablet(tablet0, tabletMeta);
-        Replica replica0 = new Replica(TEST_REPLICA0_ID, BACKEND1_ID, 0, ReplicaState.NORMAL);
-        Replica replica1 = new Replica(TEST_REPLICA1_ID, BACKEND2_ID, 0, ReplicaState.NORMAL);
-        Replica replica2 = new Replica(TEST_REPLICA2_ID, BACKEND3_ID, 0, ReplicaState.NORMAL);
+        Replica replica0 = new LocalReplica(TEST_REPLICA0_ID, BACKEND1_ID, 0, ReplicaState.NORMAL);
+        Replica replica1 = new LocalReplica(TEST_REPLICA1_ID, BACKEND2_ID, 0, ReplicaState.NORMAL);
+        Replica replica2 = new LocalReplica(TEST_REPLICA2_ID, BACKEND3_ID, 0, ReplicaState.NORMAL);
 
         tablet0.addReplica(replica0);
         tablet0.addReplica(replica1);
@@ -321,25 +314,27 @@ public class CatalogMocker {
                 KeysType.AGG_KEYS, rangePartitionInfo, distributionInfo2);
         Deencapsulation.setField(olapTable2, "baseIndexId", TEST_TBL2_ID);
 
-        Tablet baseTabletP1 = new Tablet(TEST_BASE_TABLET_P1_ID);
+        Tablet baseTabletP1 = new LocalTablet(TEST_BASE_TABLET_P1_ID);
         TabletMeta tabletMetaBaseTabletP1 = new TabletMeta(TEST_DB_ID, TEST_TBL2_ID, TEST_PARTITION1_ID,
-                                                           TEST_TBL2_ID, SCHEMA_HASH, TStorageMedium.HDD);
+                                                           TEST_TBL2_ID, SCHEMA_HASH, TStorageMedium.HDD,
+                                                           false /* isRowBinlog */);
         baseIndexP1.addTablet(baseTabletP1, tabletMetaBaseTabletP1);
-        Replica replica3 = new Replica(TEST_REPLICA3_ID, BACKEND1_ID, 0, ReplicaState.NORMAL);
-        Replica replica4 = new Replica(TEST_REPLICA4_ID, BACKEND2_ID, 0, ReplicaState.NORMAL);
-        Replica replica5 = new Replica(TEST_REPLICA5_ID, BACKEND3_ID, 0, ReplicaState.NORMAL);
+        Replica replica3 = new LocalReplica(TEST_REPLICA3_ID, BACKEND1_ID, 0, ReplicaState.NORMAL);
+        Replica replica4 = new LocalReplica(TEST_REPLICA4_ID, BACKEND2_ID, 0, ReplicaState.NORMAL);
+        Replica replica5 = new LocalReplica(TEST_REPLICA5_ID, BACKEND3_ID, 0, ReplicaState.NORMAL);
 
         baseTabletP1.addReplica(replica3);
         baseTabletP1.addReplica(replica4);
         baseTabletP1.addReplica(replica5);
 
-        Tablet baseTabletP2 = new Tablet(TEST_BASE_TABLET_P2_ID);
+        Tablet baseTabletP2 = new LocalTablet(TEST_BASE_TABLET_P2_ID);
         TabletMeta tabletMetaBaseTabletP2 = new TabletMeta(TEST_DB_ID, TEST_TBL2_ID, TEST_PARTITION2_ID,
-                                                           TEST_TBL2_ID, SCHEMA_HASH, TStorageMedium.HDD);
+                                                           TEST_TBL2_ID, SCHEMA_HASH, TStorageMedium.HDD,
+                                                           false /* isRowBinlog */);
         baseIndexP2.addTablet(baseTabletP2, tabletMetaBaseTabletP2);
-        Replica replica6 = new Replica(TEST_REPLICA6_ID, BACKEND1_ID, 0, ReplicaState.NORMAL);
-        Replica replica7 = new Replica(TEST_REPLICA7_ID, BACKEND2_ID, 0, ReplicaState.NORMAL);
-        Replica replica8 = new Replica(TEST_REPLICA8_ID, BACKEND3_ID, 0, ReplicaState.NORMAL);
+        Replica replica6 = new LocalReplica(TEST_REPLICA6_ID, BACKEND1_ID, 0, ReplicaState.NORMAL);
+        Replica replica7 = new LocalReplica(TEST_REPLICA7_ID, BACKEND2_ID, 0, ReplicaState.NORMAL);
+        Replica replica8 = new LocalReplica(TEST_REPLICA8_ID, BACKEND3_ID, 0, ReplicaState.NORMAL);
 
         baseTabletP2.addReplica(replica6);
         baseTabletP2.addReplica(replica7);
@@ -353,14 +348,14 @@ public class CatalogMocker {
 
         // rollup index p1
         MaterializedIndex rollupIndexP1 = new MaterializedIndex(TEST_ROLLUP_ID, IndexState.NORMAL);
-        Tablet rollupTabletP1 = new Tablet(TEST_ROLLUP_TABLET_P1_ID);
+        Tablet rollupTabletP1 = new LocalTablet(TEST_ROLLUP_TABLET_P1_ID);
         TabletMeta tabletMetaRollupTabletP1 = new TabletMeta(TEST_DB_ID, TEST_TBL2_ID, TEST_PARTITION1_ID,
                                                              TEST_ROLLUP_TABLET_P1_ID, ROLLUP_SCHEMA_HASH,
-                                                             TStorageMedium.HDD);
+                                                             TStorageMedium.HDD, false /* isRowBinlog */);
         rollupIndexP1.addTablet(rollupTabletP1, tabletMetaRollupTabletP1);
-        Replica replica9 = new Replica(TEST_REPLICA9_ID, BACKEND1_ID, 0, ReplicaState.NORMAL);
-        Replica replica10 = new Replica(TEST_REPLICA10_ID, BACKEND2_ID, 0, ReplicaState.NORMAL);
-        Replica replica11 = new Replica(TEST_REPLICA11_ID, BACKEND3_ID, 0, ReplicaState.NORMAL);
+        Replica replica9 = new LocalReplica(TEST_REPLICA9_ID, BACKEND1_ID, 0, ReplicaState.NORMAL);
+        Replica replica10 = new LocalReplica(TEST_REPLICA10_ID, BACKEND2_ID, 0, ReplicaState.NORMAL);
+        Replica replica11 = new LocalReplica(TEST_REPLICA11_ID, BACKEND3_ID, 0, ReplicaState.NORMAL);
 
         rollupTabletP1.addReplica(replica9);
         rollupTabletP1.addReplica(replica10);
@@ -370,14 +365,14 @@ public class CatalogMocker {
 
         // rollup index p2
         MaterializedIndex rollupIndexP2 = new MaterializedIndex(TEST_ROLLUP_ID, IndexState.NORMAL);
-        Tablet rollupTabletP2 = new Tablet(TEST_ROLLUP_TABLET_P2_ID);
+        Tablet rollupTabletP2 = new LocalTablet(TEST_ROLLUP_TABLET_P2_ID);
         TabletMeta tabletMetaRollupTabletP2 = new TabletMeta(TEST_DB_ID, TEST_TBL2_ID, TEST_PARTITION1_ID,
                                                              TEST_ROLLUP_TABLET_P2_ID, ROLLUP_SCHEMA_HASH,
-                                                             TStorageMedium.HDD);
+                                                             TStorageMedium.HDD, false /* isRowBinlog */);
         rollupIndexP2.addTablet(rollupTabletP2, tabletMetaRollupTabletP2);
-        Replica replica12 = new Replica(TEST_REPLICA12_ID, BACKEND1_ID, 0, ReplicaState.NORMAL);
-        Replica replica13 = new Replica(TEST_REPLICA13_ID, BACKEND2_ID, 0, ReplicaState.NORMAL);
-        Replica replica14 = new Replica(TEST_REPLICA14_ID, BACKEND3_ID, 0, ReplicaState.NORMAL);
+        Replica replica12 = new LocalReplica(TEST_REPLICA12_ID, BACKEND1_ID, 0, ReplicaState.NORMAL);
+        Replica replica13 = new LocalReplica(TEST_REPLICA13_ID, BACKEND2_ID, 0, ReplicaState.NORMAL);
+        Replica replica14 = new LocalReplica(TEST_REPLICA14_ID, BACKEND3_ID, 0, ReplicaState.NORMAL);
         rollupTabletP2.addReplica(replica12);
         rollupTabletP2.addReplica(replica13);
         rollupTabletP2.addReplica(replica14);
@@ -393,60 +388,26 @@ public class CatalogMocker {
 
     public static Env fetchAdminCatalog() {
         try {
-            FakeEditLog fakeEditLog = new FakeEditLog(); // CHECKSTYLE IGNORE THIS LINE
-
-            Env env = Deencapsulation.newInstance(Env.class);
-            InternalCatalog catalog = Deencapsulation.newInstance(InternalCatalog.class);
+            Env env = Mockito.spy(Deencapsulation.newInstance(Env.class));
+            InternalCatalog catalog = Mockito.spy(Deencapsulation.newInstance(InternalCatalog.class));
 
             Database db = new Database();
             AccessControllerManager accessManager = fetchAdminAccess();
 
-            new Expectations(env, catalog) {
-                {
-                    env.getAccessManager();
-                    minTimes = 0;
-                    result = accessManager;
+            Mockito.doReturn(accessManager).when(env).getAccessManager();
+            Mockito.doReturn(catalog).when(env).getInternalCatalog();
+            Mockito.doReturn(catalog).when(env).getCurrentCatalog();
 
-                    env.getInternalCatalog();
-                    minTimes = 0;
-                    result = catalog;
+            Mockito.doReturn(db).when(catalog).getDbNullable(TEST_DB_ID);
+            Mockito.doReturn(new Database()).when(catalog).getDbNullable(Mockito.anyString());
+            Mockito.doReturn(db).when(catalog).getDbNullable(TEST_DB_NAME);
+            Mockito.doReturn(null).when(catalog).getDbNullable(WRONG_DB);
+            Mockito.doReturn(Lists.newArrayList(TEST_DB_NAME)).when(catalog).getDbNames();
 
-                    env.getCurrentCatalog();
-                    minTimes = 0;
-                    result = catalog;
-
-                    catalog.getDbNullable(TEST_DB_NAME);
-                    minTimes = 0;
-                    result = db;
-
-                    catalog.getDbNullable(WRONG_DB);
-                    minTimes = 0;
-                    result = null;
-
-                    catalog.getDbNullable(TEST_DB_ID);
-                    minTimes = 0;
-                    result = db;
-
-                    catalog.getDbNullable(anyString);
-                    minTimes = 0;
-                    result = new Database();
-
-                    catalog.getDbNames();
-                    minTimes = 0;
-                    result = Lists.newArrayList(TEST_DB_NAME);
-
-                    env.getEditLog();
-                    minTimes = 0;
-                    result = new EditLog("name");
-
-                    env.changeDb((ConnectContext) any, WRONG_DB);
-                    minTimes = 0;
-                    result = new DdlException("failed");
-
-                    env.changeDb((ConnectContext) any, anyString);
-                    minTimes = 0;
-                }
-            };
+            Mockito.doReturn(new EditLog("name")).when(env).getEditLog();
+            Mockito.doNothing().when(env).changeDb(Mockito.nullable(ConnectContext.class), Mockito.anyString());
+            Mockito.doThrow(new DdlException("failed")).when(env).changeDb(Mockito.nullable(ConnectContext.class),
+                    Mockito.eq(WRONG_DB));
             return env;
         } catch (DdlException e) {
             return null;

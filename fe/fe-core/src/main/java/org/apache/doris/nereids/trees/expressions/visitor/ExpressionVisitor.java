@@ -40,6 +40,7 @@ import org.apache.doris.nereids.trees.expressions.CaseWhen;
 import org.apache.doris.nereids.trees.expressions.Cast;
 import org.apache.doris.nereids.trees.expressions.ComparisonPredicate;
 import org.apache.doris.nereids.trees.expressions.CompoundPredicate;
+import org.apache.doris.nereids.trees.expressions.Default;
 import org.apache.doris.nereids.trees.expressions.DefaultValueSlot;
 import org.apache.doris.nereids.trees.expressions.DereferenceExpression;
 import org.apache.doris.nereids.trees.expressions.Divide;
@@ -51,7 +52,9 @@ import org.apache.doris.nereids.trees.expressions.GreaterThanEqual;
 import org.apache.doris.nereids.trees.expressions.InPredicate;
 import org.apache.doris.nereids.trees.expressions.InSubquery;
 import org.apache.doris.nereids.trees.expressions.IntegralDivide;
+import org.apache.doris.nereids.trees.expressions.IsFalse;
 import org.apache.doris.nereids.trees.expressions.IsNull;
+import org.apache.doris.nereids.trees.expressions.IsTrue;
 import org.apache.doris.nereids.trees.expressions.LessThan;
 import org.apache.doris.nereids.trees.expressions.LessThanEqual;
 import org.apache.doris.nereids.trees.expressions.MarkJoinSlotReference;
@@ -117,6 +120,7 @@ import org.apache.doris.nereids.trees.expressions.literal.NullLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.SmallIntLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.StringLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.StructLiteral;
+import org.apache.doris.nereids.trees.expressions.literal.TimeStampNsLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.TimeV2Literal;
 import org.apache.doris.nereids.trees.expressions.literal.TimestampTzLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.TinyIntLiteral;
@@ -238,6 +242,10 @@ public abstract class ExpressionVisitor<R, C>
         return visitSlot(slotReference, context);
     }
 
+    public R visitDefault(Default defaultExpr, C context) {
+        return visit(defaultExpr, context);
+    }
+
     public R visitDefaultValue(DefaultValueSlot defaultValueSlot, C context) {
         return visitSlot(defaultValueSlot, context);
     }
@@ -328,6 +336,10 @@ public abstract class ExpressionVisitor<R, C>
 
     public R visitDateTimeV2Literal(DateTimeV2Literal dateTimeV2Literal, C context) {
         return visitLiteral(dateTimeV2Literal, context);
+    }
+
+    public R visitTimeStampNsLiteral(TimeStampNsLiteral timeStampNsLiteral, C context) {
+        return visitLiteral(timeStampNsLiteral, context);
     }
 
     public R visitTimestampTzLiteral(TimestampTzLiteral timestampTzLiteral, C context) {
@@ -441,6 +453,14 @@ public abstract class ExpressionVisitor<R, C>
 
     public R visitIsNull(IsNull isNull, C context) {
         return visit(isNull, context);
+    }
+
+    public R visitIsTrue(IsTrue isTrue, C context) {
+        return visit(isTrue, context);
+    }
+
+    public R visitIsFalse(IsFalse isFalse, C context) {
+        return visit(isFalse, context);
     }
 
     public R visitInSubquery(InSubquery in, C context) {

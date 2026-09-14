@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+#include "io/cache/file_cache_common.h"
 #if defined(BE_TEST) && defined(BUILD_FILE_CACHE_MICROBENCH_TOOL)
 #include <brpc/controller.h>
 #include <brpc/http_status_code.h>
@@ -23,6 +24,7 @@
 #include <fmt/format.h>
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -39,6 +41,7 @@
 #include <string>
 #include <thread>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "build/proto/microbench.pb.h"
@@ -51,12 +54,12 @@
 #include "io/file_factory.h"
 #include "io/fs/s3_file_system.h"
 #include "io/fs/s3_file_writer.h"
-#include "olap/utils.h"
 #include "rapidjson/document.h"
 #include "rapidjson/stringbuffer.h"
 #include "rapidjson/writer.h"
 #include "runtime/memory/mem_tracker_limiter.h"
 #include "runtime/thread_context.h"
+#include "storage/utils.h"
 #include "util/cpu_info.h"
 #include "util/disk_info.h"
 #include "util/mem_info.h"
@@ -91,12 +94,34 @@ using namespace doris;
 
 bvar::LatencyRecorder microbench_write_latency("file_cache_microbench_append");
 bvar::LatencyRecorder microbench_read_latency("file_cache_microbench_read_at");
+bvar::LatencyRecorder microbench_get_or_set_latency("file_cache_microbench_get_or_set");
 
 const std::string HIDDEN_PREFIX = "test_file_cache_microbench/";
 const char PAD_CHAR = 'x';
 const size_t BUFFER_SIZE = 1024 * 1024;
 // Just 10^9.
 static constexpr auto NS = 1000000000UL;
+
+static std::string normalize_benchmark_prefix(std::string_view raw_prefix) {
+    std::string normalized {doris::trim(raw_prefix)};
+    while (!normalized.empty() && normalized.front() == '/') {
+        normalized.erase(normalized.begin());
+    }
+    while (!normalized.empty() && normalized.back() == '/') {
+        normalized.pop_back();
+    }
+    return normalized;
+}
+
+static std::string get_prefix() {
+    std::string prefix = HIDDEN_PREFIX;
+    std::string subdir = normalize_benchmark_prefix(doris::config::test_s3_prefix);
+    if (!subdir.empty()) {
+        prefix += subdir;
+        prefix += "/";
+    }
+    return prefix;
+}
 
 DEFINE_int32(port, 8888, "Http Port of this server");
 
@@ -257,7 +282,7 @@ public:
         for (const auto& pair : records_) {
             const std::vector<FileInfo>& file_infos = pair.second;
             for (const auto& file_info : file_infos) {
-                if (file_info.filename.compare(0, file_prefix.length(), file_prefix) == 0) {
+                if (file_info.filename.starts_with(file_prefix)) {
                     if (file_number == -1 || result.size() < file_number) {
                         result.push_back(file_info.filename);
                     }
@@ -274,7 +299,7 @@ public:
         for (const auto& pair : records_) {
             const std::vector<FileInfo>& file_infos = pair.second;
             for (const auto& file_info : file_infos) {
-                if (file_info.filename.compare(0, file_prefix.length(), file_prefix) == 0) {
+                if (file_info.filename.starts_with(file_prefix)) {
                     return pair.first;
                 }
             }
@@ -296,7 +321,7 @@ public:
                            const std::string& bucket, const std::string& key,
                            const doris::io::FileWriterOptions* options,
                            std::shared_ptr<doris::S3RateLimiterHolder> rate_limiter)
-            : _writer(client, bucket, key, options), _rate_limiter(rate_limiter) {}
+            : _writer(client, bucket, key, options), _rate_limiter(std::move(rate_limiter)) {}
 
     doris::Status appendv(const doris::Slice* slices, size_t slices_size,
                           const std::shared_ptr<bvar::LatencyRecorder>& write_bvar) {
@@ -322,7 +347,7 @@ class MicrobenchFileReader {
 public:
     MicrobenchFileReader(std::shared_ptr<doris::io::FileReader> base_reader,
                          std::shared_ptr<doris::S3RateLimiterHolder> rate_limiter)
-            : _base_reader(std::move(base_reader)), _rate_limiter(rate_limiter) {}
+            : _base_reader(std::move(base_reader)), _rate_limiter(std::move(rate_limiter)) {}
 
     doris::Status read_at(size_t offset, const doris::Slice& result, size_t* bytes_read,
                           const doris::io::IOContext* io_ctx,
@@ -484,13 +509,27 @@ std::string get_usage(const std::string& progname) {
           "read_iops": <limit>,                // IOPS limit for reading per segment files
           "num_threads": <count>,              // Number of threads in the thread pool, default 200
           "num_files": <count>,                // Number of segments to write/read
-          "file_prefix": "<prefix>",           // Prefix for segment files, Notice: this tools hide prefix(test_file_cache_microbench/) before file_prefix
+          "file_prefix": "<prefix>",           // Prefix for segment files, key prefix is test_file_cache_microbench/<test_s3_prefix>/
           "write_batch_size": <size>,          // Size of data to write in each write operation
           "cache_type": <type>,                // Write or Read data enter file cache queue type, support NORMAL | TTL | INDEX | DISPOSABLE, default NORMAL
           "expiration": <timestamp>,           // File cache ttl expire time, value is a unix timestamp
           "repeat": <count>,                   // Read repeat times, default 1
           "read_offset": [<left>, <right>],    // Range for reading (left inclusive, right exclusive)
           "read_length": [<left>, <right>]     // Range for reading length (left inclusive, right exclusive)
+        }
+
+        Submit a direct file cache get_or_set benchmark job:
+        {
+          "job_type": "file_cache_get_or_set",
+          "file_prefix": "<prefix>",
+          "num_threads": <count>,
+          "num_files": <count>,
+          "repeat": <count>,                   // get_or_set calls per generated cache key
+          "size_bytes_perfile": <size>,        // Virtual file size used to clip offset + size
+          "get_or_set_offset": [<left>, <right>],
+          "get_or_set_size": [<left>, <right>],
+          "cache_type": <type>,                // NORMAL | TTL | INDEX | DISPOSABLE
+          "expiration": <timestamp>            // Required for TTL cache type
         }
 
       GET /get_job_status/<job_id>
@@ -548,8 +587,21 @@ std::string get_usage(const std::string& progname) {
 }
 
 // Job configuration structure
+enum class JobType { FILE_CACHE, FILE_CACHE_GET_OR_SET };
+
+static std::string job_type_to_string(JobType type) {
+    switch (type) {
+    case JobType::FILE_CACHE:
+        return "file_cache";
+    case JobType::FILE_CACHE_GET_OR_SET:
+        return "file_cache_get_or_set";
+    }
+    return "unknown";
+}
+
 struct JobConfig {
     // Default value initialization
+    JobType job_type = JobType::FILE_CACHE;
     int64_t size_bytes_perfile = 1024 * 1024;
     int32_t write_iops = 0;
     int32_t read_iops = 0;
@@ -564,6 +616,10 @@ struct JobConfig {
     int64_t read_offset_right = 0;
     int64_t read_length_left = 0;
     int64_t read_length_right = 0;
+    int64_t get_or_set_offset_left = 0;
+    int64_t get_or_set_offset_right = 1;
+    int64_t get_or_set_size_left = 4096;
+    int64_t get_or_set_size_right = 4097;
     bool write_file_cache = true;
     bool bvar_enable = false;
 
@@ -577,21 +633,46 @@ struct JobConfig {
             throw std::runtime_error("JSON parse error json args=" + json_str);
         }
 
+        config.job_type = parse_job_type(d);
+
         // Basic validation
         validate(d);
 
         // Use helper functions to parse each field
         parse_basic_fields(d, config);
         parse_cache_settings(d, config);
-        parse_read_settings(d, config);
 
-        // Additional validation
-        validate_config(config);
+        if (config.job_type == JobType::FILE_CACHE_GET_OR_SET) {
+            parse_get_or_set_fields(d, config);
+            validate_get_or_set_config(config);
+        } else {
+            parse_read_settings(d, config);
+
+            // Additional validation
+            validate_config(config);
+        }
 
         return config;
     }
 
 private:
+    static JobType parse_job_type(const rapidjson::Document& d) {
+        if (!d.HasMember("job_type")) {
+            return JobType::FILE_CACHE;
+        }
+        if (!d["job_type"].IsString()) {
+            throw std::runtime_error("job_type must be a string");
+        }
+        std::string type = d["job_type"].GetString();
+        if (type == "file_cache") {
+            return JobType::FILE_CACHE;
+        }
+        if (type == "file_cache_get_or_set") {
+            return JobType::FILE_CACHE_GET_OR_SET;
+        }
+        throw std::runtime_error("unsupported job_type: " + type);
+    }
+
     // Validate the JSON document
     static void validate(const rapidjson::Document& json_data) {
         if (!json_data.HasMember("file_prefix") || !json_data["file_prefix"].IsString() ||
@@ -659,6 +740,32 @@ private:
         }
     }
 
+    static void parse_get_or_set_fields(const rapidjson::Document& d, JobConfig& config) {
+        if (d.HasMember("get_or_set_offset") && d["get_or_set_offset"].IsArray() &&
+            d["get_or_set_offset"].Size() == 2) {
+            const rapidjson::Value& offset_array = d["get_or_set_offset"];
+            config.get_or_set_offset_left = offset_array[0].GetInt64();
+            config.get_or_set_offset_right = offset_array[1].GetInt64();
+        } else if (d.HasMember("read_offset") && d["read_offset"].IsArray() &&
+                   d["read_offset"].Size() == 2) {
+            const rapidjson::Value& offset_array = d["read_offset"];
+            config.get_or_set_offset_left = offset_array[0].GetInt64();
+            config.get_or_set_offset_right = offset_array[1].GetInt64();
+        }
+
+        if (d.HasMember("get_or_set_size") && d["get_or_set_size"].IsArray() &&
+            d["get_or_set_size"].Size() == 2) {
+            const rapidjson::Value& size_array = d["get_or_set_size"];
+            config.get_or_set_size_left = size_array[0].GetInt64();
+            config.get_or_set_size_right = size_array[1].GetInt64();
+        } else if (d.HasMember("read_length") && d["read_length"].IsArray() &&
+                   d["read_length"].Size() == 2) {
+            const rapidjson::Value& size_array = d["read_length"];
+            config.get_or_set_size_left = size_array[0].GetInt64();
+            config.get_or_set_size_right = size_array[1].GetInt64();
+        }
+    }
+
     // Parse read-related settings
     static void parse_read_settings(const rapidjson::Document& d, JobConfig& config) {
         if (config.read_iops > 0) {
@@ -709,15 +816,57 @@ private:
         }
     }
 
+    static void validate_get_or_set_config(const JobConfig& config) {
+        if (config.num_threads <= 0 || config.num_threads > 10000) {
+            throw std::runtime_error("num_threads must be between 1 and 10000");
+        }
+        if (config.num_files <= 0) {
+            throw std::runtime_error("num_files must be positive");
+        }
+        if (config.repeat <= 0) {
+            throw std::runtime_error("repeat must be positive");
+        }
+        if (config.size_bytes_perfile <= 0) {
+            throw std::runtime_error("size_bytes_perfile must be positive");
+        }
+        if (config.get_or_set_offset_left < 0 ||
+            config.get_or_set_offset_left >= config.get_or_set_offset_right) {
+            throw std::runtime_error(
+                    "get_or_set_offset must be [left, right) with 0 <= left < right");
+        }
+        if (config.get_or_set_size_left <= 0 ||
+            config.get_or_set_size_left >= config.get_or_set_size_right) {
+            throw std::runtime_error("get_or_set_size must be [left, right) with 0 < left < right");
+        }
+        if (config.cache_type != "NORMAL" && config.cache_type != "TTL" &&
+            config.cache_type != "INDEX" && config.cache_type != "DISPOSABLE") {
+            throw std::runtime_error(
+                    "cache_type must be NORMAL, TTL, INDEX, or DISPOSABLE for get_or_set jobs");
+        }
+        if (config.cache_type == "TTL" && config.expiration <= 0) {
+            throw std::runtime_error("expiration must be positive when cache type is TTL");
+        }
+    }
+
 public:
     std::string to_string() const {
+        if (job_type == JobType::FILE_CACHE_GET_OR_SET) {
+            return fmt::format(
+                    "job_type: {}, num_threads: {}, num_files: {}, file_prefix: {}, "
+                    "size_bytes_perfile: {}, repeat: {}, cache_type: {}, expiration: {}, "
+                    "get_or_set_offset: [{}, {}), get_or_set_size: [{}, {})",
+                    job_type_to_string(job_type), num_threads, num_files,
+                    get_prefix() + file_prefix, size_bytes_perfile, repeat, cache_type, expiration,
+                    get_or_set_offset_left, get_or_set_offset_right, get_or_set_size_left,
+                    get_or_set_size_right);
+        }
         return fmt::format(
                 "size_bytes_perfile: {}, write_iops: {}, read_iops: {}, num_threads: {}, "
                 "num_files: {}, file_prefix: {}, write_file_cache: {}, write_batch_size: {}, "
                 "repeat: {}, expiration: {}, cache_type: {}, read_offset: [{}, {}), "
                 "read_length: [{}, {})",
                 size_bytes_perfile, write_iops, read_iops, num_threads, num_files,
-                HIDDEN_PREFIX + file_prefix, write_file_cache, write_batch_size, repeat, expiration,
+                get_prefix() + file_prefix, write_file_cache, write_batch_size, repeat, expiration,
                 cache_type, read_offset_left, read_offset_right, read_length_left,
                 read_length_right);
     }
@@ -759,6 +908,10 @@ struct Job {
         int64_t lock_wait_timer = 0;
         int64_t get_timer = 0;
         int64_t set_timer = 0;
+        int64_t get_or_set_ops = 0;
+        int64_t get_or_set_blocks = 0;
+        double get_or_set_qps = 0;
+        double avg_get_or_set_us = 0;
     } stats;
 
     // Record associated file information for the job
@@ -835,10 +988,284 @@ private:
     }
 };
 
-// Job manager
+namespace microbenchService {
+class JobManager;
+
+class BenchEnvManager : public std::enable_shared_from_this<BenchEnvManager> {
+public:
+    BenchEnvManager(std::string_view doris_home) : _doris_home(doris_home) {}
+
+    ~BenchEnvManager() { stop_reload_worker(); }
+
+    doris::Status load_config() {
+        std::string conffile = std::string(_doris_home) + "/conf/be.conf";
+        if (!doris::config::init(conffile.c_str(), true, true, true)) {
+            return Status::InternalError("Error reading config file");
+        }
+
+        std::string custom_conffile = doris::config::custom_config_dir + "/be_custom.conf";
+        if (!doris::config::init(custom_conffile.c_str(), true, false, false)) {
+            return Status::InternalError("Error reading custom config file");
+        }
+
+        if (!doris::config::enable_file_cache) {
+            return Status::InternalError("config::enbale_file_cache should be true!");
+        }
+
+        config::group_commit_wal_max_disk_limit = "100M";
+        LOG(INFO) << "Obj config. ak=" << doris::config::test_s3_ak
+                  << " sk=" << doris::config::test_s3_sk
+                  << " region=" << doris::config::test_s3_region
+                  << " endpoint=" << doris::config::test_s3_endpoint
+                  << " bucket=" << doris::config::test_s3_bucket;
+
+        LOG(INFO) << "File cache config. enable_file_cache=" << doris::config::enable_file_cache
+                  << " file_cache_path=" << doris::config::file_cache_path
+                  << " file_cache_each_block_size=" << doris::config::file_cache_each_block_size
+                  << " clear_file_cache=" << doris::config::clear_file_cache
+                  << " enable_file_cache_query_limit="
+                  << doris::config::enable_file_cache_query_limit
+                  << " file_cache_enter_disk_resource_limit_mode_percent="
+                  << doris::config::file_cache_enter_disk_resource_limit_mode_percent
+                  << " file_cache_exit_disk_resource_limit_mode_percent="
+                  << doris::config::file_cache_exit_disk_resource_limit_mode_percent
+                  << " enable_read_cache_file_directly="
+                  << doris::config::enable_read_cache_file_directly
+                  << " file_cache_enable_evict_from_other_queue_by_size="
+                  << doris::config::file_cache_enable_evict_from_other_queue_by_size
+                  << " file_cache_error_log_limit_bytes="
+                  << doris::config::file_cache_error_log_limit_bytes
+                  << " cache_lock_wait_long_tail_threshold_us="
+                  << doris::config::cache_lock_wait_long_tail_threshold_us
+                  << " cache_lock_held_long_tail_threshold_us="
+                  << doris::config::cache_lock_held_long_tail_threshold_us
+                  << " file_cache_remove_block_qps_limit="
+                  << doris::config::file_cache_remove_block_qps_limit
+                  << " enable_evict_file_cache_in_advance="
+                  << doris::config::enable_evict_file_cache_in_advance
+                  << " file_cache_enter_need_evict_cache_in_advance_percent="
+                  << doris::config::file_cache_enter_need_evict_cache_in_advance_percent
+                  << " file_cache_exit_need_evict_cache_in_advance_percent="
+                  << doris::config::file_cache_exit_need_evict_cache_in_advance_percent
+                  << " file_cache_evict_in_advance_interval_ms="
+                  << doris::config::file_cache_evict_in_advance_interval_ms
+                  << " file_cache_evict_in_advance_batch_bytes="
+                  << doris::config::file_cache_evict_in_advance_batch_bytes;
+
+        LOG(INFO) << "S3 writer config. s3_file_writer_log_interval_second="
+                  << doris::config::s3_file_writer_log_interval_second
+                  << " s3_write_buffer_size=" << doris::config::s3_write_buffer_size
+                  << " enable_flush_file_cache_async="
+                  << doris::config::enable_flush_file_cache_async;
+
+        return Status::OK();
+    }
+
+    doris::Status load_bench_exec_env() {
+        SCOPED_INIT_THREAD_CONTEXT();
+
+        doris::CpuInfo::init();
+        doris::DiskInfo::init();
+        doris::MemInfo::init();
+
+        LOG(INFO) << doris::CpuInfo::debug_string();
+        LOG(INFO) << doris::DiskInfo::debug_string();
+        LOG(INFO) << doris::MemInfo::debug_string();
+
+        std::vector<doris::StorePath> paths;
+        auto olap_res = doris::parse_conf_store_paths(doris::config::storage_root_path, &paths);
+        if (!olap_res) {
+            LOG(ERROR) << "parse config storage path failed, path="
+                       << doris::config::storage_root_path;
+            exit(-1);
+        }
+
+        std::vector<doris::StorePath> spill_paths;
+        if (doris::config::spill_storage_root_path.empty()) {
+            doris::config::spill_storage_root_path = doris::config::storage_root_path;
+        }
+        olap_res =
+                doris::parse_conf_store_paths(doris::config::spill_storage_root_path, &spill_paths);
+        if (!olap_res) {
+            LOG(ERROR) << "parse config spill storage path failed, path="
+                       << doris::config::spill_storage_root_path;
+            exit(-1);
+        }
+        std::set<std::string> broken_paths;
+        doris::parse_conf_broken_store_paths(doris::config::broken_storage_path, &broken_paths);
+
+        auto it = paths.begin();
+        for (; it != paths.end();) {
+            if (broken_paths.contains(it->path)) {
+                if (doris::config::ignore_broken_disk) {
+                    LOG(WARNING) << "ignore broken disk, path = " << it->path;
+                    it = paths.erase(it);
+                } else {
+                    LOG(ERROR) << "a broken disk is found " << it->path;
+                    exit(-1);
+                }
+            } else if (!doris::check_datapath_rw(it->path)) {
+                if (doris::config::ignore_broken_disk) {
+                    LOG(WARNING) << "read write test file failed, path=" << it->path;
+                    it = paths.erase(it);
+                } else {
+                    LOG(ERROR) << "read write test file failed, path=" << it->path;
+                    // if only one disk and the disk is full, also need exit because rocksdb will open failed
+                    exit(-1);
+                }
+            } else {
+                ++it;
+            }
+        }
+
+        if (paths.empty()) {
+            LOG(ERROR) << "All disks are broken, exit.";
+            exit(-1);
+        }
+
+        it = spill_paths.begin();
+        for (; it != spill_paths.end();) {
+            if (!doris::check_datapath_rw(it->path)) {
+                if (doris::config::ignore_broken_disk) {
+                    LOG(WARNING) << "read write test file failed, path=" << it->path;
+                    it = spill_paths.erase(it);
+                } else {
+                    LOG(ERROR) << "read write test file failed, path=" << it->path;
+                    exit(-1);
+                }
+            } else {
+                ++it;
+            }
+        }
+        if (spill_paths.empty()) {
+            LOG(ERROR) << "All spill disks are broken, exit.";
+            exit(-1);
+        }
+
+        auto* exec_env = doris::ExecEnv::GetInstance();
+        auto status = doris::ExecEnv::init(exec_env, paths, spill_paths, broken_paths);
+        if (!status.ok()) {
+            return status;
+        }
+
+        std::unique_ptr<doris::ThreadPool> s3_upload_pool;
+        static_cast<void>(doris::ThreadPoolBuilder("MicrobenchS3FileUploadThreadPool")
+                                  .set_min_threads(256)
+                                  .set_max_threads(512)
+                                  .build(&s3_upload_pool));
+        exec_env->set_s3_file_upload_thread_pool(std::move(s3_upload_pool));
+        exec_env->set_file_cache_open_fd_cache(std::make_unique<doris::io::FDCache>());
+        return Status::OK();
+    }
+
+    doris::Status reload_cache_in_config() {
+        std::unordered_set<std::string> cache_path_set;
+        std::vector<doris::CachePath> cache_paths;
+        RETURN_IF_ERROR(doris::parse_conf_cache_paths(doris::config::file_cache_path, cache_paths));
+
+        std::vector<CachePath> cache_paths_no_dup;
+        cache_paths_no_dup.reserve(cache_paths.size());
+        for (const auto& cache_path : cache_paths) {
+            if (cache_path_set.contains(cache_path.path)) {
+                LOG(WARNING) << fmt::format("cache path {} is duplicate", cache_path.path);
+                continue;
+            }
+            cache_path_set.emplace(cache_path.path);
+            cache_paths_no_dup.emplace_back(cache_path);
+        }
+        RETURN_IF_ERROR(doris::io::FileCacheFactory::instance()->reload_file_cache(cache_paths));
+        return Status::OK();
+    }
+
+    std::unique_ptr<JobManager> create_job_manager_from_current_config() {
+        return std::make_unique<JobManager>(shared_from_this());
+    }
+
+    void start_reload_worker() {
+        std::lock_guard<std::mutex> lock(_reload_mt);
+        if (_reload_thread.joinable()) {
+            return;
+        }
+
+        _reloading.store(false);
+        _stop_thread = false;
+        _reload_thread = std::thread(&BenchEnvManager::_reload_worker_func, this);
+        LOG(INFO) << "Reload worker thread started";
+    }
+
+    void stop_reload_worker() {
+        {
+            std::unique_lock<std::mutex> lock(_reload_mt);
+            if (_stop_thread) {
+                return;
+            }
+
+            _stop_thread = true;
+            _reload_cv.notify_all();
+        }
+        if (_reload_thread.joinable()) {
+            _reload_thread.join();
+        }
+    }
+
+    void reload_request() {
+        _reloading.store(true);
+        _reload_cv.notify_one();
+    }
+
+    std::string reload_details_stat() {
+        return _reloading.load() ? "Reloading config" : "Reload finished or not started";
+    }
+
+private:
+    void _reload_worker_func() {
+        while (true) {
+            std::unique_lock<std::mutex> l(_reload_mt);
+            // Wait until stopped or safe to reload (State == Reloading && JobCount == 0)
+            _reload_cv.wait(l, [this]() { return _stop_thread; });
+
+            if (_stop_thread) {
+                break;
+            }
+
+            LOG(INFO) << "Starting configuration reload sequence...";
+
+            l.unlock();
+
+            doris::Status status;
+            try {
+                status = load_config();
+                if (!status) {
+                    LOG(ERROR) << "Failed to load config!";
+                    throw std::runtime_error(status.to_string().c_str());
+                }
+                status = reload_cache_in_config();
+                if (!status) {
+                    LOG(ERROR) << "Failed to reload file cache!";
+                    throw std::runtime_error(status.to_string().c_str());
+                }
+            } catch (const std::exception& e) {
+                _reloading.store(false);
+                LOG(ERROR) << "Exception during reload: " << e.what();
+            }
+            _reloading.store(false);
+        }
+    }
+
+    std::string _doris_home;
+    std::mutex _reload_mt;
+    std::condition_variable _reload_cv;
+    std::thread _reload_thread;
+    bool _stop_thread {false};
+    std::atomic<bool> _reloading {false};
+};
+
 class JobManager {
 public:
-    JobManager() : _next_job_id(0), _job_executor_pool(std::thread::hardware_concurrency()) {
+    JobManager(std::shared_ptr<BenchEnvManager> env_mgr)
+            : _next_job_id(0),
+              _env_mgr(std::move(env_mgr)),
+              _job_executor_pool(std::thread::hardware_concurrency()) {
         LOG(INFO) << "Initialized JobManager with " << std::thread::hardware_concurrency()
                   << " executor threads";
     }
@@ -917,7 +1344,7 @@ public:
         std::lock_guard<std::mutex> lock(_mutex);
         auto it = _jobs.find(job_id);
         if (it != _jobs.end()) {
-            FileInfo file_info = {key, data_size, job_id};
+            FileInfo file_info = {.filename = key, .data_size = data_size, .job_id = job_id};
             it->second->file_records.push_back(file_info);
             s3_file_records.add_file_info(job_id, file_info);
         } else {
@@ -995,6 +1422,11 @@ private:
         JobConfig& config = job.config;
         LOG(INFO) << "Executing job " << job_id << " with config: " << config.to_string();
 
+        if (config.job_type == JobType::FILE_CACHE_GET_OR_SET) {
+            execute_file_cache_get_or_set(job);
+            return;
+        }
+
         // Generate multiple keys
         std::vector<std::string> keys;
         keys.reserve(config.num_files);
@@ -1003,7 +1435,7 @@ private:
         // If it's a read-only job, find the previously written files
         if (config.read_iops > 0 && config.write_iops == 0) {
             std::string old_job_id =
-                    s3_file_records.find_job_id_by_prefix(HIDDEN_PREFIX + config.file_prefix);
+                    s3_file_records.find_job_id_by_prefix(get_prefix() + config.file_prefix);
             if (old_job_id.empty()) {
                 throw std::runtime_error(
                         "Can't find previously job uploaded files. Please make sure read "
@@ -1016,7 +1448,7 @@ private:
 
         // Generate file keys
         for (int i = 0; i < config.num_files; ++i) {
-            keys.push_back(HIDDEN_PREFIX + config.file_prefix + "/" + rewrite_job_id + "_" +
+            keys.push_back(get_prefix() + config.file_prefix + "/" + rewrite_job_id + "_" +
                            std::to_string(i));
         }
 
@@ -1033,7 +1465,27 @@ private:
         LOG(INFO) << "Job " << job_id << " execution completed";
     }
 
-private:
+    static doris::io::FileCacheType parse_file_cache_type(const std::string& cache_type) {
+        if (cache_type == "TTL") {
+            return doris::io::FileCacheType::TTL;
+        }
+        if (cache_type == "INDEX") {
+            return doris::io::FileCacheType::INDEX;
+        }
+        if (cache_type == "DISPOSABLE") {
+            return doris::io::FileCacheType::DISPOSABLE;
+        }
+        return doris::io::FileCacheType::NORMAL;
+    }
+
+    static size_t pick_range_value(std::mt19937_64& gen, int64_t left, int64_t right) {
+        if (left + 1 == right) {
+            return static_cast<size_t>(left);
+        }
+        std::uniform_int_distribution<int64_t> dis(left, right - 1);
+        return static_cast<size_t>(dis(gen));
+    }
+
     doris::S3ClientConf create_s3_client_conf(const JobConfig& config) {
         doris::S3ClientConf s3_conf;
         s3_conf.max_connections = std::max(256, config.num_threads * 4);
@@ -1074,7 +1526,7 @@ private:
                     DataGenerator data_generator(config.size_bytes_perfile);
                     doris::io::FileWriterOptions options;
                     if (config.cache_type == "TTL") {
-                        options.file_cache_expiration = config.expiration;
+                        options.file_cache_expiration_time = config.expiration;
                     }
                     options.write_file_cache = config.write_file_cache;
                     auto writer = std::make_unique<MicrobenchS3FileWriter>(
@@ -1141,6 +1593,123 @@ private:
         LOG(INFO) << "Total write time: " << job.stats.total_write_time << " seconds";
     }
 
+    void execute_file_cache_get_or_set(Job& job) {
+        const JobConfig& config = job.config;
+        LOG(INFO) << "Executing file_cache_get_or_set job " << job.job_id
+                  << " with config: " << config.to_string();
+
+        std::vector<std::string> keys;
+        keys.reserve(config.num_files);
+        for (int i = 0; i < config.num_files; ++i) {
+            keys.push_back(get_prefix() + config.file_prefix + "/" + job.job_id + "_" +
+                           std::to_string(i));
+        }
+
+        BenchThreadPool pool(config.num_threads);
+        std::vector<std::future<void>> futures;
+        futures.reserve(keys.size());
+        std::mutex stats_mutex;
+        std::mutex error_mutex;
+        doris::io::ReadStatistics total_stats;
+        std::atomic<int64_t> total_ops {0};
+        std::atomic<int64_t> total_blocks {0};
+        std::atomic<bool> has_error {false};
+        std::string first_error;
+
+        doris::MonotonicStopWatch stopwatch;
+        stopwatch.start();
+        for (const auto& key : keys) {
+            futures.push_back(pool.enqueue([&, key]() {
+                try {
+                    doris::io::ReadStatistics local_stats;
+                    int64_t local_ops = 0;
+                    int64_t local_blocks = 0;
+                    doris::io::FileCacheType cache_type = parse_file_cache_type(config.cache_type);
+
+                    auto hash = doris::io::BlockFileCache::hash(key);
+                    doris::io::BlockFileCache* cache =
+                            doris::io::FileCacheFactory::instance()->get_by_path(hash);
+                    if (cache == nullptr) {
+                        throw std::runtime_error("No file cache instance found for key " + key);
+                    }
+
+                    std::mt19937_64 gen(std::hash<std::string> {}(key));
+                    for (int64_t i = 0; i < config.repeat; ++i) {
+                        size_t offset = pick_range_value(gen, config.get_or_set_offset_left,
+                                                         config.get_or_set_offset_right);
+                        size_t size = pick_range_value(gen, config.get_or_set_size_left,
+                                                       config.get_or_set_size_right);
+                        if (offset >= static_cast<size_t>(config.size_bytes_perfile)) {
+                            offset = static_cast<size_t>(config.size_bytes_perfile - 1);
+                        }
+                        if (offset + size > static_cast<size_t>(config.size_bytes_perfile)) {
+                            size = static_cast<size_t>(config.size_bytes_perfile) - offset;
+                        }
+
+                        doris::MonotonicStopWatch single_sw;
+                        single_sw.start();
+                        doris::io::CacheContext cache_context;
+                        cache_context.stats = &local_stats;
+                        cache_context.cache_type = cache_type;
+                        cache_context.expiration_time = config.expiration;
+                        auto holder = cache->get_or_set(hash, offset, size, cache_context);
+                        single_sw.stop();
+                        local_stats.cache_get_or_set_timer += single_sw.elapsed_time();
+                        local_blocks += holder.file_blocks.size();
+                        ++local_ops;
+                        microbench_get_or_set_latency << (single_sw.elapsed_time() / 1000);
+                    }
+
+                    {
+                        std::lock_guard<std::mutex> lock(stats_mutex);
+                        total_stats.cache_get_or_set_timer += local_stats.cache_get_or_set_timer;
+                        total_stats.lock_wait_timer += local_stats.lock_wait_timer;
+                        total_stats.get_timer += local_stats.get_timer;
+                        total_stats.set_timer += local_stats.set_timer;
+                    }
+                    total_ops.fetch_add(local_ops, std::memory_order_relaxed);
+                    total_blocks.fetch_add(local_blocks, std::memory_order_relaxed);
+                } catch (const std::exception& e) {
+                    has_error.store(true, std::memory_order_relaxed);
+                    std::lock_guard<std::mutex> lock(error_mutex);
+                    if (first_error.empty()) {
+                        first_error = e.what();
+                    }
+                }
+            }));
+        }
+
+        for (auto& future : futures) {
+            future.get();
+        }
+        stopwatch.stop();
+        if (has_error.load(std::memory_order_relaxed)) {
+            throw std::runtime_error(first_error.empty() ? "file_cache_get_or_set task failed"
+                                                         : first_error);
+        }
+
+        const double elapsed_sec = stopwatch.elapsed_time() / 1e9;
+        job.stats.total_read_time = std::to_string(elapsed_sec) + " seconds";
+        job.stats.cache_get_or_set_timer = total_stats.cache_get_or_set_timer;
+        job.stats.lock_wait_timer = total_stats.lock_wait_timer;
+        job.stats.get_timer = total_stats.get_timer;
+        job.stats.set_timer = total_stats.set_timer;
+        job.stats.get_or_set_ops = total_ops.load(std::memory_order_relaxed);
+        job.stats.get_or_set_blocks = total_blocks.load(std::memory_order_relaxed);
+        job.stats.get_or_set_qps =
+                elapsed_sec > 0 ? static_cast<double>(job.stats.get_or_set_ops) / elapsed_sec : 0;
+        job.stats.avg_get_or_set_us =
+                job.stats.get_or_set_ops > 0
+                        ? static_cast<double>(job.stats.cache_get_or_set_timer) /
+                                  job.stats.get_or_set_ops / 1000
+                        : 0;
+
+        LOG(INFO) << "Completed file_cache_get_or_set job " << job.job_id
+                  << ", ops=" << job.stats.get_or_set_ops
+                  << ", blocks=" << job.stats.get_or_set_blocks << ", elapsed_sec=" << elapsed_sec
+                  << ", qps=" << job.stats.get_or_set_qps;
+    }
+
     // Execute read tasks
     void execute_read_tasks(const std::vector<std::string>& keys, Job& job, JobConfig& config) {
         LOG(INFO) << "Starting read tasks for job " << job.job_id << ", num_keys=" << keys.size()
@@ -1148,7 +1717,7 @@ private:
         auto start_time = std::chrono::steady_clock::now();
 
         int64_t exist_job_perfile_size = s3_file_records.get_exist_job_perfile_size_by_prefix(
-                HIDDEN_PREFIX + config.file_prefix);
+                get_prefix() + config.file_prefix);
         std::vector<std::future<void>> read_futures;
         doris::io::IOContext io_ctx;
         doris::io::FileCacheStatistics total_stats;
@@ -1171,7 +1740,7 @@ private:
         std::vector<std::string> read_files;
         if (exist_job_perfile_size != -1) {
             // read exist files
-            s3_file_records.get_exist_job_files_by_prefix(HIDDEN_PREFIX + config.file_prefix,
+            s3_file_records.get_exist_job_files_by_prefix(get_prefix() + config.file_prefix,
                                                           read_files, config.num_files);
         }
 
@@ -1182,9 +1751,15 @@ private:
         LOG(INFO) << "job_id = " << job.job_id << " read_files size = " << read_files.size();
 
         read_stopwatch.start();
+        std::vector<std::string> read_buffers(read_files.size());
+
+        for (auto& buffer : read_buffers) {
+            buffer.resize(config.read_length_right);
+        }
+
         for (int i = 0; i < read_files.size(); ++i) {
             const auto& key = read_files[i];
-            read_futures.push_back(read_pool.enqueue([&, key]() {
+            read_futures.push_back(read_pool.enqueue([&, &buffer = read_buffers[i], key]() {
                 try {
                     if (job.completion_tracker) {
                         job.completion_tracker->wait_for_completion(
@@ -1193,6 +1768,7 @@ private:
                     doris::io::FileReaderOptions reader_opts;
                     reader_opts.cache_type = doris::io::FileCachePolicy::FILE_BLOCK_CACHE;
                     reader_opts.is_doris_table = true;
+                    reader_opts.tablet_id = 1; // microbench placeholder
 
                     doris::io::FileDescription fd;
                     std::string obj_path = "s3://" + doris::config::test_s3_bucket + "/";
@@ -1237,7 +1813,7 @@ private:
                             }
                         }};
 
-                        for (int i = 0; i < config.repeat; i++) {
+                        for (int j = 0; j < config.repeat; j++) {
                             size_t read_offset = 0;
                             size_t read_length = 0;
 
@@ -1247,12 +1823,10 @@ private:
                             }
                             if (exist_job_perfile_size != -1) {
                                 // read exist files
-                                if (config.read_offset_right > exist_job_perfile_size) {
-                                    config.read_offset_right = exist_job_perfile_size;
-                                }
-                                if (config.read_length_right > exist_job_perfile_size) {
-                                    config.read_length_right = exist_job_perfile_size;
-                                }
+                                config.read_offset_right =
+                                        std::min(config.read_offset_right, exist_job_perfile_size);
+                                config.read_length_right =
+                                        std::min(config.read_length_right, exist_job_perfile_size);
 
                                 if (use_random) {
                                     std::random_device rd;
@@ -1287,16 +1861,13 @@ private:
                             CHECK(read_length >= 0)
                                     << "Calculated read_length is negative: " << read_length;
 
-                            std::string read_buffer;
-                            read_buffer.resize(read_length);
-
                             size_t total_bytes_read = 0;
                             while (total_bytes_read < read_length) {
                                 size_t bytes_to_read = std::min(
                                         read_length - total_bytes_read,
                                         static_cast<size_t>(4 * 1024 * 1024)); // 4MB chunks
 
-                                doris::Slice read_slice(read_buffer.data() + total_bytes_read,
+                                doris::Slice read_slice(buffer.data() + total_bytes_read,
                                                         bytes_to_read);
                                 size_t bytes_read = 0;
 
@@ -1325,7 +1896,7 @@ private:
                             }
 
                             // Verify read data
-                            if (!DataVerifier::verify_data(key, file_size, read_offset, read_buffer,
+                            if (!DataVerifier::verify_data(key, file_size, read_offset, buffer,
                                                            read_length)) {
                                 throw std::runtime_error("Data verification failed for key: " +
                                                          key);
@@ -1386,15 +1957,107 @@ private:
     std::mutex _mutex;
     std::atomic<int> _next_job_id;
     std::map<std::string, std::shared_ptr<Job>> _jobs;
+    std::shared_ptr<BenchEnvManager> _env_mgr;
     BenchThreadPool _job_executor_pool;
 };
 
-namespace microbenchService {
-
 class MicrobenchServiceImpl : public microbench::MicrobenchService {
 public:
-    MicrobenchServiceImpl(JobManager& job_manager) : _job_manager(job_manager) {}
-    virtual ~MicrobenchServiceImpl() {}
+    MicrobenchServiceImpl(std::string_view doris_home_path)
+            : _bench_env_mgr(std::make_shared<BenchEnvManager>(doris_home_path)) {}
+
+    ~MicrobenchServiceImpl() override {
+        if (_job_manager) {
+            _job_manager->stop();
+        }
+        if (_bench_env_mgr) {
+            _bench_env_mgr->stop_reload_worker();
+        }
+    }
+
+    doris::Status init_microbench_service() {
+        auto status = _bench_env_mgr->load_config();
+        if (!status) {
+            return status;
+        }
+
+        status = _bench_env_mgr->load_bench_exec_env();
+        if (!status) {
+            return status;
+        }
+        _job_manager = _bench_env_mgr->create_job_manager_from_current_config();
+        _bench_env_mgr->start_reload_worker();
+
+        return Status::OK();
+    }
+
+    void show_reload_status(google::protobuf::RpcController* cntl_base,
+                            const microbench::HttpRequest* request,
+                            microbench::HttpResponse* response,
+                            google::protobuf::Closure* done) override {
+        brpc::ClosureGuard done_guard(done);
+        brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
+
+        rapidjson::StringBuffer buffer;
+        rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+
+        writer.StartObject();
+        writer.Key("status");
+        writer.String("OK");
+        writer.Key("ReloadStat");
+
+        writer.String(_bench_env_mgr->reload_details_stat().c_str());
+
+        writer.EndObject();
+
+        cntl->http_response().set_content_type("application/json");
+        cntl->response_attachment().append(buffer.GetString());
+    }
+
+    void reload_config(google::protobuf::RpcController* cntl_base,
+                       const microbench::HttpRequest* request, microbench::HttpResponse* response,
+                       google::protobuf::Closure* done) override {
+        brpc::ClosureGuard done_guard(done);
+        brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
+
+        LOG(INFO) << "Hot reload config of microbench service";
+
+        try {
+            LOG(INFO) << "Request reload. May be execute after";
+            _bench_env_mgr->reload_request();
+
+            rapidjson::StringBuffer buffer;
+            rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+            writer.StartObject();
+            writer.Key("status");
+            writer.String("OK");
+            writer.Key("message");
+            writer.String("Reload requested");
+            writer.EndObject();
+            cntl->http_response().set_content_type("application/json");
+            cntl->response_attachment().append(buffer.GetString());
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Error reloading config job: " << e.what();
+
+            // Set error status code and response
+            cntl->http_response().set_status_code(brpc::HTTP_STATUS_BAD_REQUEST);
+            cntl->http_response().set_content_type("application/json");
+
+            // Build error response
+            rapidjson::Document error_doc;
+            error_doc.SetObject();
+            rapidjson::Document::AllocatorType& allocator = error_doc.GetAllocator();
+            error_doc.AddMember("status", "error", allocator);
+            error_doc.AddMember("message", rapidjson::Value(e.what(), allocator), allocator);
+
+            // Serialize to string
+            rapidjson::StringBuffer buffer;
+            rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+            error_doc.Accept(writer);
+
+            cntl->response_attachment().append(buffer.GetString());
+        }
+    }
 
     /**
      * Submit a job
@@ -1404,7 +2067,7 @@ public:
      */
     void submit_job(google::protobuf::RpcController* cntl_base,
                     const microbench::HttpRequest* request, microbench::HttpResponse* response,
-                    google::protobuf::Closure* done) {
+                    google::protobuf::Closure* done) override {
         brpc::ClosureGuard done_guard(done);
         brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
 
@@ -1417,7 +2080,7 @@ public:
 
             LOG(INFO) << "Parsed JobConfig: " << config.to_string();
 
-            std::string job_id = _job_manager.submit_job(config);
+            std::string job_id = _job_manager->submit_job(config);
             LOG(INFO) << "Job submitted successfully with ID: " << job_id;
 
             // Set response headers
@@ -1468,7 +2131,7 @@ public:
      */
     void get_job_status(google::protobuf::RpcController* cntl_base,
                         const microbench::HttpRequest* request, microbench::HttpResponse* response,
-                        google::protobuf::Closure* done) {
+                        google::protobuf::Closure* done) override {
         brpc::ClosureGuard done_guard(done);
         brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
 
@@ -1489,7 +2152,7 @@ public:
                   << ", max_files=" << max_files;
 
         try {
-            const Job& job = _job_manager.get_job_status(job_id);
+            const Job& job = _job_manager->get_job_status(job_id);
 
             // Set response headers
             cntl->http_response().set_content_type("application/json");
@@ -1500,6 +2163,10 @@ public:
             rapidjson::Document::AllocatorType& allocator = d.GetAllocator();
 
             d.AddMember("job_id", rapidjson::Value(job.job_id.c_str(), allocator), allocator);
+            if (job.config.job_type != JobType::FILE_CACHE) {
+                auto job_type = job_type_to_string(job.config.job_type);
+                d.AddMember("job_type", rapidjson::Value(job_type.c_str(), allocator), allocator);
+            }
             d.AddMember("status",
                         rapidjson::Value(get_status_string(job.status).c_str(), allocator),
                         allocator);
@@ -1514,10 +2181,18 @@ public:
             }
 
             // Add configuration information
-            add_config_info(d, allocator, job.config);
+            if (job.config.job_type == JobType::FILE_CACHE_GET_OR_SET) {
+                add_get_or_set_config_info(d, allocator, job.config);
+            } else {
+                add_config_info(d, allocator, job.config);
+            }
 
             // Add statistics information
-            add_stats_info(d, allocator, job.stats);
+            if (job.config.job_type == JobType::FILE_CACHE_GET_OR_SET) {
+                add_get_or_set_stats_info(d, allocator, job.stats);
+            } else {
+                add_stats_info(d, allocator, job.stats);
+            }
 
             // Add file records (if requested)
             if (files_value) {
@@ -1561,14 +2236,14 @@ public:
      */
     void list_jobs(google::protobuf::RpcController* cntl_base,
                    const microbench::HttpRequest* request, microbench::HttpResponse* response,
-                   google::protobuf::Closure* done) {
+                   google::protobuf::Closure* done) override {
         brpc::ClosureGuard done_guard(done);
         brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
 
         LOG(INFO) << "Received list_jobs request";
 
         try {
-            std::vector<std::shared_ptr<Job>> jobs = _job_manager.list_jobs();
+            std::vector<std::shared_ptr<Job>> jobs = _job_manager->list_jobs();
 
             // Set response headers
             cntl->http_response().set_content_type("application/json");
@@ -1601,6 +2276,11 @@ public:
                 job_obj.AddMember("file_prefix",
                                   rapidjson::Value(job->config.file_prefix.c_str(), allocator),
                                   allocator);
+                if (job->config.job_type != JobType::FILE_CACHE) {
+                    auto job_type = job_type_to_string(job->config.job_type);
+                    job_obj.AddMember("job_type", rapidjson::Value(job_type.c_str(), allocator),
+                                      allocator);
+                }
 
                 jobs_array.PushBack(job_obj, allocator);
             }
@@ -1644,7 +2324,7 @@ public:
      */
     void cancel_job(google::protobuf::RpcController* cntl_base,
                     const microbench::HttpRequest* request, microbench::HttpResponse* response,
-                    google::protobuf::Closure* done) {
+                    google::protobuf::Closure* done) override {
         brpc::ClosureGuard done_guard(done);
         brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
 
@@ -1677,7 +2357,7 @@ public:
      */
     void get_help(google::protobuf::RpcController* cntl_base,
                   const microbench::HttpRequest* request, microbench::HttpResponse* response,
-                  google::protobuf::Closure* done) {
+                  google::protobuf::Closure* done) override {
         brpc::ClosureGuard done_guard(done);
         brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
 
@@ -1697,7 +2377,8 @@ public:
      */
     void file_cache_clear(google::protobuf::RpcController* cntl_base,
                           const microbench::HttpRequest* request,
-                          microbench::HttpResponse* response, google::protobuf::Closure* done) {
+                          microbench::HttpResponse* response,
+                          google::protobuf::Closure* done) override {
         brpc::ClosureGuard done_guard(done);
         brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
 
@@ -1771,7 +2452,8 @@ public:
      */
     void file_cache_reset(google::protobuf::RpcController* cntl_base,
                           const microbench::HttpRequest* request,
-                          microbench::HttpResponse* response, google::protobuf::Closure* done) {
+                          microbench::HttpResponse* response,
+                          google::protobuf::Closure* done) override {
         brpc::ClosureGuard done_guard(done);
         brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
         LOG(INFO) << "Received file_cache_reset request";
@@ -1839,7 +2521,8 @@ public:
      */
     void file_cache_release(google::protobuf::RpcController* cntl_base,
                             const microbench::HttpRequest* request,
-                            microbench::HttpResponse* response, google::protobuf::Closure* done) {
+                            microbench::HttpResponse* response,
+                            google::protobuf::Closure* done) override {
         brpc::ClosureGuard done_guard(done);
         brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
         LOG(INFO) << "Received file_cache_release request";
@@ -1899,7 +2582,7 @@ public:
      */
     void update_config(google::protobuf::RpcController* cntl_base,
                        const microbench::HttpRequest* request, microbench::HttpResponse* response,
-                       google::protobuf::Closure* done) {
+                       google::protobuf::Closure* done) override {
         brpc::ClosureGuard done_guard(done);
         brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
         LOG(INFO) << "Received update_config request";
@@ -1911,8 +2594,8 @@ public:
                 need_persist = true;
             }
             cntl->http_request().uri().RemoveQuery("persist");
-            std::string key = "";
-            std::string value = "";
+            std::string key;
+            std::string value;
             for (brpc::URI::QueryIterator it = cntl->http_request().uri().QueryBegin();
                  it != cntl->http_request().uri().QueryEnd(); ++it) {
                 key = it->first;
@@ -1973,7 +2656,7 @@ public:
      */
     void show_config(google::protobuf::RpcController* cntl_base,
                      const microbench::HttpRequest* request, microbench::HttpResponse* response,
-                     google::protobuf::Closure* done) {
+                     google::protobuf::Closure* done) override {
         brpc::ClosureGuard done_guard(done);
         brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
         LOG(INFO) << "Received show_config request";
@@ -2138,6 +2821,34 @@ private:
         doc.AddMember("config", config_obj, allocator);
     }
 
+    void add_get_or_set_config_info(rapidjson::Document& doc,
+                                    rapidjson::Document::AllocatorType& allocator,
+                                    const JobConfig& config) {
+        rapidjson::Value config_obj(rapidjson::kObjectType);
+        config_obj.AddMember("num_threads", config.num_threads, allocator);
+        config_obj.AddMember("num_files", config.num_files, allocator);
+        config_obj.AddMember("file_prefix", rapidjson::Value(config.file_prefix.c_str(), allocator),
+                             allocator);
+        config_obj.AddMember("size_bytes_perfile", config.size_bytes_perfile, allocator);
+        config_obj.AddMember("repeat", config.repeat, allocator);
+        config_obj.AddMember("cache_type", rapidjson::Value(config.cache_type.c_str(), allocator),
+                             allocator);
+        config_obj.AddMember("expiration", config.expiration, allocator);
+        config_obj.AddMember("bvar_enable", config.bvar_enable, allocator);
+
+        rapidjson::Value offset_array(rapidjson::kArrayType);
+        offset_array.PushBack(config.get_or_set_offset_left, allocator);
+        offset_array.PushBack(config.get_or_set_offset_right, allocator);
+        config_obj.AddMember("get_or_set_offset", offset_array, allocator);
+
+        rapidjson::Value size_array(rapidjson::kArrayType);
+        size_array.PushBack(config.get_or_set_size_left, allocator);
+        size_array.PushBack(config.get_or_set_size_right, allocator);
+        config_obj.AddMember("get_or_set_size", size_array, allocator);
+
+        doc.AddMember("config", config_obj, allocator);
+    }
+
     // Add statistics information to JSON response
     void add_stats_info(rapidjson::Document& doc, rapidjson::Document::AllocatorType& allocator,
                         const Job::Statistics& stats) {
@@ -2182,6 +2893,28 @@ private:
         doc.AddMember("statistics", stats_obj, allocator);
     }
 
+    void add_get_or_set_stats_info(rapidjson::Document& doc,
+                                   rapidjson::Document::AllocatorType& allocator,
+                                   const Job::Statistics& stats) {
+        rapidjson::Value stats_obj(rapidjson::kObjectType);
+        stats_obj.AddMember("total_time",
+                            rapidjson::Value(stats.total_read_time.c_str(), allocator), allocator);
+        stats_obj.AddMember("get_or_set_ops", static_cast<uint64_t>(stats.get_or_set_ops),
+                            allocator);
+        stats_obj.AddMember("get_or_set_blocks", static_cast<uint64_t>(stats.get_or_set_blocks),
+                            allocator);
+        stats_obj.AddMember("get_or_set_qps", stats.get_or_set_qps, allocator);
+        stats_obj.AddMember("avg_get_or_set_us", stats.avg_get_or_set_us, allocator);
+        stats_obj.AddMember("cache_get_or_set_timer",
+                            static_cast<uint64_t>(stats.cache_get_or_set_timer), allocator);
+        stats_obj.AddMember("lock_wait_timer", static_cast<uint64_t>(stats.lock_wait_timer),
+                            allocator);
+        stats_obj.AddMember("get_timer", static_cast<uint64_t>(stats.get_timer), allocator);
+        stats_obj.AddMember("set_timer", static_cast<uint64_t>(stats.set_timer), allocator);
+
+        doc.AddMember("statistics", stats_obj, allocator);
+    }
+
     // Add file records to JSON response
     void add_file_records(rapidjson::Document& doc, rapidjson::Document::AllocatorType& allocator,
                           const std::vector<FileInfo>& file_records, size_t max_files) {
@@ -2207,18 +2940,24 @@ private:
         doc.AddMember("file_records_total", static_cast<uint64_t>(file_records.size()), allocator);
     }
 
-    JobManager& _job_manager;
+    std::shared_ptr<BenchEnvManager> _bench_env_mgr;
+    std::unique_ptr<JobManager> _job_manager;
 };
 } // namespace microbenchService
 
 // HTTP server handling
 class HttpServer {
 public:
-    HttpServer(JobManager& job_manager) : _job_manager(job_manager), _server(nullptr) {}
+    HttpServer() = default;
 
-    void start() {
+    void start(std::string_view doris_home_path) {
         _server = new brpc::Server();
-        microbenchService::MicrobenchServiceImpl http_svc(_job_manager);
+        microbenchService::MicrobenchServiceImpl http_svc(doris_home_path);
+        auto status = http_svc.init_microbench_service();
+        if (!status) {
+            LOG(ERROR) << status.to_string();
+            return;
+        }
 
         LOG(INFO) << "Starting HTTP server on port " << FLAGS_port;
 
@@ -2248,103 +2987,8 @@ public:
     }
 
 private:
-    JobManager& _job_manager;
-    brpc::Server* _server;
+    brpc::Server* _server {nullptr};
 };
-
-void init_exec_env() {
-    SCOPED_INIT_THREAD_CONTEXT();
-    std::vector<doris::StorePath> paths;
-    auto olap_res = doris::parse_conf_store_paths(doris::config::storage_root_path, &paths);
-    if (!olap_res) {
-        LOG(ERROR) << "parse config storage path failed, path=" << doris::config::storage_root_path;
-        exit(-1);
-    }
-
-    std::vector<doris::StorePath> spill_paths;
-    if (doris::config::spill_storage_root_path.empty()) {
-        doris::config::spill_storage_root_path = doris::config::storage_root_path;
-    }
-    olap_res = doris::parse_conf_store_paths(doris::config::spill_storage_root_path, &spill_paths);
-    if (!olap_res) {
-        LOG(ERROR) << "parse config spill storage path failed, path="
-                   << doris::config::spill_storage_root_path;
-        exit(-1);
-    }
-    std::set<std::string> broken_paths;
-    doris::parse_conf_broken_store_paths(doris::config::broken_storage_path, &broken_paths);
-
-    auto it = paths.begin();
-    for (; it != paths.end();) {
-        if (broken_paths.count(it->path) > 0) {
-            if (doris::config::ignore_broken_disk) {
-                LOG(WARNING) << "ignore broken disk, path = " << it->path;
-                it = paths.erase(it);
-            } else {
-                LOG(ERROR) << "a broken disk is found " << it->path;
-                exit(-1);
-            }
-        } else if (!doris::check_datapath_rw(it->path)) {
-            if (doris::config::ignore_broken_disk) {
-                LOG(WARNING) << "read write test file failed, path=" << it->path;
-                it = paths.erase(it);
-            } else {
-                LOG(ERROR) << "read write test file failed, path=" << it->path;
-                // if only one disk and the disk is full, also need exit because rocksdb will open failed
-                exit(-1);
-            }
-        } else {
-            ++it;
-        }
-    }
-
-    if (paths.empty()) {
-        LOG(ERROR) << "All disks are broken, exit.";
-        exit(-1);
-    }
-
-    it = spill_paths.begin();
-    for (; it != spill_paths.end();) {
-        if (!doris::check_datapath_rw(it->path)) {
-            if (doris::config::ignore_broken_disk) {
-                LOG(WARNING) << "read write test file failed, path=" << it->path;
-                it = spill_paths.erase(it);
-            } else {
-                LOG(ERROR) << "read write test file failed, path=" << it->path;
-                exit(-1);
-            }
-        } else {
-            ++it;
-        }
-    }
-    if (spill_paths.empty()) {
-        LOG(ERROR) << "All spill disks are broken, exit.";
-        exit(-1);
-    }
-
-    doris::CpuInfo::init();
-    doris::DiskInfo::init();
-    doris::MemInfo::init();
-
-    LOG(INFO) << doris::CpuInfo::debug_string();
-    LOG(INFO) << doris::DiskInfo::debug_string();
-    LOG(INFO) << doris::MemInfo::debug_string();
-
-    auto* exec_env = doris::ExecEnv::GetInstance();
-    auto status = exec_env->init_mem_env();
-
-    std::unique_ptr<doris::ThreadPool> s3_upload_pool;
-    static_cast<void>(doris::ThreadPoolBuilder("MicrobenchS3FileUploadThreadPool")
-                              .set_min_threads(256)
-                              .set_max_threads(512)
-                              .build(&s3_upload_pool));
-    exec_env->set_s3_file_upload_thread_pool(std::move(s3_upload_pool));
-
-    exec_env->set_file_cache_factory(new FileCacheFactory());
-    std::vector<doris::CachePath> cache_paths;
-    exec_env->init_file_cache_factory(cache_paths);
-    exec_env->set_file_cache_open_fd_cache(std::make_unique<doris::io::FDCache>());
-}
 
 int main(int argc, char* argv[]) {
     google::ParseCommandLineFlags(&argc, &argv, true);
@@ -2360,73 +3004,12 @@ int main(int argc, char* argv[]) {
     }
     google::InitGoogleLogging(argv[0]);
 
-    if (-1 == setenv("DORIS_HOME", ".", 0)) {
-        LOG(WARNING) << "set DORIS_HOME error";
+    std::string doris_home = getenv("DORIS_HOME");
+    if (doris_home.empty()) {
+        LOG(ERROR) << "DORIS_HOME environment variable not set";
     }
-    const char* doris_home = getenv("DORIS_HOME");
-    if (doris_home == nullptr) {
-        LOG(INFO) << "DORIS_HOME environment variable not set";
-    }
+
     LOG(INFO) << "env=" << doris_home;
-    std::string conffile = std::string(doris_home) + "/conf/be.conf";
-    if (!doris::config::init(conffile.c_str(), true, true, true)) {
-        LOG(ERROR) << "Error reading config file";
-        return -1;
-    }
-    std::string custom_conffile = doris::config::custom_config_dir + "/be_custom.conf";
-    if (!doris::config::init(custom_conffile.c_str(), true, false, false)) {
-        LOG(ERROR) << "Error reading custom config file";
-        return -1;
-    }
-
-    if (!doris::config::enable_file_cache) {
-        LOG(ERROR) << "config::enbale_file_cache should be true!";
-        return -1;
-    }
-
-    LOG(INFO) << "Obj config. ak=" << doris::config::test_s3_ak
-              << " sk=" << doris::config::test_s3_sk << " region=" << doris::config::test_s3_region
-              << " endpoint=" << doris::config::test_s3_endpoint
-              << " bucket=" << doris::config::test_s3_bucket;
-    LOG(INFO) << "File cache config. enable_file_cache=" << doris::config::enable_file_cache
-              << " file_cache_path=" << doris::config::file_cache_path
-              << " file_cache_each_block_size=" << doris::config::file_cache_each_block_size
-              << " clear_file_cache=" << doris::config::clear_file_cache
-              << " enable_file_cache_query_limit=" << doris::config::enable_file_cache_query_limit
-              << " file_cache_enter_disk_resource_limit_mode_percent="
-              << doris::config::file_cache_enter_disk_resource_limit_mode_percent
-              << " file_cache_exit_disk_resource_limit_mode_percent="
-              << doris::config::file_cache_exit_disk_resource_limit_mode_percent
-              << " enable_read_cache_file_directly="
-              << doris::config::enable_read_cache_file_directly
-              << " file_cache_enable_evict_from_other_queue_by_size="
-              << doris::config::file_cache_enable_evict_from_other_queue_by_size
-              << " file_cache_error_log_limit_bytes="
-              << doris::config::file_cache_error_log_limit_bytes
-              << " cache_lock_wait_long_tail_threshold_us="
-              << doris::config::cache_lock_wait_long_tail_threshold_us
-              << " cache_lock_held_long_tail_threshold_us="
-              << doris::config::cache_lock_held_long_tail_threshold_us
-              << " file_cache_remove_block_qps_limit="
-              << doris::config::file_cache_remove_block_qps_limit
-              << " enable_evict_file_cache_in_advance="
-              << doris::config::enable_evict_file_cache_in_advance
-              << " file_cache_enter_need_evict_cache_in_advance_percent="
-              << doris::config::file_cache_enter_need_evict_cache_in_advance_percent
-              << " file_cache_exit_need_evict_cache_in_advance_percent="
-              << doris::config::file_cache_exit_need_evict_cache_in_advance_percent
-              << " file_cache_evict_in_advance_interval_ms="
-              << doris::config::file_cache_evict_in_advance_interval_ms
-              << " file_cache_evict_in_advance_batch_bytes="
-              << doris::config::file_cache_evict_in_advance_batch_bytes;
-    LOG(INFO) << "S3 writer config. s3_file_writer_log_interval_second="
-              << doris::config::s3_file_writer_log_interval_second
-              << " s3_write_buffer_size=" << doris::config::s3_write_buffer_size
-              << " enable_flush_file_cache_async=" << doris::config::enable_flush_file_cache_async;
-
-    init_exec_env();
-    JobManager job_manager;
-
     std::thread periodiccally_log_thread;
     std::mutex periodiccally_log_thread_lock;
     std::condition_variable periodiccally_log_thread_cv;
@@ -2440,12 +3023,8 @@ int main(int argc, char* argv[]) {
     };
     periodiccally_log_thread = std::thread {periodiccally_log};
 
-    try {
-        HttpServer http_server(job_manager);
-        http_server.start();
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "Error in HTTP server: " << e.what();
-    }
+    HttpServer http_server;
+    http_server.start(doris_home);
 
     if (periodiccally_log_thread.joinable()) {
         {

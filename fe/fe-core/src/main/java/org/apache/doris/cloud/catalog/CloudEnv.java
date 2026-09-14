@@ -18,8 +18,17 @@
 package org.apache.doris.cloud.catalog;
 
 import org.apache.doris.analysis.ResourceTypeEnum;
+import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.EnvFactory;
+import org.apache.doris.catalog.MaterializedIndex;
+import org.apache.doris.catalog.MaterializedIndex.IndexExtState;
+import org.apache.doris.catalog.OlapTable;
+import org.apache.doris.catalog.Partition;
+import org.apache.doris.catalog.Replica;
+import org.apache.doris.catalog.Table;
+import org.apache.doris.catalog.Tablet;
+import org.apache.doris.catalog.TabletMeta;
 import org.apache.doris.cloud.CacheHotspotManager;
 import org.apache.doris.cloud.CloudWarmUpJob;
 import org.apache.doris.cloud.CloudWarmUpJob.JobState;
@@ -45,6 +54,9 @@ import org.apache.doris.nereids.trees.plans.commands.DropStageCommand;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.system.Frontend;
 import org.apache.doris.system.SystemInfoService.HostInfo;
+import org.apache.doris.task.AgentBatchTask;
+import org.apache.doris.task.AgentTaskExecutor;
+import org.apache.doris.task.CompactionTask;
 
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
@@ -54,6 +66,7 @@ import org.apache.logging.log4j.Logger;
 import java.io.DataInputStream;
 import java.io.File;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -69,6 +82,8 @@ public class CloudEnv extends Env {
 
     private CloudTabletRebalancer cloudTabletRebalancer;
     private CacheHotspotManager cacheHotspotMgr;
+    private CloudSyncVersionDaemon cloudSyncVersionDaemon;
+    private CloudFEVersionSynchronizer cloudFEVersionSynchronizer;
 
     private boolean enableStorageVault;
 
@@ -89,6 +104,8 @@ public class CloudEnv extends Env {
         this.cloudTabletRebalancer = new CloudTabletRebalancer((CloudSystemInfoService) systemInfo);
         this.cacheHotspotMgr = new CacheHotspotManager((CloudSystemInfoService) systemInfo);
         this.upgradeMgr = new CloudUpgradeMgr((CloudSystemInfoService) systemInfo);
+        this.cloudSyncVersionDaemon = new CloudSyncVersionDaemon();
+        this.cloudFEVersionSynchronizer = new CloudFEVersionSynchronizer();
         this.cloudSnapshotHandler = CloudSnapshotHandler.getInstance();
     }
 
@@ -122,6 +139,11 @@ public class CloudEnv extends Env {
 
     @Override
     public void initialize(String[] args) throws Exception {
+        if (clusterSnapshotFile != null && Strings.isNullOrEmpty(Config.cloud_unique_id)) {
+            throw new UserException("cloud_unique_id must be specified in fe.conf "
+                    + "when load from cluster snapshot in cloud mode");
+        }
+
         if (Strings.isNullOrEmpty(Config.cloud_unique_id) && Config.cluster_id == -1) {
             throw new UserException("cluster_id must be specified in fe.conf if deployed "
                                     + "in cloud mode, because FE should known to which it belongs");
@@ -141,6 +163,7 @@ public class CloudEnv extends Env {
 
         super.initialize(args);
         this.cloudSnapshotHandler.initialize();
+        cloudInstanceStatusChecker.start();
     }
 
     @Override
@@ -157,11 +180,15 @@ public class CloudEnv extends Env {
         cloudSnapshotHandler.start();
     }
 
+    public CloudFEVersionSynchronizer getCloudFEVersionSynchronizer() {
+        return cloudFEVersionSynchronizer;
+    }
+
     @Override
     protected void startNonMasterDaemonThreads() {
         LOG.info("start cloud Non Master only daemon threads");
         super.startNonMasterDaemonThreads();
-        cloudInstanceStatusChecker.start();
+        cloudSyncVersionDaemon.start();
     }
 
     public static String genFeNodeNameFromMeta(String host, int port, long timeMs) {
@@ -473,6 +500,151 @@ public class CloudEnv extends Env {
     protected void cloneClusterSnapshot() throws Exception {
         if (this.clusterSnapshotFile != null) {
             this.cloudSnapshotHandler.cloneSnapshot(this.clusterSnapshotFile);
+        }
+    }
+
+    @Override
+    public void compactTablet(long tabletId, String type) throws DdlException {
+        TabletMeta tabletMeta = Env.getCurrentInvertedIndex().getTabletMeta(tabletId);
+        if (tabletMeta == null) {
+            throw new DdlException("Unknown tablet: " + tabletId);
+        }
+
+        Database db = getInternalCatalog().getDbNullable(tabletMeta.getDbId());
+        if (db == null) {
+            throw new DdlException("Unknown database for tablet: " + tabletId);
+        }
+        Table table = db.getTableNullable(tabletMeta.getTableId());
+        if (!(table instanceof OlapTable)) {
+            throw new DdlException("Unknown OLAP table for tablet: " + tabletId);
+        }
+        OlapTable olapTable = (OlapTable) table;
+
+        List<PendingCloudCompactionTablet> pending = new ArrayList<>();
+        olapTable.readLock();
+        try {
+            Partition partition = olapTable.getPartition(tabletMeta.getPartitionId());
+            if (partition == null) {
+                throw new DdlException("Unknown partition for tablet: " + tabletId);
+            }
+            MaterializedIndex index = partition.getIndex(tabletMeta.getIndexId());
+            if (index == null || !index.getState().isVisible()) {
+                throw new DdlException("Tablet " + tabletId + " is not in a visible index");
+            }
+            Tablet tablet = index.getTablet(tabletId);
+            if (tablet == null) {
+                throw new DdlException("Tablet " + tabletId + " does not belong to its metadata index");
+            }
+
+            int schemaHash = olapTable.getSchemaHashByIndexId(index.getId());
+            LOG.info("Cloud tablet compaction. database={}, table={}, tablet={}, type={}",
+                    db.getFullName(), olapTable.getName(), tabletId, type);
+            for (Replica replica : tablet.getReplicas()) {
+                pending.add(new PendingCloudCompactionTablet(partition.getId(), index.getId(), tabletId,
+                        schemaHash, replica));
+            }
+        } finally {
+            olapTable.readUnlock();
+        }
+
+        AgentBatchTask batchTask = new AgentBatchTask();
+        for (PendingCloudCompactionTablet pendingTablet : pending) {
+            long backendId;
+            try {
+                backendId = pendingTablet.replica.getBackendId();
+            } catch (UserException e) {
+                throw new DdlException("failed to resolve backend for tablet " + tabletId
+                        + ": " + e.getMessage());
+            }
+            batchTask.addTask(new CompactionTask(backendId, db.getId(), olapTable.getId(),
+                    pendingTablet.partitionId, pendingTablet.indexId, pendingTablet.tabletId,
+                    pendingTablet.schemaHash, type));
+        }
+
+        if (batchTask.getTaskNum() == 0) {
+            throw new DdlException("No replica found for tablet: " + tabletId);
+        }
+        AgentTaskExecutor.submit(batchTask);
+    }
+
+    @Override
+    public void compactTable(String dbName, String tableName, String type, List<String> partitionNames)
+            throws DdlException {
+        Database db = getInternalCatalog().getDbOrDdlException(dbName);
+        OlapTable olapTable = db.getOlapTableOrDdlException(tableName);
+
+        long dbId = db.getId();
+        long tableId;
+
+        // Step 1: under readLock, only collect tablet metadata. Resolving the backend
+        // is deferred because CloudReplica.getBackendId() can call into Meta Service
+        // and wait on compute-group state; holding the table read lock across that
+        // would block unrelated DDL on this table for the full wait.
+        List<PendingCloudCompactionTablet> pending = new ArrayList<>();
+        olapTable.readLock();
+        try {
+            LOG.info("Cloud table compaction. db={}, table={}, partitions={}, type={}",
+                    dbName, tableName, partitionNames, type);
+            tableId = olapTable.getId();
+            for (String parName : partitionNames) {
+                Partition partition = olapTable.getPartition(parName);
+                if (partition == null) {
+                    throw new DdlException("partition[" + parName + "] not exist in table[" + tableName + "]");
+                }
+                for (MaterializedIndex idx : partition.getMaterializedIndices(IndexExtState.VISIBLE)) {
+                    int schemaHash = olapTable.getSchemaHashByIndexId(idx.getId());
+                    for (Tablet tablet : idx.getTablets()) {
+                        // Cloud: each tablet has only one CloudReplica (primary BE).
+                        for (Replica replica : tablet.getReplicas()) {
+                            pending.add(new PendingCloudCompactionTablet(partition.getId(), idx.getId(),
+                                    tablet.getId(), schemaHash, replica));
+                        }
+                    }
+                }
+            }
+        } finally {
+            olapTable.readUnlock();
+        }
+
+        // Step 2: resolve backends and build tasks outside the lock. Surface compute-group
+        // errors (missing privilege, manual shutdown, no BE, ...) to the user instead of
+        // silently skipping, otherwise a failed ADMIN COMPACT TABLE looks like a no-op.
+        AgentBatchTask batchTask = new AgentBatchTask();
+        for (PendingCloudCompactionTablet p : pending) {
+            long beId;
+            try {
+                beId = p.replica.getBackendId();
+            } catch (UserException e) {
+                throw new DdlException("failed to resolve backend for tablet " + p.tabletId
+                        + ": " + e.getMessage());
+            }
+            CompactionTask compactionTask = new CompactionTask(beId, dbId, tableId, p.partitionId,
+                    p.indexId, p.tabletId, p.schemaHash, type);
+            batchTask.addTask(compactionTask);
+        }
+
+        if (pending.isEmpty()) {
+            throw new DdlException("no tablet dispatched for compaction; the selected partitions "
+                    + "contain no visible index or tablet");
+        }
+        AgentTaskExecutor.submit(batchTask);
+    }
+
+    /** Metadata snapshot of one tablet replica, captured under the table read lock. */
+    private static final class PendingCloudCompactionTablet {
+        final long partitionId;
+        final long indexId;
+        final long tabletId;
+        final int schemaHash;
+        final Replica replica;
+
+        PendingCloudCompactionTablet(long partitionId, long indexId, long tabletId,
+                int schemaHash, Replica replica) {
+            this.partitionId = partitionId;
+            this.indexId = indexId;
+            this.tabletId = tabletId;
+            this.schemaHash = schemaHash;
+            this.replica = replica;
         }
     }
 }

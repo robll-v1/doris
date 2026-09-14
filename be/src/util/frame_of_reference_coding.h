@@ -23,12 +23,11 @@
 #include <vector>
 
 #include "common/cast_set.h"
-#include "olap/olap_common.h"
-#include "olap/uint24.h"
+#include "core/uint24.h"
+#include "storage/olap_common.h"
 #include "util/faststring.h"
 
 namespace doris {
-#include "common/compile_check_begin.h"
 
 inline uint8_t leading_zeroes(const uint64_t v) {
     if (v == 0) {
@@ -211,5 +210,32 @@ private:
     uint32_t _current_decoded_frame = -1;
     std::vector<T> _out_buffer; // store values of decoded frame
 };
-#include "common/compile_check_end.h"
+
+template <>
+const uint24_t ForEncoder<uint24_t>::numeric_limits_max();
+
+/// Instantiated once in frame_of_reference_coding.cpp; suppresses per-TU implicit instantiation.
+extern template class ForEncoder<int8_t>;
+extern template class ForEncoder<int16_t>;
+extern template class ForEncoder<int32_t>;
+extern template class ForEncoder<int64_t>;
+extern template class ForEncoder<int128_t>;
+extern template class ForEncoder<uint8_t>;
+extern template class ForEncoder<uint16_t>;
+extern template class ForEncoder<uint32_t>;
+extern template class ForEncoder<uint64_t>;
+extern template class ForEncoder<uint24_t>;
+extern template class ForEncoder<uint128_t>;
+extern template class ForDecoder<int8_t>;
+extern template class ForDecoder<int16_t>;
+extern template class ForDecoder<int32_t>;
+extern template class ForDecoder<int64_t>;
+extern template class ForDecoder<int128_t>;
+extern template class ForDecoder<uint8_t>;
+extern template class ForDecoder<uint16_t>;
+extern template class ForDecoder<uint32_t>;
+extern template class ForDecoder<uint64_t>;
+extern template class ForDecoder<uint24_t>;
+extern template class ForDecoder<uint128_t>;
+
 } // namespace doris

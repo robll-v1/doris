@@ -17,17 +17,30 @@
 
 package org.apache.doris.nereids.rules.rewrite;
 
+import org.apache.doris.catalog.Column;
+import org.apache.doris.catalog.DatabaseIf;
+import org.apache.doris.catalog.Index;
+import org.apache.doris.catalog.TableIf;
+import org.apache.doris.catalog.Type;
+import org.apache.doris.catalog.info.IndexType;
+import org.apache.doris.datasource.CatalogIf;
+import org.apache.doris.datasource.plugin.PluginDrivenExternalTable;
 import org.apache.doris.nereids.CascadesContext;
 import org.apache.doris.nereids.rules.Rule;
 import org.apache.doris.nereids.rules.RulePromise;
 import org.apache.doris.nereids.rules.RuleType;
 import org.apache.doris.nereids.rules.implementation.AggregateStrategies;
 import org.apache.doris.nereids.trees.expressions.Alias;
+import org.apache.doris.nereids.trees.expressions.IsNull;
 import org.apache.doris.nereids.trees.expressions.functions.agg.Count;
 import org.apache.doris.nereids.trees.expressions.functions.agg.Max;
 import org.apache.doris.nereids.trees.expressions.functions.agg.Min;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.Ln;
+import org.apache.doris.nereids.trees.plans.RelationId;
 import org.apache.doris.nereids.trees.plans.logical.LogicalAggregate;
+import org.apache.doris.nereids.trees.plans.logical.LogicalFileScan;
+import org.apache.doris.nereids.trees.plans.logical.LogicalFileScan.SelectedPartitions;
+import org.apache.doris.nereids.trees.plans.logical.LogicalFilter;
 import org.apache.doris.nereids.trees.plans.logical.LogicalOlapScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalProject;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalStorageLayerAggregate.PushDownAggOp;
@@ -37,7 +50,9 @@ import org.apache.doris.nereids.util.PlanChecker;
 import org.apache.doris.nereids.util.PlanConstructor;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 
 import java.util.Collections;
 import java.util.Optional;
@@ -75,7 +90,26 @@ public class PhysicalStorageLayerAggregateTest implements MemoPatternMatchSuppor
                 .applyImplementation(storageLayerAggregateWithoutProject())
                 .matches(
                     logicalAggregate(
-                        physicalStorageLayerAggregate().when(agg -> agg.getAggOp() == PushDownAggOp.COUNT)
+                        physicalStorageLayerAggregate().when(agg -> agg.getAggOp() == PushDownAggOp.COUNT
+                                && agg.getCountArgumentExprIds().equals(
+                                        ImmutableList.of(olapScan.getOutput().get(0).getExprId())))
+                    )
+                );
+
+        // COUNT(*) still keeps a placeholder scan slot after column pruning, so its semantic
+        // argument list must remain empty instead of being inferred from the physical scan shape.
+        aggregate = new LogicalAggregate<>(
+                Collections.emptyList(),
+                ImmutableList.of(new Alias(new Count(), "count_star")),
+                true, Optional.empty(), olapScan);
+        context = MemoTestUtils.createCascadesContext(aggregate);
+
+        PlanChecker.from(context)
+                .applyImplementation(storageLayerAggregateWithoutProject())
+                .matches(
+                    logicalAggregate(
+                        physicalStorageLayerAggregate().when(agg -> agg.getAggOp() == PushDownAggOp.COUNT
+                                && agg.getCountArgumentExprIds().isEmpty())
                     )
                 );
 
@@ -94,6 +128,71 @@ public class PhysicalStorageLayerAggregateTest implements MemoPatternMatchSuppor
                         physicalStorageLayerAggregate().when(agg -> agg.getAggOp() == PushDownAggOp.MIX)
                     )
                 );
+    }
+
+    @Test
+    public void testNullableFileCountUsesStorageLayerAggregate() {
+        LogicalAggregate<LogicalFileScan> aggregate = newNullableFileCountAggregate();
+        LogicalFileScan fileScan = aggregate.child();
+
+        PlanChecker.from(MemoTestUtils.createCascadesContext(aggregate))
+                .applyImplementation(storageLayerAggregateWithoutProjectForFileScan())
+                .matches(logicalAggregate(
+                        physicalStorageLayerAggregate().when(agg -> agg.getAggOp() == PushDownAggOp.COUNT
+                                && agg.getCountArgumentExprIds().equals(
+                                        ImmutableList.of(fileScan.getOutput().get(0).getExprId())))));
+    }
+
+    @Test
+    public void testNullableFileCountDoesNotUseV1StorageLayerAggregate() {
+        LogicalAggregate<LogicalFileScan> aggregate = newNullableFileCountAggregate();
+        CascadesContext context = MemoTestUtils.createCascadesContext(aggregate);
+        context.getConnectContext().getSessionVariable().enableFileScannerV2 = false;
+
+        PlanChecker.from(context)
+                .applyImplementation(storageLayerAggregateWithoutProjectForFileScan())
+                .nonMatch(physicalStorageLayerAggregate());
+    }
+
+    @Test
+    public void testMixedCountStarAndNullableFileCountDoesNotUseStorageLayerAggregate() {
+        LogicalAggregate<LogicalFileScan> nullableCount = newNullableFileCountAggregate();
+        LogicalFileScan fileScan = nullableCount.child();
+        LogicalAggregate<LogicalFileScan> mixedCount = new LogicalAggregate<>(
+                Collections.emptyList(),
+                ImmutableList.of(new Alias(new Count(), "count_star"),
+                        new Alias(new Count(fileScan.getOutput().get(0)), "count_nullable")),
+                true, Optional.empty(), fileScan);
+
+        PlanChecker.from(MemoTestUtils.createCascadesContext(mixedCount))
+                .applyImplementation(storageLayerAggregateWithoutProjectForFileScan())
+                .nonMatch(physicalStorageLayerAggregate());
+    }
+
+    private LogicalAggregate<LogicalFileScan> newNullableFileCountAggregate() {
+        Column nullableColumn = new Column("value", Type.INT, true);
+        PluginDrivenExternalTable table = Mockito.mock(PluginDrivenExternalTable.class);
+        Mockito.when(table.initSelectedPartitions(Mockito.any()))
+                .thenReturn(SelectedPartitions.NOT_PRUNED);
+        Mockito.when(table.getFullSchema()).thenReturn(ImmutableList.of(nullableColumn));
+        // On this branch external file-scan tables are PluginDrivenExternalTable, so
+        // LogicalFileScan.computeOutput() resolves the schema via the version-aware
+        // getFullSchema(Optional<MvccSnapshot>) overload rather than the no-arg one.
+        Mockito.when(table.getFullSchema(Mockito.any())).thenReturn(ImmutableList.of(nullableColumn));
+        Mockito.when(table.getName()).thenReturn("nullable_file_table");
+        CatalogIf catalog = Mockito.mock(CatalogIf.class);
+        Mockito.when(catalog.getName()).thenReturn("catalog");
+        DatabaseIf<TableIf> database = Mockito.mock(DatabaseIf.class);
+        Mockito.when(database.getCatalog()).thenReturn(catalog);
+        Mockito.when(database.getFullName()).thenReturn("db");
+        Mockito.when(table.getDatabase()).thenReturn(database);
+        LogicalFileScan fileScan = new LogicalFileScan(new RelationId(1), table,
+                ImmutableList.of("catalog", "db"), Collections.emptyList(),
+                Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty());
+        return new LogicalAggregate<>(
+                Collections.emptyList(),
+                ImmutableList.of(new Alias(new Count(fileScan.getOutput().get(0)), "count")),
+                true, Optional.empty(), fileScan);
     }
 
     @Override
@@ -138,7 +237,9 @@ public class PhysicalStorageLayerAggregateTest implements MemoPatternMatchSuppor
                 .matches(
                     logicalAggregate(
                         logicalProject(
-                            physicalStorageLayerAggregate().when(agg -> agg.getAggOp() == PushDownAggOp.COUNT)
+                            physicalStorageLayerAggregate().when(agg -> agg.getAggOp() == PushDownAggOp.COUNT
+                                    && agg.getCountArgumentExprIds().equals(
+                                            ImmutableList.of(olapScan.getOutput().get(0).getExprId())))
                         )
                     )
                 );
@@ -161,6 +262,31 @@ public class PhysicalStorageLayerAggregateTest implements MemoPatternMatchSuppor
                         )
                     )
                 );
+    }
+
+    @Test
+    public void testCountOnIndexRejectsIsNullOnProjectedCountSlot() {
+        LogicalOlapScan olapScan = PlanConstructor.newLogicalOlapScan(2, "count_alias", 0);
+        Index invertedIndex = new Index(1L, "idx_name", ImmutableList.of("name"),
+                IndexType.INVERTED, null, "");
+        olapScan.getTable().getIndexIdToMeta().values().forEach(
+                meta -> meta.setIndexes(ImmutableList.of(invertedIndex)));
+
+        LogicalFilter<LogicalOlapScan> filter = new LogicalFilter<>(
+                ImmutableSet.of(new IsNull(olapScan.getOutput().get(1))), olapScan);
+        LogicalProject<LogicalFilter<LogicalOlapScan>> project = new LogicalProject<>(
+                ImmutableList.of(new Alias(olapScan.getOutput().get(1), "x")), filter);
+        LogicalAggregate<LogicalProject<LogicalFilter<LogicalOlapScan>>> aggregate = new LogicalAggregate<>(
+                Collections.emptyList(),
+                ImmutableList.of(new Alias(new Count(project.getOutput().get(0)), "count_x"),
+                        new Alias(new Count(), "count_star")),
+                true, Optional.empty(), project);
+        CascadesContext context = MemoTestUtils.createCascadesContext(aggregate);
+        context.getConnectContext().getSessionVariable().setEnablePushDownCountOnIndex(true);
+
+        PlanChecker.from(context)
+                .applyImplementation(countOnIndex())
+                .matches(logicalAggregate(logicalProject(logicalFilter(logicalOlapScan()))));
     }
 
     @Test
@@ -197,10 +323,27 @@ public class PhysicalStorageLayerAggregateTest implements MemoPatternMatchSuppor
                 .get();
     }
 
+    private Rule storageLayerAggregateWithoutProjectForFileScan() {
+        return new AggregateStrategies().buildRules()
+                .stream()
+                .filter(rule -> rule.getRuleType()
+                        == RuleType.STORAGE_LAYER_AGGREGATE_WITHOUT_PROJECT_FOR_FILE_SCAN)
+                .findFirst()
+                .get();
+    }
+
     private Rule storageLayerAggregateWithProject() {
         return new AggregateStrategies().buildRules()
                 .stream()
                 .filter(rule -> rule.getRuleType() == RuleType.STORAGE_LAYER_AGGREGATE_WITH_PROJECT)
+                .findFirst()
+                .get();
+    }
+
+    private Rule countOnIndex() {
+        return new AggregateStrategies().buildRules()
+                .stream()
+                .filter(rule -> rule.getRuleType() == RuleType.COUNT_ON_INDEX)
                 .findFirst()
                 .get();
     }

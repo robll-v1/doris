@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("test_iceberg_varbinary", "p0,external,doris,external_docker,external_docker_doris") {
+suite("test_iceberg_varbinary", "p0,external") {
 
     String enabled = context.config.otherConfigs.get("enableIcebergTest")
     if (enabled == null || !enabled.equalsIgnoreCase("true")) {
@@ -29,13 +29,18 @@ suite("test_iceberg_varbinary", "p0,external,doris,external_docker,external_dock
     String rest_port = context.config.otherConfigs.get("iceberg_rest_uri_port")
     String minio_port = context.config.otherConfigs.get("iceberg_minio_port")
     String externalEnvIp = context.config.otherConfigs.get("externalEnvIp")
+    // A container-advertised REST URI may differ from the host port-forward address.
+    String restUri = context.config.otherConfigs.get("iceberg_rest_uri")
+    if (restUri == null) {
+        restUri = "http://${externalEnvIp}:${rest_port}"
+    }
     
     sql """drop catalog if exists ${catalog_name_no_mapping}"""
     sql """
     CREATE CATALOG ${catalog_name_no_mapping} PROPERTIES (
         'type'='iceberg',
         'iceberg.catalog.type'='rest',
-        'uri' = 'http://${externalEnvIp}:${rest_port}',
+        'uri' = '${restUri}',
         "s3.access_key" = "admin",
         "s3.secret_key" = "password",
         "s3.endpoint" = "http://${externalEnvIp}:${minio_port}",
@@ -50,7 +55,7 @@ suite("test_iceberg_varbinary", "p0,external,doris,external_docker,external_dock
     CREATE CATALOG ${catalog_name_with_mapping} PROPERTIES (
         'type'='iceberg',
         'iceberg.catalog.type'='rest',
-        'uri' = 'http://${externalEnvIp}:${rest_port}',
+        'uri' = '${restUri}',
         "s3.access_key" = "admin",
         "s3.secret_key" = "password",
         "s3.endpoint" = "http://${externalEnvIp}:${minio_port}",
@@ -148,5 +153,26 @@ suite("test_iceberg_varbinary", "p0,external,doris,external_docker,external_dock
 
     qt_select19 """
         select * from test_ice_uuid_parquet_write_with_mapping order by id;
+    """
+
+    qt_select21 """
+        select multi_distinct_count(col2),multi_distinct_count(col1) from test_ice_uuid_orc;
+    """
+
+    qt_select22 """
+        select multi_distinct_count(col2),multi_distinct_count(col1) from test_ice_uuid_parquet;
+    """
+
+    qt_select23 """
+        select * from binary_partitioned_table where from_hex(partition_bin)="0FF102FDFEFF";
+    """
+
+    sql """ use test_db; """
+    qt_select23 """
+        select id from test_variant_repro;
+    """
+    sql """set enable_file_scanner_v2=true"""
+    qt_select_variant """
+        select id, cast(v as string) from test_variant_repro order by id;
     """
 }

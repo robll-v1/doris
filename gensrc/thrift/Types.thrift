@@ -102,7 +102,8 @@ enum TPrimitiveType {
   UINT64 = 41,  // only used in BE to represent offsets
   FIXED_LENGTH_OBJECT = 42 // only used in BE to represent fixed-length object
   VARBINARY = 43, // represent varbinary type
-  TIMESTAMPTZ = 44 //  timestamp with time zone
+  TIMESTAMPTZ = 44, // timestamp with time zone
+  TIMESTAMP_NS = 45 // signed nanoseconds since the Unix epoch
 }
 
 enum TTypeNodeType {
@@ -130,7 +131,8 @@ enum TInvertedIndexFileStorageFormat {
     DEFAULT = 0, // Default format, unspecified storage method.
     V1 = 1,      // Index per idx: Each index is stored separately based on its identifier.
     V2 = 2,      // Segment id per idx: Indexes are organized based on segment identifiers, grouping indexes by their associated segment.
-    V3 = 3       // Position and dictionary compression
+    V3 = 3,      // Position and dictionary compression
+    SNII = 4     // SNII native inverted index storage format
 }
 
 struct TScalarType {
@@ -145,6 +147,9 @@ struct TScalarType {
 
     // Only set for VARIANT
     5: optional i32 variant_max_subcolumns_count = 0;
+    6: optional bool variant_enable_doc_mode = false;
+    // Execution-only ColumnVariantV2 marker. Table metadata never sets this field.
+    7: optional bool variant_is_v2 = false;
 }
 
 // Represents a field in a STRUCT type.
@@ -249,7 +254,8 @@ enum TTaskType {
     PUSH_INDEX_POLICY = 35,
 
     // CLOUD
-    CALCULATE_DELETE_BITMAP = 1000
+    CALCULATE_DELETE_BITMAP = 1000,
+    MAKE_CLOUD_COMMITTED_RS_VISIBLE = 1001
 }
 
 // level of verboseness for "explain" output
@@ -283,6 +289,7 @@ struct TColumnType {
   4: optional i32 precision
   5: optional i32 scale
   6: optional i32 variant_max_subcolumns_count = 0;
+  7: optional bool variant_enable_doc_mode = false;
 }
 
 // A TNetworkAddress is the standard host, port representation of a
@@ -332,7 +339,9 @@ enum TFunctionBinaryType {
 
   JAVA_UDF = 5,
 
-  AGG_STATE = 6
+  AGG_STATE = 6,
+
+  PYTHON_UDF = 7
 }
 
 // Represents a fully qualified function name.
@@ -408,6 +417,8 @@ struct TFunction {
   15: optional bool is_static_load = false
   16: optional i64 expiration_time //minutes
   17: optional TDictFunction dict_function
+  18: optional string runtime_version
+  19: optional string function_code
 }
 
 enum TJdbcOperation {
@@ -680,6 +691,7 @@ struct TReplicaInfo {
     5: required TReplicaId replica_id
     6: optional bool is_alive
     7: optional i64 backend_id
+    8: optional string cloud_compute_group_id
 }
 
 struct TResourceInfo {
@@ -720,6 +732,7 @@ enum TLoadSourceType {
     RAW = 0,
     KAFKA = 1,
     MULTI_TABLE = 2,
+    KINESIS = 3,
 }
 
 enum TMergeType {
@@ -753,6 +766,11 @@ enum TMetadataType {
   PARTITION_VALUES = 10,
   HUDI = 11,
   PAIMON = 12,
+  PARQUET = 13,
+  STREAMS = 14,
+  // Also assigned on branch-4.1 for Lance physical index entries inspection.
+  // Keep the value aligned across maintained branches. Do not renumber.
+  LANCE_INDEX_ENTRIES = 15,
 }
 
 // deprecated
@@ -760,6 +778,7 @@ enum TIcebergQueryType {
   SNAPSHOTS
 }
 
+// deprecated
 enum THudiQueryType {
   TIMELINE = 0
 }
@@ -771,8 +790,12 @@ struct TUserIdentity {
     3: optional bool is_domain
 }
 
+struct TColumnGroup {
+    1: required i32 sequence_column = -1
+    2: required list<i32> columns_in_group
+}
+
 const i32 TSNAPSHOT_REQ_VERSION1 = 3; // corresponding to alpha rowset
 const i32 TSNAPSHOT_REQ_VERSION2 = 4; // corresponding to beta rowset
 // the snapshot request should always set prefer snapshot version to TPREFER_SNAPSHOT_REQ_VERSION
 const i32 TPREFER_SNAPSHOT_REQ_VERSION = TSNAPSHOT_REQ_VERSION2;
-

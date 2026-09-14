@@ -17,13 +17,20 @@
 
 package org.apache.doris.qe;
 
+import org.apache.doris.analysis.ExprToThriftVisitor;
 import org.apache.doris.analysis.LiteralExpr;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ClientPool;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.ErrorCode;
+import org.apache.doris.datasource.DelegatedCredential;
 import org.apache.doris.mysql.MysqlCommand;
+import org.apache.doris.mysql.MysqlProto;
+import org.apache.doris.mysql.MysqlResultSetEndPacket;
+import org.apache.doris.mysql.MysqlSerializer;
+import org.apache.doris.mysql.protocol.MysqlProtocolAdapter;
+import org.apache.doris.qe.ConnectContext.ConnectType;
 import org.apache.doris.thrift.FrontendService;
 import org.apache.doris.thrift.TExpr;
 import org.apache.doris.thrift.TExprNode;
@@ -35,6 +42,7 @@ import org.apache.doris.thrift.TUniqueId;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Maps;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -42,9 +50,11 @@ import org.apache.thrift.TException;
 import org.apache.thrift.transport.TTransportException;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * FEOpExecutor is used to send request to specific FE
@@ -134,7 +144,7 @@ public class FEOpExecutor {
             forwardMsg.append(" : failed");
             Exception exception = new ForwardToMasterException(forwardMsg.toString(), e);
 
-            boolean ok = ClientPool.frontendPool.reopen(client, thriftTimeoutMs);
+            boolean ok = ClientPool.frontendPool.reopenOrClear(feAddr, client, thriftTimeoutMs);
             if (!ok) {
                 throw exception;
             }
@@ -164,6 +174,7 @@ public class FEOpExecutor {
         // node ident
         params.setClientNodeHost(Env.getCurrentEnv().getSelfNode().getHost());
         params.setClientNodePort(Env.getCurrentEnv().getSelfNode().getPort());
+        params.setConnectingFeLocalResourceGroup(Config.local_resource_group);
         params.setSql(originStmt.originStmt);
         params.setStmtIdx(originStmt.idx);
         params.setUser(ctx.getQualifiedUser());
@@ -194,6 +205,11 @@ public class FEOpExecutor {
         if (null != ctx.queryId()) {
             params.setQueryId(ctx.queryId());
         }
+        // connect attributes (e.g. scheduleInfo for lineage)
+        Map<String, String> connectAttributes = ctx.getConnectAttributes();
+        if (connectAttributes != null && !connectAttributes.isEmpty()) {
+            params.setConnectAttributes(connectAttributes);
+        }
 
         // set transaction load info
         if (ctx.isTxnModel()) {
@@ -204,6 +220,24 @@ public class FEOpExecutor {
             if (null != ctx.getPrepareExecuteBuffer()) {
                 params.setPrepareExecuteBuffer(ctx.getPrepareExecuteBuffer());
             }
+            params.setCursorFetchRequested(ctx.isCursorFetchRequested());
+        }
+
+        ctx.getSessionContext().getDelegatedCredential().ifPresent((DelegatedCredential credential) -> {
+            params.setDelegatedCredentialSessionId(ctx.getSessionContext().getSessionId());
+            params.setDelegatedCredentialType(credential.getType().name());
+            params.setDelegatedCredentialToken(credential.getToken());
+            credential.getExpiresAtMillis().ifPresent(params::setDelegatedCredentialExpiresAtMillis);
+        });
+
+        // Propagate the client's CLIENT_DEPRECATE_EOF capability so the master FE
+        // generates packets matching the original client's protocol expectations.
+        // Only a MySQL connection negotiates this capability and owns a MysqlChannel;
+        // an Arrow Flight SQL session has none, and leaving the field unset keeps the
+        // master on its default packet layout.
+        if (ctx.getConnectType() == ConnectType.MYSQL) {
+            params.setClientDeprecatedEOF(ctx.getMysqlChannel().clientDeprecatedEOF());
+            params.setMysqlCapability(ctx.getCapability().getFlags());
         }
 
         return params;
@@ -237,12 +271,87 @@ public class FEOpExecutor {
         return result.packet;
     }
 
+    public boolean isClientDeprecatedEofApplied() {
+        return result != null && result.isSetClientDeprecatedEofApplied()
+                && result.isClientDeprecatedEofApplied();
+    }
+
+    public boolean hasQueryResultPackets() {
+        return result != null && result.isSetQueryResultBufList()
+                && !result.getQueryResultBufList().isEmpty();
+    }
+
+    // An old master cannot add the Connector/J cursor terminator. Normalize its buffered
+    // result at the follower, which still has the original execute flag and client capability.
+    // DML/DDL OK and ERR packets are retained verbatim, including warnings and load info.
+    public void prepareQueryResultForClient() {
+        if (!ctx.getMysqlChannel().clientDeprecatedEOF() || isClientDeprecatedEofApplied()
+                || !hasQueryResultPackets()) {
+            return;
+        }
+        List<ByteBuffer> packets = new ArrayList<>(result.getQueryResultBufList());
+        int metadataEnd = Math.toIntExact(MysqlProto.readVInt(packets.get(0).duplicate())) + 1;
+        boolean needsCursorTerminator = MysqlProtocolAdapter.of(ctx).clientConsumesCursorMetadataTerminator(ctx);
+        // An execution error may occur after only part of the metadata has been buffered.
+        if (metadataEnd > packets.size()) {
+            Preconditions.checkState(isErrorPacket(result.packet));
+            return;
+        }
+        boolean hasMetadataTerminator = metadataEnd < packets.size()
+                && isEofPacket(packets.get(metadataEnd));
+        if (hasMetadataTerminator) {
+            ByteBuffer metadata = packets.remove(metadataEnd);
+            if (needsCursorTerminator) {
+                packets.add(metadataEnd, resultSetTerminator(metadata));
+            }
+        } else if (needsCursorTerminator) {
+            MysqlSerializer serializer = MysqlSerializer.newInstance(ctx.getCapability());
+            new MysqlResultSetEndPacket(new QueryState()).writeTo(serializer);
+            packets.add(metadataEnd, serializer.toByteBuffer());
+        }
+        result.setQueryResultBufList(packets);
+        if (isEofPacket(result.packet)) {
+            result.setPacket(resultSetTerminator(result.packet));
+        }
+        result.setClientDeprecatedEofApplied(true);
+    }
+
+    private static boolean isErrorPacket(ByteBuffer packet) {
+        return Byte.toUnsignedInt(packet.get(packet.position())) == 0xFF;
+    }
+
+    private static boolean isEofPacket(ByteBuffer packet) {
+        return packet.remaining() <= 8 && Byte.toUnsignedInt(packet.get(packet.position())) == 0xFE;
+    }
+
+    private static ByteBuffer resultSetTerminator(ByteBuffer packet) {
+        if (packet.remaining() != 5) {
+            return packet;
+        }
+        ByteBuffer eof = packet.duplicate();
+        MysqlProto.readInt1(eof);
+        int warnings = MysqlProto.readInt2(eof);
+        QueryState state = new QueryState();
+        state.setOk(0, warnings, null);
+        state.serverStatus = MysqlProto.readInt2(eof);
+        MysqlSerializer serializer = MysqlSerializer.newInstance();
+        new MysqlResultSetEndPacket(state).writeTo(serializer);
+        return serializer.toByteBuffer();
+    }
+
     public TUniqueId getQueryId() {
         if (result != null && result.isSetQueryId()) {
             return result.getQueryId();
         } else {
             return null;
         }
+    }
+
+    public Set<Long> getAuditStatisticsBackendIds() {
+        if (result == null || !result.isSetAuditStatisticsBackendIds()) {
+            return Collections.emptySet();
+        }
+        return ImmutableSet.copyOf(result.getAuditStatisticsBackendIds());
     }
 
     public String getProxyStatus() {
@@ -275,7 +384,7 @@ public class FEOpExecutor {
         Map<String, TExprNode> forwardVariables = Maps.newHashMap();
         for (Map.Entry<String, LiteralExpr> entry : userVariables.entrySet()) {
             LiteralExpr literalExpr = entry.getValue();
-            TExpr tExpr = literalExpr.treeToThrift();
+            TExpr tExpr = ExprToThriftVisitor.treeToThrift(literalExpr);
             TExprNode tExprNode = tExpr.nodes.get(0);
             forwardVariables.put(entry.getKey(), tExprNode);
         }
@@ -293,6 +402,7 @@ public class FEOpExecutor {
                                         + "`query_timeout`/`insert_timeout`")
                         .put(TTransportException.END_OF_FILE, "EOF")
                         .put(TTransportException.CORRUPTED_DATA, "Corrupted data")
+                        .put(TTransportException.MESSAGE_SIZE_LIMIT, "Message size exceeds limit")
                         .build();
 
         private final String msg;

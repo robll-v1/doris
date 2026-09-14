@@ -15,8 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("test_search_default_field_operator") {
+suite("test_search_default_field_operator", "p0") {
     def tableName = "search_enhanced_test"
+
+    // Pin enable_segment_limit_pushdown to prevent CI flakiness from fuzzy testing.
+    sql """ set enable_segment_limit_pushdown = true """
 
     sql "DROP TABLE IF EXISTS ${tableName}"
 
@@ -52,41 +55,41 @@ suite("test_search_default_field_operator") {
 
     // ============ Test 1: Wildcard Prefix with Default Field ============
     // Requirement: firstname EQ Chris*
-    // SQL: search('Chris*', 'firstname')
+    // SQL: search('Chris*', '{"default_field":"firstname"}')
     // Expected: Chris (1), Christopher (2)
     // Note: Without parser, inverted index is case-sensitive
     qt_wildcard_prefix """
-        SELECT /*+SET_VAR(enable_common_expr_pushdown=true) */ id, firstname
+        SELECT /*+SET_VAR(enable_segment_limit_pushdown=true) */ id, firstname
         FROM ${tableName}
-        WHERE search('Chris*', 'firstname')
+        WHERE search('Chris*', '{"default_field":"firstname"}')
         ORDER BY id
     """
 
     // ============ Test 2: Multi-term AND with Default Operator ============
     // Requirement: tags EQ foo bar (with AND semantics)
-    // SQL: search('foo bar', 'tags', 'and')
+    // SQL: search('foo bar', '{"default_field":"tags","default_operator":"and"}')
     // Expected: 'foo bar' (1), 'bar foo' (3)
     qt_multi_term_and """
-        SELECT /*+SET_VAR(enable_common_expr_pushdown=true) */ id, tags
+        SELECT /*+SET_VAR(enable_segment_limit_pushdown=true) */ id, tags
         FROM ${tableName}
-        WHERE search('foo bar', 'tags', 'and')
+        WHERE search('foo bar', '{"default_field":"tags","default_operator":"and"}')
         ORDER BY id
     """
 
     // ============ Test 3: Multi-term OR with Default Operator ============
     // Requirement: tags EQ foo OR bark (with OR semantics)
-    // SQL: search('foo bark', 'tags', 'or')
+    // SQL: search('foo bark', '{"default_field":"tags","default_operator":"or"}')
     // Expected: 'foo bar' (1), 'bar foo' (3), 'foolish bark' (4)
     qt_multi_term_or """
-        SELECT /*+SET_VAR(enable_common_expr_pushdown=true) */ id, tags
+        SELECT /*+SET_VAR(enable_segment_limit_pushdown=true) */ id, tags
         FROM ${tableName}
-        WHERE search('foo bark', 'tags', 'or')
+        WHERE search('foo bark', '{"default_field":"tags","default_operator":"or"}')
         ORDER BY id
     """
 
     // ============ Test 4: Multi-wildcard AND ============
     // Requirement: tags EQ foo* bar* (with AND semantics)
-    // SQL: search('foo* bar*', 'tags', 'and')
+    // SQL: search('foo* bar*', '{"default_field":"tags","default_operator":"and"}')
     // Expands to: tags:foo* AND tags:bar*
     // Expected: rows with tokens matching foo* AND tokens matching bar*
     // - 'foo bar' (1): tokens=['foo','bar'] - matches foo* ✓ and bar* ✓
@@ -94,38 +97,38 @@ suite("test_search_default_field_operator") {
     // - 'bar foo' (3): tokens=['bar','foo'] - matches foo* ✓ and bar* ✓
     // - 'foolish bark' (4): tokens=['foolish','bark'] - matches foo* ✓ and bar* ✓
     qt_wildcard_multi_and """
-        SELECT /*+SET_VAR(enable_common_expr_pushdown=true) */ id, tags
+        SELECT /*+SET_VAR(enable_segment_limit_pushdown=true) */ id, tags
         FROM ${tableName}
-        WHERE search('foo* bar*', 'tags', 'and')
+        WHERE search('foo* bar*', '{"default_field":"tags","default_operator":"and"}')
         ORDER BY id
     """
 
     // ============ Test 5: Explicit OR operator overrides default ============
-    // SQL: search('foo OR bark', 'tags', 'and')
+    // SQL: search('foo OR bark', '{"default_field":"tags","default_operator":"and"}')
     // The explicit OR in DSL should override the default 'and' operator
     // Expected: 'foo bar' (1), 'bar foo' (3), 'foolish bark' (4)
     qt_explicit_or_override """
-        SELECT /*+SET_VAR(enable_common_expr_pushdown=true) */ id, tags
+        SELECT /*+SET_VAR(enable_segment_limit_pushdown=true) */ id, tags
         FROM ${tableName}
-        WHERE search('foo OR bark', 'tags', 'and')
+        WHERE search('foo OR bark', '{"default_field":"tags","default_operator":"and"}')
         ORDER BY id
     """
 
     // ============ Test 6: EXACT function with default field ============
     // Requirement: EXACT(foo bar) on tags_exact field (no tokenization)
-    // SQL: search('EXACT(foo bar)', 'tags_exact')
+    // SQL: search('EXACT(foo bar)', '{"default_field":"tags_exact"}')
     // Expected: 'foo bar' (1) only - exact string match
     qt_exact_function """
-        SELECT /*+SET_VAR(enable_common_expr_pushdown=true) */ id, tags_exact
+        SELECT /*+SET_VAR(enable_segment_limit_pushdown=true) */ id, tags_exact
         FROM ${tableName}
-        WHERE search('EXACT(foo bar)', 'tags_exact')
+        WHERE search('EXACT(foo bar)', '{"default_field":"tags_exact"}')
         ORDER BY id
     """
 
     // ============ Test 7: Traditional syntax still works ============
     // Ensure backward compatibility - original syntax unchanged
     qt_traditional_syntax """
-        SELECT /*+SET_VAR(enable_common_expr_pushdown=true) */ id, firstname
+        SELECT /*+SET_VAR(enable_segment_limit_pushdown=true) */ id, firstname
         FROM ${tableName}
         WHERE search('firstname:Chris*')
         ORDER BY id
@@ -133,17 +136,17 @@ suite("test_search_default_field_operator") {
 
     // ============ Test 8: Single term with default field ============
     qt_single_term """
-        SELECT /*+SET_VAR(enable_common_expr_pushdown=true) */ id, tags
+        SELECT /*+SET_VAR(enable_segment_limit_pushdown=true) */ id, tags
         FROM ${tableName}
-        WHERE search('bar', 'tags')
+        WHERE search('bar', '{"default_field":"tags"}')
         ORDER BY id
     """
 
     // ============ Test 9: Wildcard in middle ============
     qt_wildcard_middle """
-        SELECT /*+SET_VAR(enable_common_expr_pushdown=true) */ id, firstname
+        SELECT /*+SET_VAR(enable_segment_limit_pushdown=true) */ id, firstname
         FROM ${tableName}
-        WHERE search('*ris*', 'firstname')
+        WHERE search('*ris*', '{"default_field":"firstname"}')
         ORDER BY id
     """
 
@@ -151,55 +154,55 @@ suite("test_search_default_field_operator") {
     // Without parser, wildcard queries are case-sensitive (matches Lucene behavior)
     // CHRIS* won't match Chris/Christopher
     qt_case_sensitive """
-        SELECT /*+SET_VAR(enable_common_expr_pushdown=true) */ id, firstname
+        SELECT /*+SET_VAR(enable_segment_limit_pushdown=true) */ id, firstname
         FROM ${tableName}
-        WHERE search('CHRIS*', 'firstname')
+        WHERE search('CHRIS*', '{"default_field":"firstname"}')
         ORDER BY id
     """
 
     // ============ Test 11: Default operator is OR when not specified ============
     qt_default_or """
-        SELECT /*+SET_VAR(enable_common_expr_pushdown=true) */ id, tags
+        SELECT /*+SET_VAR(enable_segment_limit_pushdown=true) */ id, tags
         FROM ${tableName}
-        WHERE search('foo bark', 'tags')
+        WHERE search('foo bark', '{"default_field":"tags"}')
         ORDER BY id
     """
 
     // ============ Test 12: ANY function with default field ============
     qt_any_function """
-        SELECT /*+SET_VAR(enable_common_expr_pushdown=true) */ id, tags
+        SELECT /*+SET_VAR(enable_segment_limit_pushdown=true) */ id, tags
         FROM ${tableName}
-        WHERE search('ANY(foo bark)', 'tags')
+        WHERE search('ANY(foo bark)', '{"default_field":"tags"}')
         ORDER BY id
     """
 
     // ============ Test 13: ALL function with default field ============
     qt_all_function """
-        SELECT /*+SET_VAR(enable_common_expr_pushdown=true) */ id, tags
+        SELECT /*+SET_VAR(enable_segment_limit_pushdown=true) */ id, tags
         FROM ${tableName}
-        WHERE search('ALL(foo bar)', 'tags')
+        WHERE search('ALL(foo bar)', '{"default_field":"tags"}')
         ORDER BY id
     """
 
     // ============ Test 14: Complex wildcard pattern ============
     qt_complex_wildcard """
-        SELECT /*+SET_VAR(enable_common_expr_pushdown=true) */ id, firstname
+        SELECT /*+SET_VAR(enable_segment_limit_pushdown=true) */ id, firstname
         FROM ${tableName}
-        WHERE search('?evin', 'firstname')
+        WHERE search('?evin', '{"default_field":"firstname"}')
         ORDER BY id
     """
 
     // ============ Test 15: Default field with explicit AND ============
     qt_explicit_and """
-        SELECT /*+SET_VAR(enable_common_expr_pushdown=true) */ id, tags
+        SELECT /*+SET_VAR(enable_segment_limit_pushdown=true) */ id, tags
         FROM ${tableName}
-        WHERE search('foo AND bar', 'tags')
+        WHERE search('foo AND bar', '{"default_field":"tags"}')
         ORDER BY id
     """
 
     // ============ Test 16: Multiple fields still work ============
     qt_multiple_fields """
-        SELECT /*+SET_VAR(enable_common_expr_pushdown=true) */ id, firstname, tags
+        SELECT /*+SET_VAR(enable_segment_limit_pushdown=true) */ id, firstname, tags
         FROM ${tableName}
         WHERE search('firstname:Chris* OR tags:bark')
         ORDER BY id
@@ -207,21 +210,21 @@ suite("test_search_default_field_operator") {
 
     // ============ Test 17: NOT operator with default field ============
     qt_not_operator """
-        SELECT /*+SET_VAR(enable_common_expr_pushdown=true) */ id, tags
+        SELECT /*+SET_VAR(enable_segment_limit_pushdown=true) */ id, tags
         FROM ${tableName}
-        WHERE search('NOT foobar', 'tags')
+        WHERE search('NOT foobar', '{"default_field":"tags"}')
         ORDER BY id
     """
 
     // ============ Test 18: Combining different parameter counts ============
-    // Tests mixing 1-param, 2-param, and 3-param search() calls in same query
+    // Tests mixing 1-param and 2-param search() calls in same query
     // - search('firstname:Chris*'): 1-param, traditional syntax → matches id 1,2
-    // - search('foo*', 'tags', 'or'): 3-param with wildcard → matches id 1,3,4
+    // - search('foo*', '{"default_field":"tags","default_operator":"or"}'): 2-param with JSON options → matches id 1,3,4
     // - OR combination → matches id 1,2,3,4 (all rows)
     qt_param_count_mix """
-        SELECT /*+SET_VAR(enable_common_expr_pushdown=true) */ id
+        SELECT /*+SET_VAR(enable_segment_limit_pushdown=true) */ id
         FROM ${tableName}
-        WHERE search('firstname:Chris*') OR search('foo*', 'tags', 'or')
+        WHERE search('firstname:Chris*') OR search('foo*', '{"default_field":"tags","default_operator":"or"}')
         ORDER BY id
     """
 

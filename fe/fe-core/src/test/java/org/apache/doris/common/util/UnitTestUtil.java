@@ -22,6 +22,8 @@ import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.DataProperty;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.KeysType;
+import org.apache.doris.catalog.LocalReplica;
+import org.apache.doris.catalog.LocalTablet;
 import org.apache.doris.catalog.MaterializedIndex;
 import org.apache.doris.catalog.MaterializedIndex.IndexState;
 import org.apache.doris.catalog.OlapTable;
@@ -43,7 +45,7 @@ import org.apache.doris.thrift.TStorageMedium;
 import org.apache.doris.thrift.TStorageType;
 import org.apache.doris.thrift.TTabletType;
 
-import org.junit.Assert;
+import org.junit.jupiter.api.Assertions;
 
 import java.lang.reflect.Method;
 import java.util.ArrayList;
@@ -71,16 +73,17 @@ public class UnitTestUtil {
                                         long tabletId, long backendId, long version) {
         // replica
         long replicaId = 0;
-        Replica replica1 = new Replica(replicaId, backendId, ReplicaState.NORMAL, version, 0);
-        Replica replica2 = new Replica(replicaId + 1, backendId + 1, ReplicaState.NORMAL, version, 0);
-        Replica replica3 = new Replica(replicaId + 2, backendId + 2, ReplicaState.NORMAL, version, 0);
+        Replica replica1 = new LocalReplica(replicaId, backendId, ReplicaState.NORMAL, version, 0);
+        Replica replica2 = new LocalReplica(replicaId + 1, backendId + 1, ReplicaState.NORMAL, version, 0);
+        Replica replica3 = new LocalReplica(replicaId + 2, backendId + 2, ReplicaState.NORMAL, version, 0);
 
         // tablet
-        Tablet tablet = new Tablet(tabletId);
+        Tablet tablet = new LocalTablet(tabletId);
 
         // index
         MaterializedIndex index = new MaterializedIndex(indexId, IndexState.NORMAL);
-        TabletMeta tabletMeta = new TabletMeta(db.getId(), tableId, partitionId, indexId, 0, TStorageMedium.HDD);
+        TabletMeta tabletMeta = new TabletMeta(db.getId(), tableId, partitionId, indexId, 0, TStorageMedium.HDD,
+                false /* isRowBinlog */);
         index.addTablet(tablet, tabletMeta);
 
         tablet.addReplica(replica1);
@@ -150,7 +153,7 @@ public class UnitTestUtil {
             method = c.getDeclaredMethod(methodName, params);
             method.setAccessible(true);
         } catch (NoSuchMethodException e) {
-            Assert.fail(e.getMessage());
+            Assertions.fail(e.getMessage());
         }
         return method;
     }

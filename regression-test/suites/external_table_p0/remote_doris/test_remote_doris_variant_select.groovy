@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("test_remote_doris_variant_select", "p0,external,doris,external_docker,external_docker_doris") {
+suite("test_remote_doris_variant_select", "p0,external") {
     String remote_doris_host = context.config.otherConfigs.get("extArrowFlightSqlHost")
     String remote_doris_arrow_port = context.config.otherConfigs.get("extArrowFlightSqlPort")
     String remote_doris_http_port = context.config.otherConfigs.get("extArrowFlightHttpPort")
@@ -111,8 +111,9 @@ suite("test_remote_doris_variant_select", "p0,external,doris,external_docker,ext
         sql """
             select * from `${catalog_arrow_name}`.`${db_name}`.`test_remote_doris_variant_select_t` order by id
         """
-        // check exception message contains
-        exception "[NOT_IMPLEMENTED_ERROR]read_column_from_arrow with type variant. cur path: /dummyPath"
+        // Keep the concatenation inside one DSL argument; a leading '+' starts a unary expression.
+        exception("External Variant is supported only for Parquet files in FileScannerV2; "
+                + "file format ARROW is not supported")
     }
 
     qt_sql """

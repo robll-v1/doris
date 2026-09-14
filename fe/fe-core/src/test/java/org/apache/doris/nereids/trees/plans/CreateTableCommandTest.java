@@ -18,9 +18,9 @@
 package org.apache.doris.nereids.trees.plans;
 
 import org.apache.doris.analysis.Expr;
+import org.apache.doris.analysis.ExprToExprNameVisitor;
 import org.apache.doris.analysis.FunctionCallExpr;
 import org.apache.doris.analysis.PartitionDesc;
-import org.apache.doris.analysis.SinglePartitionDesc;
 import org.apache.doris.analysis.SlotRef;
 import org.apache.doris.analysis.StringLiteral;
 import org.apache.doris.catalog.AggregateType;
@@ -30,23 +30,16 @@ import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.ReplicaAllocation;
 import org.apache.doris.catalog.ScalarType;
-import org.apache.doris.catalog.TabletMeta;
 import org.apache.doris.catalog.Type;
+import org.apache.doris.common.Config;
 import org.apache.doris.common.ConfigBase;
 import org.apache.doris.common.ConfigException;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.exceptions.ParseException;
 import org.apache.doris.nereids.parser.NereidsParser;
-import org.apache.doris.nereids.trees.plans.commands.CreateMTMVCommand;
 import org.apache.doris.nereids.trees.plans.commands.CreateTableCommand;
-import org.apache.doris.nereids.trees.plans.commands.info.CreateMTMVInfo;
 import org.apache.doris.nereids.trees.plans.commands.info.CreateTableInfo;
-import org.apache.doris.nereids.trees.plans.commands.info.FixedRangePartition;
-import org.apache.doris.nereids.trees.plans.commands.info.InPartition;
-import org.apache.doris.nereids.trees.plans.commands.info.LessThanPartition;
-import org.apache.doris.nereids.trees.plans.commands.info.PartitionDefinition;
-import org.apache.doris.nereids.trees.plans.commands.info.PartitionTableInfo;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 import org.apache.doris.utframe.TestWithFeService;
 
@@ -54,7 +47,6 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
 
-import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
@@ -89,8 +81,6 @@ public class CreateTableCommandTest extends TestWithFeService {
                 + "properties('replication_num' = '1','colocate_with'='test'); ";
         createTable(sql);
         Set<Long> tabletIdSetAfterCreateFirstTable = env.getTabletInvertedIndex().getReplicaMetaTable().rowKeySet();
-        Set<TabletMeta> tabletMetaSetBeforeCreateFirstTable =
-                new HashSet<>(env.getTabletInvertedIndex().getTabletMetaTable().values());
         Set<Long> colocateTableIdBeforeCreateFirstTable = env.getColocateTableIndex().getTable2Group().keySet();
         Assertions.assertTrue(colocateTableIdBeforeCreateFirstTable.size() > 0);
         Assertions.assertTrue(tabletIdSetAfterCreateFirstTable.size() > 0);
@@ -102,13 +92,10 @@ public class CreateTableCommandTest extends TestWithFeService {
         Set<Long> tabletIdSetAfterDuplicateCreateTable2 = env.getTabletInvertedIndex().getBackingReplicaMetaTable()
                 .columnKeySet();
         Set<Long> tabletIdSetAfterDuplicateCreateTable3 = env.getTabletInvertedIndex().getTabletMetaMap().keySet();
-        Set<TabletMeta> tabletIdSetAfterDuplicateCreateTable4 =
-                new HashSet<>(env.getTabletInvertedIndex().getTabletMetaTable().values());
 
         Assertions.assertEquals(tabletIdSetAfterCreateFirstTable, tabletIdSetAfterDuplicateCreateTable1);
         Assertions.assertEquals(tabletIdSetAfterCreateFirstTable, tabletIdSetAfterDuplicateCreateTable2);
         Assertions.assertEquals(tabletIdSetAfterCreateFirstTable, tabletIdSetAfterDuplicateCreateTable3);
-        Assertions.assertEquals(tabletMetaSetBeforeCreateFirstTable, tabletIdSetAfterDuplicateCreateTable4);
 
         // check whether table id is cleared from colocate group after duplicate create table
         Set<Long> colocateTableIdAfterCreateFirstTable = env.getColocateTableIndex().getTable2Group().keySet();
@@ -246,6 +233,27 @@ public class CreateTableCommandTest extends TestWithFeService {
         Assertions.assertSame(tbl13.getColumn(Column.SEQUENCE_COL).getAggregationType(), AggregateType.NONE);
         Assertions.assertSame(tbl13.getColumn(Column.SEQUENCE_COL).getType(), Type.INT);
         Assertions.assertEquals(tbl13.getSequenceMapCol(), "v1");
+    }
+
+    @Test
+    public void testPartitionInvertedIndexStorageFormatRejectedInLocalMode() {
+        String originDeployMode = Config.deploy_mode;
+        String originCloudUniqueId = Config.cloud_unique_id;
+        try {
+            Config.deploy_mode = "local";
+            Config.cloud_unique_id = "";
+            AnalysisException exception = Assertions.assertThrows(AnalysisException.class,
+                    () -> createTable("create table test.partition_inverted_index_storage_format_local\n"
+                            + "(k1 int, v1 varchar(10))\n"
+                            + "duplicate key(k1)\n"
+                            + "distributed by hash(k1) buckets 1\n"
+                            + "properties('replication_num' = '1', "
+                            + "'partition.inverted_index_storage_format' = 'SNII')"));
+            Assertions.assertTrue(exception.getMessage().contains("only supported in cloud mode"));
+        } finally {
+            Config.deploy_mode = originDeployMode;
+            Config.cloud_unique_id = originCloudUniqueId;
+        }
     }
 
     @Test
@@ -695,6 +703,30 @@ public class CreateTableCommandTest extends TestWithFeService {
     }
 
     @Test
+    public void testCreateTableWithComplexMapKey() {
+        // MAP<ARRAY<INT>, INT> should be rejected - array key
+        checkThrow(AnalysisException.class, "MAP key type must be a primitive type",
+                () -> createTable("create table test.test_map_array_key(k1 INT, k2 Map<Array<int>, int>) "
+                        + "duplicate key (k1) distributed by hash(k1) buckets 1 "
+                        + "properties('replication_num' = '1');"));
+        // MAP<MAP<INT, INT>, INT> should be rejected - map key
+        checkThrow(AnalysisException.class, "MAP key type must be a primitive type",
+                () -> createTable("create table test.test_map_map_key(k1 INT, k2 Map<Map<int,int>, int>) "
+                        + "duplicate key (k1) distributed by hash(k1) buckets 1 "
+                        + "properties('replication_num' = '1');"));
+        // MAP<STRUCT<f1:INT>, INT> should be rejected - struct key
+        checkThrow(AnalysisException.class, "MAP key type must be a primitive type",
+                () -> createTable("create table test.test_map_struct_key(k1 INT, k2 Map<Struct<f1:int>, int>) "
+                        + "duplicate key (k1) distributed by hash(k1) buckets 1 "
+                        + "properties('replication_num' = '1');"));
+        // MAP<STRING, ARRAY<INT>> should still be accepted - complex value type is OK
+        Assertions.assertDoesNotThrow(
+                () -> createTable("create table test.test_map_complex_value(k1 INT, k2 Map<String, Array<int>>) "
+                        + "duplicate key (k1) distributed by hash(k1) buckets 1 "
+                        + "properties('replication_num' = '1');"));
+    }
+
+    @Test
     public void testCreateTableWithStructType() {
         Assertions.assertDoesNotThrow(
                 () -> createTable("create table test.test_struct(k1 INT, k2 Struct<f1:int, f2:VARCHAR(20)>) duplicate key (k1) "
@@ -740,101 +772,87 @@ public class CreateTableCommandTest extends TestWithFeService {
                     e.getMessage());
         }
 
-        try {
-            getCreateTableStmt("create table tb1 (id int not null, id2 int not null, id3 int not null) "
-                    + "ENGINE=iceberg partition by (id, func1(id2, 1), func(3,id1), id3) () "
-                    + "distributed by hash (id) properties (\"a\"=\"b\")");
-        } catch (Exception e) {
-            Assertions.assertEquals(
-                    "Iceberg doesn't support 'DISTRIBUTE BY', "
-                            + "and you can use 'bucket(num, column)' in 'PARTITIONED BY'.",
-                    e.getMessage());
-        }
+        // NOTE: the iceberg DISTRIBUTE BY rejection moved off fe-core into IcebergConnectorMetadata.createTable
+        // (SPI cutover); it is covered by fe-connector-iceberg IcebergCreateTableValidationTest.
 
-        par = getCreateTableStmt("create table tb1 (id int not null, id2 int not null, id3 int not null) "
-                + "ENGINE=iceberg partition by (id, func1(id2, 1), func(3,id1), id3) () properties (\"a\"=\"b\")");
+        // Writing ENGINE=iceberg while sitting in the internal catalog used to be how a test reached the
+        // external analysis arm: the nine-name whitelist accepted the name wherever it was written, and the
+        // statement only failed at execution. The target catalog now judges the name, so that shortcut is a
+        // rejection -- assert it, and exercise the external partition conversion where it actually lives.
+        AnalysisException wrongTarget = Assertions.assertThrows(AnalysisException.class,
+                () -> getCreateTableStmt("create table tb1 (id int) ENGINE=iceberg properties (\"a\"=\"b\")"));
+        Assertions.assertEquals("Engine 'iceberg' does not match catalog 'internal'.", wrongTarget.getMessage());
+
+        par = externalPartitionDesc("create table tb1 (id int not null, id2 int not null, id3 int not null) "
+                + "partition by (id, func1(id2, 1), func(3,id1), id3) () properties (\"a\"=\"b\")");
         Assertions.assertEquals(
                 "PARTITION BY LIST(`id`, func1(`id2`, '1'), func('3', `id1`), `id3`)\n" + "(\n" + "\n" + ")",
                 par.toSql());
 
-        try {
-            getCreateTableStmt(
-                    "create table tb1 (id int) "
-                    + "engine = iceberg rollup (ab (cd)) properties (\"a\"=\"b\")");
-        } catch (Exception e) {
-            Assertions.assertEquals(
-                    "iceberg catalog doesn't support rollup tables.",
-                     e.getMessage());
-        }
-
-        try {
-            getCreateTableStmt("create table tb1 (id int) engine = hive rollup (ab (cd)) properties (\"a\"=\"b\")");
-        } catch (Exception e) {
-            Assertions.assertEquals(
-                    "hive catalog doesn't support rollup tables.",
-                    e.getMessage());
-        }
-
         // test with empty partitions
-        LogicalPlan plan = new NereidsParser().parseSingle(
-                "create table tb1 (id int) engine = iceberg properties (\"a\"=\"b\")");
-        Assertions.assertTrue(plan instanceof CreateTableCommand);
-        CreateTableInfo createTableInfo = ((CreateTableCommand) plan).getCreateTableInfo();
-        createTableInfo.validate(connectContext);
-        Assertions.assertNull(createTableInfo.getPartitionDesc());
+        Assertions.assertNull(
+                externalPartitionDesc("create table tb1 (id int) properties (\"a\"=\"b\")"),
+                "no partition clause must convert to no partition descriptor");
 
         // test with multi partitions
-        LogicalPlan plan2 = new NereidsParser().parseSingle(
-                "create table tb1 (id int) engine = iceberg "
+        PartitionDesc partitionDesc2 = externalPartitionDesc("create table tb1 (id int) "
                     + "partition by (val, bucket(2, id), par, day(ts), efg(a,b,c)) () properties (\"a\"=\"b\")");
-        Assertions.assertTrue(plan2 instanceof CreateTableCommand);
-        CreateTableInfo createTableInfo2 = ((CreateTableCommand) plan2).getCreateTableInfo();
-        createTableInfo2.validate(connectContext);
-        PartitionDesc partitionDesc2 = createTableInfo2.getPartitionDesc();
         List<Expr> partitionFields2 = partitionDesc2.getPartitionExprs();
         Assertions.assertEquals(5, partitionFields2.size());
 
         Expr expr0 = partitionFields2.get(0);
         Assertions.assertInstanceOf(SlotRef.class, expr0);
-        Assertions.assertEquals("val", expr0.getExprName());
+        Assertions.assertEquals("val", expr0.accept(ExprToExprNameVisitor.INSTANCE, null));
 
         Expr expr1 = partitionFields2.get(1);
         Assertions.assertInstanceOf(FunctionCallExpr.class, expr1);
         List<Expr> params1 = ((FunctionCallExpr) expr1).getParams().exprs();
-        Assertions.assertEquals("bucket", expr1.getExprName());
+        Assertions.assertEquals("bucket", expr1.accept(ExprToExprNameVisitor.INSTANCE, null));
         Assertions.assertEquals(2, params1.size());
         Assertions.assertInstanceOf(StringLiteral.class, params1.get(0));
         Assertions.assertEquals("2", params1.get(0).getStringValue());
         Assertions.assertInstanceOf(SlotRef.class, params1.get(1));
-        Assertions.assertEquals("id", params1.get(1).getExprName());
+        Assertions.assertEquals("id", params1.get(1).accept(ExprToExprNameVisitor.INSTANCE, null));
 
         Expr expr2 = partitionFields2.get(2);
         Assertions.assertInstanceOf(SlotRef.class, expr2);
-        Assertions.assertEquals("par", expr2.getExprName());
+        Assertions.assertEquals("par", expr2.accept(ExprToExprNameVisitor.INSTANCE, null));
 
         Expr expr3 = partitionFields2.get(3);
         Assertions.assertInstanceOf(FunctionCallExpr.class, expr3);
         List<Expr> params3 = ((FunctionCallExpr) expr3).getParams().exprs();
-        Assertions.assertEquals("day", expr3.getExprName());
+        Assertions.assertEquals("day", expr3.accept(ExprToExprNameVisitor.INSTANCE, null));
         Assertions.assertEquals(1, params3.size());
         Assertions.assertInstanceOf(SlotRef.class, params3.get(0));
-        Assertions.assertEquals("ts", params3.get(0).getExprName());
+        Assertions.assertEquals("ts", params3.get(0).accept(ExprToExprNameVisitor.INSTANCE, null));
 
         Expr expr4 = partitionFields2.get(4);
         Assertions.assertInstanceOf(FunctionCallExpr.class, expr4);
         List<Expr> params4 = ((FunctionCallExpr) expr4).getParams().exprs();
-        Assertions.assertEquals("efg", expr4.getExprName());
+        Assertions.assertEquals("efg", expr4.accept(ExprToExprNameVisitor.INSTANCE, null));
         Assertions.assertEquals(3, params4.size());
         Assertions.assertInstanceOf(SlotRef.class, params4.get(0));
-        Assertions.assertEquals("a", params4.get(0).getExprName());
+        Assertions.assertEquals("a", params4.get(0).accept(ExprToExprNameVisitor.INSTANCE, null));
         Assertions.assertInstanceOf(SlotRef.class, params4.get(1));
-        Assertions.assertEquals("b", params4.get(1).getExprName());
+        Assertions.assertEquals("b", params4.get(1).accept(ExprToExprNameVisitor.INSTANCE, null));
         Assertions.assertInstanceOf(SlotRef.class, params4.get(2));
-        Assertions.assertEquals("c", params4.get(2).getExprName());
+        Assertions.assertEquals("c", params4.get(2).accept(ExprToExprNameVisitor.INSTANCE, null));
 
         Assertions.assertEquals(
                 "PARTITION BY LIST(`val`, bucket('2', `id`), `par`, day(`ts`), efg(`a`, `b`, `c`))\n(\n\n)",
                 partitionDesc2.toSql());
+    }
+
+    /**
+     * The partition descriptor an EXTERNAL target produces. Exercised directly rather than through a
+     * CREATE TABLE aimed at the internal catalog: {@code isExternal} is now derived from the target catalog,
+     * so an engine name can no longer stand in for one.
+     */
+    private PartitionDesc externalPartitionDesc(String sql) {
+        LogicalPlan plan = new NereidsParser().parseSingle(sql);
+        Assertions.assertTrue(plan instanceof CreateTableCommand);
+        CreateTableInfo info = ((CreateTableCommand) plan).getCreateTableInfo();
+        return info.getPartitionTableInfo().convertToPartitionDesc(true);
     }
 
     private PartitionDesc getCreateTableStmt(String sql) {
@@ -845,282 +863,72 @@ public class CreateTableCommandTest extends TestWithFeService {
         return createTableInfo.getPartitionDesc();
     }
 
-    @Test
-    public void testPartitionCheckForHive() {
-        try {
-            getCreateTableStmt("CREATE TABLE `tb11`(\n"
-                    + "    `par1` int\n"
-                    + ") ENGINE = hive PARTITION BY LIST (\n"
-                    + "    par1\n"
-                    + ")();");
-            Assertions.assertTrue(false);
-        } catch (Exception e) {
-            Assertions.assertEquals("Cannot set all columns as partitioning columns.", e.getMessage());
-        }
-        try {
-            getCreateTableStmt("CREATE TABLE `tb11`(\n"
-                    + "    `par1` int,\n"
-                    + "    `c1` bigint\n"
-                    + ") ENGINE = hive PARTITION BY LIST (\n"
-                    + "    par1\n"
-                    + ")();");
-            Assertions.assertTrue(false);
-        } catch (Exception e) {
-            Assertions.assertEquals(
-                    "The partition field must be at the end of the schema.",
-                    e.getMessage());
-        }
-        try {
-            getCreateTableStmt("CREATE TABLE `tb11`(\n"
-                    + "    `c1` bigint,\n"
-                    + "    `par2` int,\n"
-                    + "    `par1` int\n"
-                    + ") ENGINE = hive PARTITION BY LIST (\n"
-                    + "    par1, par2\n"
-                    + ")();");
-            Assertions.assertTrue(false);
-        } catch (Exception e) {
-            Assertions.assertEquals(
-                    "The order of partition fields in the schema "
-                            + "must be consistent with the order defined in `PARTITIONED BY LIST()`",
-                    e.getMessage());
-        }
-        try {
-            getCreateTableStmt("CREATE TABLE `tb11`(\n"
-                    + "    `c1` bigint,\n"
-                    + "    `par2` int\n"
-                    + ") ENGINE = hive PARTITION BY LIST (\n"
-                    + "    par1, par2, par3 ,par4\n"
-                    + ")();");
-            Assertions.assertTrue(false);
-        } catch (Exception e) {
-            Assertions.assertEquals("partition key par1 is not exists", e.getMessage());
-        }
+    // NOTE: testPartitionCheckForHive removed. The hive external partition-column rules (not-all-columns,
+    // partition-fields-at-end, order-consistent, partition-key-exists, float/complex/nullable) moved off fe-core
+    // PartitionTableInfo.validatePartitionInfo into HiveConnectorMetadata.createTable (SPI cutover), and are now
+    // covered by fe-connector-hive HiveCreateTableValidationTest.
 
-        try {
-            getCreateTableStmt("CREATE TABLE `tb11`(\n"
-                    + "    `c1` bigint,\n"
-                    + "    `par1` int,\n"
-                    + "    `par2` int,\n"
-                    + "    `par3` int\n"
-                    + ") ENGINE = hive PARTITION BY LIST (\n"
-                    + "    par1, par2\n"
-                    + ")();");
-            Assertions.assertTrue(false);
-        } catch (Exception e) {
-            Assertions.assertEquals("The partition field must be at the end of the schema.", e.getMessage());
-        }
+    @Test
+    public void testRejectMaxValueInListPartition() {
+        // MAXVALUE can only be used in RANGE partition's VALUES LESS THAN, it is not a
+        // concrete LIST partition value, so creating a LIST partition with it must fail.
+        String invalidSql = "create table test.tbl_list_maxvalue ("
+                + "k int not null, v int) "
+                + "duplicate key(k) "
+                + "partition by list(k) ("
+                + "  partition p1 values in (('1')),"
+                + "  partition p2 values in ((MAXVALUE))"
+                + ") "
+                + "distributed by hash(k) buckets 1 "
+                + "properties('replication_num' = '1')";
+        AnalysisException ex = Assertions.assertThrows(
+                AnalysisException.class, () -> getCreateTableStmt(invalidSql));
+        Assertions.assertTrue(ex.getMessage().contains("MAXVALUE is not allowed in LIST partition"));
+        Assertions.assertTrue(ex.getMessage().contains("p2"));
+
+        // RANGE partition's VALUES LESS THAN (MAXVALUE) stays allowed.
+        String validSql = "create table test.tbl_range_maxvalue ("
+                + "k int not null, v int) "
+                + "duplicate key(k) "
+                + "partition by range(k) ("
+                + "  partition p1 values less than ('10'),"
+                + "  partition p2 values less than (MAXVALUE)"
+                + ") "
+                + "distributed by hash(k) buckets 1 "
+                + "properties('replication_num' = '1')";
+        Assertions.assertDoesNotThrow(() -> getCreateTableStmt(validSql));
     }
 
     @Test
-    public void testConvertToPartitionTableInfo() throws Exception {
-        testUnpartitionConvertToPartitionTableInfo();
-        testRangePartitionConvertToPartitionTableInfo();
-        testInPartitionConvertToPartitionTableInfo();
-        testLessThanPartitionConvertToPartitionTableInfo();
-    }
-
-    private void testUnpartitionConvertToPartitionTableInfo() throws Exception {
-        String partitionTable = "CREATE TABLE aa1 (\n"
-                + " `user_id` LARGEINT NOT NULL COMMENT '\\\"用户id\\\"',\n"
-                + " `date` DATE NOT NULL COMMENT '\\\"数据灌入日期时间\\\"',\n"
-                + " `num` SMALLINT NOT NULL COMMENT '\\\"数量\\\"'\n"
-                + " ) ENGINE=OLAP\n"
-                + " DUPLICATE KEY(`user_id`, `date`, `num`)\n"
-                + " COMMENT 'OLAP'\n"
-                + " PARTITION BY RANGE(`date`)\n"
-                + " (\n"
-                + " PARTITION `p201701` VALUES [(\"2017-01-01\"),  (\"2017-02-01\")),\n"
-                + " PARTITION `p201702` VALUES [(\"2017-02-01\"), (\"2017-03-01\")),\n"
-                + " PARTITION `p201703` VALUES [(\"2017-03-01\"), (\"2017-04-01\"))\n"
-                + " )\n"
-                + " DISTRIBUTED BY HASH(`user_id`) BUCKETS 2\n"
-                + " PROPERTIES ('replication_num' = '1') ;\n";
-        createTable(partitionTable);
-
-        String mv = "CREATE MATERIALIZED VIEW mtmv5\n"
-                + " BUILD DEFERRED REFRESH AUTO ON MANUAL\n"
-                + " DISTRIBUTED BY RANDOM BUCKETS 2\n"
-                + " PROPERTIES ('replication_num' = '1')\n"
-                + " AS\n"
-                + " SELECT * FROM aa1;";
-
-        CreateMTMVInfo createMTMVInfo = getPartitionTableInfo(mv);
-        Assertions.assertEquals(PartitionTableInfo.EMPTY, createMTMVInfo.getPartitionTableInfo());
-    }
-
-    private void testRangePartitionConvertToPartitionTableInfo() throws Exception {
-        String fixedRangePartitionTable = "CREATE TABLE mm1 (\n"
-                + " `user_id` LARGEINT NOT NULL COMMENT '\\\"用户id\\\"',\n"
-                + " `date` DATE NOT NULL COMMENT '\\\"数据灌入日期时间\\\"',\n"
-                + " `num` SMALLINT NOT NULL COMMENT '\\\"数量\\\"'\n"
-                + " ) ENGINE=OLAP\n"
-                + " DUPLICATE KEY(`user_id`, `date`, `num`)\n"
-                + " COMMENT 'OLAP'\n"
-                + " PARTITION BY RANGE(`date`)\n"
-                + " (\n"
-                + " PARTITION `p201701` VALUES [(\"2017-01-01\"),  (\"2017-02-01\")),\n"
-                + " PARTITION `p201702` VALUES [(\"2017-02-01\"), (\"2017-03-01\")),\n"
-                + " PARTITION `p201703` VALUES [(\"2017-03-01\"), (\"2017-04-01\"))\n"
-                + " )\n"
-                + " DISTRIBUTED BY HASH(`user_id`) BUCKETS 2\n"
-                + " PROPERTIES ('replication_num' = '1') ;\n";
-
-        String mv = "CREATE MATERIALIZED VIEW mtmv1\n"
-                + " BUILD DEFERRED REFRESH AUTO ON MANUAL\n"
-                + " partition by(`date`)\n"
-                + " DISTRIBUTED BY RANDOM BUCKETS 2\n"
-                + " PROPERTIES ('replication_num' = '1')\n"
-                + " AS\n"
-                + " SELECT * FROM mm1;";
-
-        check(fixedRangePartitionTable, mv);
-    }
-
-    private void testLessThanPartitionConvertToPartitionTableInfo() throws Exception {
-        String lessThanPartitionTable = "CREATE TABLE te2 (\n"
-                + " `user_id` LARGEINT NOT NULL COMMENT '\\\"用户id\\\"',\n"
-                + " `date` DATE NOT NULL COMMENT '\\\"数据灌入日期时间\\\"',\n"
-                + " `num` SMALLINT NOT NULL COMMENT '\\\"数量\\\"'\n"
-                + " ) ENGINE=OLAP\n"
-                + " DUPLICATE KEY(`user_id`, `date`, `num`)\n"
-                + " COMMENT 'OLAP'\n"
-                + " PARTITION BY RANGE(`date`)\n"
-                + "(\n"
-                + " PARTITION `p201701` VALUES LESS THAN (\"2017-02-01\"),\n"
-                + " PARTITION `p201702` VALUES LESS THAN (\"2017-03-01\"),\n"
-                + " PARTITION `p201703` VALUES LESS THAN (\"2017-04-01\"),\n"
-                + " PARTITION `p2018` VALUES [(\"2018-01-01\"), (\"2019-01-01\")),\n"
-                + " PARTITION `other` VALUES LESS THAN (MAXVALUE)\n"
-                + ")\n"
-                + " DISTRIBUTED BY HASH(`user_id`) BUCKETS 2\n"
-                + " PROPERTIES ('replication_num' = '1') ;";
-
-        String mv = "CREATE MATERIALIZED VIEW mtmv2\n"
-                + " BUILD DEFERRED REFRESH AUTO ON MANUAL\n"
-                + " partition by(`date`)\n"
-                + " DISTRIBUTED BY RANDOM BUCKETS 2\n"
-                + " PROPERTIES ('replication_num' = '1')\n"
-                + " AS\n"
-                + " SELECT * FROM te2;";
-
-        check(lessThanPartitionTable, mv);
-    }
-
-    private void testInPartitionConvertToPartitionTableInfo() throws Exception {
-        String inPartitionTable = "CREATE TABLE cc1 (\n"
-                + "`user_id` LARGEINT NOT NULL COMMENT '\\\"用户id\\\"',\n"
-                + "`date` DATE NOT NULL COMMENT '\\\"数据灌入日期时间\\\"',\n"
-                + "`num` SMALLINT NOT NULL COMMENT '\\\"数量\\\"'\n"
-                + ") ENGINE=OLAP\n"
-                + "DUPLICATE KEY(`user_id`, `date`, `num`)\n"
-                + "COMMENT 'OLAP'\n"
-                + "PARTITION BY LIST(`date`,`num`)\n"
-                + "(\n"
-                + " PARTITION p201701_1000 VALUES IN (('2017-01-01',1), ('2017-01-01',2)),\n"
-                + " PARTITION p201702_2000 VALUES IN (('2017-02-01',3), ('2017-02-01',4))\n"
-                + " )\n"
-                + " DISTRIBUTED BY HASH(`user_id`) BUCKETS 2\n"
-                + " PROPERTIES ('replication_num' = '1') ;";
-
-        String mv = "CREATE MATERIALIZED VIEW mtmv\n"
-                + "BUILD DEFERRED REFRESH AUTO ON MANUAL\n"
-                + "partition by(`date`)\n"
-                + "DISTRIBUTED BY RANDOM BUCKETS 2\n"
-                + "PROPERTIES ('replication_num' = '1')\n"
-                + "AS\n"
-                + "SELECT * FROM cc1;";
-
-        check(inPartitionTable, mv);
-    }
-
-    private void check(String sql, String mv) throws Exception {
-        createTable(sql);
-
-        CreateMTMVInfo createMTMVInfo = getPartitionTableInfo(mv);
-        PartitionTableInfo partitionTableInfo = createMTMVInfo.getPartitionTableInfo();
-        PartitionDesc partitionDesc = createMTMVInfo.getPartitionDesc();
-
-        List<PartitionDefinition> partitionDefs = partitionTableInfo.getPartitionDefs();
-        List<SinglePartitionDesc> singlePartitionDescs = partitionDesc.getSinglePartitionDescs();
-
-        assertPartitionInfo(partitionDefs, singlePartitionDescs);
-    }
-
-    private void assertPartitionInfo(List<PartitionDefinition> partitionDefs, List<SinglePartitionDesc> singlePartitionDescs) {
-        Assertions.assertEquals(singlePartitionDescs.size(), partitionDefs.size());
-
-        for (int i = 0; i < singlePartitionDescs.size(); i++) {
-            PartitionDefinition partitionDefinition = partitionDefs.get(i);
-            SinglePartitionDesc singlePartitionDesc = singlePartitionDescs.get(i);
-
-            if (partitionDefinition instanceof InPartition) {
-                InPartition inPartition = (InPartition) partitionDefinition;
-
-                Assertions.assertEquals(singlePartitionDesc.getPartitionName(), partitionDefinition.getPartitionName());
-                Assertions.assertEquals(singlePartitionDesc.getPartitionKeyDesc().getPartitionType().name(), "IN");
-                Assertions.assertEquals(singlePartitionDesc.getPartitionKeyDesc().getInValues().size(), inPartition.getValues().size());
-            } else if (partitionDefinition instanceof FixedRangePartition) {
-                FixedRangePartition fixedRangePartition = (FixedRangePartition) partitionDefinition;
-
-                Assertions.assertEquals(singlePartitionDesc.getPartitionName(), partitionDefinition.getPartitionName());
-                Assertions.assertEquals(singlePartitionDesc.getPartitionKeyDesc().getPartitionType().name(), "FIXED");
-                Assertions.assertEquals(fixedRangePartition.getLowerBounds().size(), singlePartitionDesc.getPartitionKeyDesc().getLowerValues().size());
-                Assertions.assertEquals(fixedRangePartition.getUpperBounds().size(), singlePartitionDesc.getPartitionKeyDesc().getUpperValues().size());
-            } else if (partitionDefinition instanceof LessThanPartition) {
-                LessThanPartition lessThanPartition = (LessThanPartition) partitionDefinition;
-
-                Assertions.assertEquals(singlePartitionDesc.getPartitionName(), partitionDefinition.getPartitionName());
-                Assertions.assertEquals(singlePartitionDesc.getPartitionKeyDesc().getPartitionType().name(), "LESS_THAN");
-                Assertions.assertEquals(lessThanPartition.getValues().size(), singlePartitionDesc.getPartitionKeyDesc().getUpperValues().size());
-            }
-        }
-    }
-
-    private CreateMTMVInfo getPartitionTableInfo(String sql) throws Exception {
-        NereidsParser nereidsParser = new NereidsParser();
-        LogicalPlan logicalPlan = nereidsParser.parseSingle(sql);
-        Assertions.assertTrue(logicalPlan instanceof CreateMTMVCommand);
-        CreateMTMVCommand command = (CreateMTMVCommand) logicalPlan;
-        command.getCreateMTMVInfo().analyze(connectContext);
-
-        return command.getCreateMTMVInfo();
-    }
-
-    @Test
-    public void testMTMVRejectVarbinary() throws Exception {
-        String mv = "CREATE MATERIALIZED VIEW mv_vb\n"
-                + " BUILD DEFERRED REFRESH AUTO ON MANUAL\n"
-                + " DISTRIBUTED BY RANDOM BUCKETS 2\n"
-                + " PROPERTIES ('replication_num' = '1')\n"
-                + " AS SELECT X'AB' as vb;";
-
-        LogicalPlan plan = new NereidsParser().parseSingle(mv);
-        Assertions.assertTrue(plan instanceof CreateMTMVCommand);
-        CreateMTMVCommand cmd = (CreateMTMVCommand) plan;
-
-        org.apache.doris.nereids.exceptions.AnalysisException ex = Assertions.assertThrows(
-                org.apache.doris.nereids.exceptions.AnalysisException.class,
-                () -> cmd.getCreateMTMVInfo().analyze(connectContext));
-        System.out.println(ex.getMessage());
-        Assertions.assertTrue(ex.getMessage().contains("MTMV do not support varbinary type"));
-        Assertions.assertTrue(ex.getMessage().contains("vb"));
-    }
-
-    @Test
-    public void testVarBinaryModifyColumnRejected() throws Exception {
-        createTable("create table test.vb_alt (k1 int, v1 int)\n"
+    public void testVariantFieldPatternDictCompressionValidation() {
+        String invalidSql = "create table test.tbl_variant_dict_invalid\n"
+                + "(k1 int, v variant<\n"
+                + "    MATCH_NAME 'metrics.score' : int\n"
+                + "> null,\n"
+                + "INDEX idx_v (v) USING INVERTED PROPERTIES(\n"
+                + "    \"field_pattern\" = \"metrics.score\",\n"
+                + "    \"dict_compression\" = \"true\"\n"
+                + "))\n"
                 + "duplicate key(k1)\n"
                 + "distributed by hash(k1) buckets 1\n"
-                + "properties('replication_num' = '1');");
+                + "properties('replication_num' = '1', 'inverted_index_storage_format' = 'V3');";
 
-        org.apache.doris.nereids.trees.plans.logical.LogicalPlan plan =
-                new org.apache.doris.nereids.parser.NereidsParser()
-                        .parseSingle("alter table test.vb_alt modify column v1 VARBINARY");
-        Assertions.assertTrue(
-                plan instanceof org.apache.doris.nereids.trees.plans.commands.AlterTableCommand);
-        org.apache.doris.nereids.trees.plans.commands.AlterTableCommand cmd2 =
-                (org.apache.doris.nereids.trees.plans.commands.AlterTableCommand) plan;
-        Assertions.assertThrows(Throwable.class, () -> cmd2.run(connectContext, null));
+        AnalysisException ex = Assertions.assertThrows(AnalysisException.class, () -> createTable(invalidSql));
+        Assertions.assertTrue(ex.getMessage().contains("invalid INVERTED index: field pattern: metrics.score"));
+        Assertions.assertTrue(ex.getMessage().contains("dict_compression can only be set for StringType columns"));
+
+        String validSql = "create table test.tbl_variant_dict_valid\n"
+                + "(k1 int, v variant<\n"
+                + "    MATCH_NAME 'metrics.score' : string\n"
+                + "> null,\n"
+                + "INDEX idx_v (v) USING INVERTED PROPERTIES(\n"
+                + "    \"field_pattern\" = \"metrics.score\",\n"
+                + "    \"dict_compression\" = \"true\"\n"
+                + "))\n"
+                + "duplicate key(k1)\n"
+                + "distributed by hash(k1) buckets 1\n"
+                + "properties('replication_num' = '1', 'inverted_index_storage_format' = 'V3');";
+
+        Assertions.assertDoesNotThrow(() -> createTable(validSql));
     }
 }

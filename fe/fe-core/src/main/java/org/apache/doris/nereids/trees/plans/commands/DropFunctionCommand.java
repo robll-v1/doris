@@ -17,11 +17,11 @@
 
 package org.apache.doris.nereids.trees.plans.commands;
 
-import org.apache.doris.analysis.FunctionName;
 import org.apache.doris.analysis.SetType;
 import org.apache.doris.analysis.StmtType;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
+import org.apache.doris.catalog.FunctionName;
 import org.apache.doris.catalog.FunctionSearchDesc;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
@@ -40,6 +40,8 @@ import com.google.common.base.Joiner;
 import com.google.common.collect.ImmutableMap;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+
+import java.util.List;
 
 /**
  * drop a alias or user defined function
@@ -71,8 +73,10 @@ public class DropFunctionCommand extends Command implements ForwardWithSync {
         }
         argsDef.analyze();
         FunctionSearchDesc function = new FunctionSearchDesc(functionName, argsDef.getArgTypes(), argsDef.isVariadic());
+
+        List<Long> functionIds;
         if (SetType.GLOBAL.equals(setType)) {
-            Env.getCurrentEnv().getGlobalFunctionMgr().dropFunction(function, ifExists);
+            functionIds = Env.getCurrentEnv().getGlobalFunctionMgr().dropFunction(function, ifExists);
         } else {
             String dbName = functionName.getDb();
             if (dbName == null) {
@@ -83,16 +87,25 @@ public class DropFunctionCommand extends Command implements ForwardWithSync {
             if (db == null) {
                 ErrorReport.reportAnalysisException(ErrorCode.ERR_NO_DB_ERROR);
             }
-            db.dropFunction(function, ifExists);
+            functionIds = db.dropFunction(function, ifExists);
+        }
+        if (functionIds.isEmpty()) {
+            // No function generation was removed. A signature-based cleanup task could arrive
+            // after a same-signature function is created and delete the new generation's cache.
+            return;
         }
         // BE will cache classload, when drop function, BE need clear cache
         ImmutableMap<Long, Backend> backendsInfo = Env.getCurrentSystemInfo().getAllBackendsByAllCluster();
         String functionSignature = getSignatureString();
         AgentBatchTask batchTask = new AgentBatchTask();
         for (Backend backend : backendsInfo.values()) {
-            CleanUDFCacheTask cleanUDFCacheTask = new CleanUDFCacheTask(backend.getId(), functionSignature);
-            batchTask.addTask(cleanUDFCacheTask);
-            LOG.info("clean udf cache in be {}, beId {}", backend.getHost(), backend.getId());
+            for (long functionId : functionIds) {
+                CleanUDFCacheTask cleanUDFCacheTask = new CleanUDFCacheTask(
+                        backend.getId(), functionSignature, functionId);
+                batchTask.addTask(cleanUDFCacheTask);
+                LOG.info("clean udf cache in be {}, beId {}, functionId {}",
+                        backend.getHost(), backend.getId(), functionId);
+            }
         }
         AgentTaskExecutor.submit(batchTask);
     }

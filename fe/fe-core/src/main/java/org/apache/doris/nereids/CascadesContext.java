@@ -19,6 +19,7 @@ package org.apache.doris.nereids;
 
 import org.apache.doris.common.IdGenerator;
 import org.apache.doris.common.Pair;
+import org.apache.doris.mtmv.ivm.IvmRewriteResult;
 import org.apache.doris.nereids.analyzer.Scope;
 import org.apache.doris.nereids.hint.Hint;
 import org.apache.doris.nereids.jobs.Job;
@@ -37,7 +38,6 @@ import org.apache.doris.nereids.memo.Group;
 import org.apache.doris.nereids.memo.Memo;
 import org.apache.doris.nereids.processor.post.RuntimeFilterContext;
 import org.apache.doris.nereids.processor.post.TopnFilterContext;
-import org.apache.doris.nereids.processor.post.runtimefilterv2.RuntimeFilterContextV2;
 import org.apache.doris.nereids.properties.PhysicalProperties;
 import org.apache.doris.nereids.rules.RuleFactory;
 import org.apache.doris.nereids.rules.RuleSet;
@@ -56,9 +56,9 @@ import org.apache.doris.planner.RuntimeFilterId;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.OriginStatement;
 import org.apache.doris.qe.SessionVariable;
-import org.apache.doris.statistics.ColumnStatistic;
-import org.apache.doris.statistics.Statistics;
-import org.apache.doris.statistics.StatisticsBuilder;
+import org.apache.doris.statistics.model.ColumnStatistic;
+import org.apache.doris.statistics.model.Statistics;
+import org.apache.doris.statistics.model.StatisticsBuilder;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Maps;
@@ -91,6 +91,8 @@ public class CascadesContext implements ScheduleContext {
 
     // in analyze/rewrite stage, the plan will storage in this field
     private Plan plan;
+    // present when IVM rewrite is active; absent otherwise
+    private Optional<IvmRewriteResult> ivmRewriteResult = Optional.empty();
     private Optional<RootRewriteJobContext> currentRootRewriteJobContext;
     // in optimize stage, the plan will storage in the memo
     private Memo memo;
@@ -104,11 +106,11 @@ public class CascadesContext implements ScheduleContext {
     // subqueryExprIsAnalyzed: whether the subquery has been analyzed.
     private final Map<SubqueryExpr, Boolean> subqueryExprIsAnalyzed;
     private final RuntimeFilterContext runtimeFilterContext;
-    private final RuntimeFilterContextV2 runtimeFilterV2Context;
     private final TopnFilterContext topnFilterContext = new TopnFilterContext();
     private Optional<Scope> outerScope = Optional.empty();
 
     private boolean isRewriteRoot;
+    private boolean isMaterializedViewRewritePlanFragment;
     private volatile boolean isTimeout = false;
 
     // current process subtree, represent outer plan if empty
@@ -133,6 +135,7 @@ public class CascadesContext implements ScheduleContext {
     private final boolean isEnableExprTrace;
 
     private int groupExpressionCount = 0;
+    private Optional<CTEContext> recursiveCteContext;
 
     /**
      * Constructor of OptimizerContext.
@@ -142,7 +145,8 @@ public class CascadesContext implements ScheduleContext {
      */
     private CascadesContext(Optional<CascadesContext> parent, Optional<CTEId> currentTree,
             StatementContext statementContext, Plan plan, Memo memo,
-            CTEContext cteContext, PhysicalProperties requireProperties, boolean isLeadingDisableJoinReorder) {
+            CTEContext cteContext, PhysicalProperties requireProperties, boolean isLeadingDisableJoinReorder,
+            CTEContext recursiveCteContext) {
         this.parent = Objects.requireNonNull(parent, "parent should not null");
         this.currentTree = Objects.requireNonNull(currentTree, "currentTree should not null");
         this.statementContext = Objects.requireNonNull(statementContext, "statementContext should not null");
@@ -152,12 +156,11 @@ public class CascadesContext implements ScheduleContext {
         this.ruleSet = new RuleSet();
         this.jobPool = new JobStack();
         this.jobScheduler = new SimpleJobScheduler();
-        this.currentJobContext = new JobContext(this, requireProperties, Double.MAX_VALUE);
+        this.currentJobContext = new JobContext(this, requireProperties);
         this.subqueryExprIsAnalyzed = new HashMap<>();
         IdGenerator<RuntimeFilterId> runtimeFilterIdGen = RuntimeFilterId.createGenerator();
         this.runtimeFilterContext = new RuntimeFilterContext(getConnectContext().getSessionVariable(),
                 runtimeFilterIdGen);
-        this.runtimeFilterV2Context = new RuntimeFilterContextV2(runtimeFilterIdGen);
         this.materializationContexts = new HashMap<>();
         if (statementContext.getConnectContext() != null) {
             ConnectContext connectContext = statementContext.getConnectContext();
@@ -167,6 +170,7 @@ public class CascadesContext implements ScheduleContext {
             this.isEnableExprTrace = false;
         }
         this.isLeadingDisableJoinReorder = isLeadingDisableJoinReorder;
+        this.recursiveCteContext = Optional.ofNullable(recursiveCteContext);
     }
 
     /** init a temporary context to rewrite expression */
@@ -181,7 +185,7 @@ public class CascadesContext implements ScheduleContext {
         }
         return newContext(Optional.empty(), Optional.empty(),
                 statementContext, DUMMY_PLAN,
-                new CTEContext(), PhysicalProperties.ANY, false);
+                new CTEContext(), PhysicalProperties.ANY, false, null);
     }
 
     /**
@@ -190,24 +194,23 @@ public class CascadesContext implements ScheduleContext {
     public static CascadesContext initContext(StatementContext statementContext,
             Plan initPlan, PhysicalProperties requireProperties) {
         return newContext(Optional.empty(), Optional.empty(), statementContext,
-                initPlan, new CTEContext(), requireProperties, false);
+                initPlan, new CTEContext(), requireProperties, false, null);
     }
 
     /**
      * use for analyze cte. we must pass CteContext from outer since we need to get right scope of cte
      */
     public static CascadesContext newContextWithCteContext(CascadesContext cascadesContext,
-            Plan initPlan, CTEContext cteContext) {
+            Plan initPlan, CTEContext cteContext, CTEContext recursiveCteContext) {
         return newContext(Optional.of(cascadesContext), Optional.empty(),
                 cascadesContext.getStatementContext(), initPlan, cteContext, PhysicalProperties.ANY,
-                cascadesContext.isLeadingDisableJoinReorder
-        );
+                cascadesContext.isLeadingDisableJoinReorder, recursiveCteContext);
     }
 
     public static CascadesContext newCurrentTreeContext(CascadesContext context) {
         return CascadesContext.newContext(context.getParent(), context.getCurrentTree(), context.getStatementContext(),
                 context.getRewritePlan(), context.getCteContext(),
-                context.getCurrentJobContext().getRequiredProperties(), context.isLeadingDisableJoinReorder);
+                context.getCurrentJobContext().getRequiredProperties(), context.isLeadingDisableJoinReorder, null);
     }
 
     /**
@@ -216,14 +219,15 @@ public class CascadesContext implements ScheduleContext {
     public static CascadesContext newSubtreeContext(Optional<CTEId> subtree, CascadesContext context,
             Plan plan, PhysicalProperties requireProperties) {
         return CascadesContext.newContext(Optional.of(context), subtree, context.getStatementContext(),
-                plan, context.getCteContext(), requireProperties, context.isLeadingDisableJoinReorder);
+                plan, context.getCteContext(), requireProperties, context.isLeadingDisableJoinReorder, null);
     }
 
     private static CascadesContext newContext(Optional<CascadesContext> parent, Optional<CTEId> subtree,
             StatementContext statementContext, Plan initPlan, CTEContext cteContext,
-            PhysicalProperties requireProperties, boolean isLeadingDisableJoinReorder) {
+            PhysicalProperties requireProperties, boolean isLeadingDisableJoinReorder,
+            CTEContext recursiveCteContext) {
         return new CascadesContext(parent, subtree, statementContext, initPlan, null,
-            cteContext, requireProperties, isLeadingDisableJoinReorder);
+                cteContext, requireProperties, isLeadingDisableJoinReorder, recursiveCteContext);
     }
 
     public CascadesContext getRoot() {
@@ -250,6 +254,19 @@ public class CascadesContext implements ScheduleContext {
         return isTimeout;
     }
 
+    public Optional<CTEContext> getRecursiveCteContext() {
+        return recursiveCteContext;
+    }
+
+    public List<Slot> getRecursiveCteOutputs() {
+        return recursiveCteContext.isPresent() ? recursiveCteContext.get().getRecursiveCteOutputs()
+                : ImmutableList.of();
+    }
+
+    public boolean isAnalyzingRecursiveCteAnchorChild() {
+        return recursiveCteContext.isPresent() && recursiveCteContext.get().getRecursiveCteOutputs().isEmpty();
+    }
+
     /**
      * Init memo with plan
      */
@@ -273,7 +290,11 @@ public class CascadesContext implements ScheduleContext {
     }
 
     public TableCollectAndHookInitializer newTableCollector(boolean firstLevel) {
-        return new TableCollectAndHookInitializer(this, firstLevel);
+        return newTableCollector(firstLevel, false);
+    }
+
+    public TableCollectAndHookInitializer newTableCollector(boolean firstLevel, boolean enablePreloadRule) {
+        return new TableCollectAndHookInitializer(this, firstLevel, enablePreloadRule);
     }
 
     public Analyzer newAnalyzer() {
@@ -341,12 +362,36 @@ public class CascadesContext implements ScheduleContext {
     }
 
     public CascadesContext setJobContext(PhysicalProperties physicalProperties) {
-        this.currentJobContext = new JobContext(this, physicalProperties, Double.MAX_VALUE);
+        this.currentJobContext = new JobContext(this, physicalProperties);
         return this;
     }
 
     public Plan getRewritePlan() {
         return plan;
+    }
+
+    /**
+     * Returns the unified IVM rewrite result for the current statement.
+     */
+    public Optional<IvmRewriteResult> getIvmRewriteResult() {
+        return ivmRewriteResult;
+    }
+
+    /**
+     * Returns the unified IVM rewrite result, creating it when this statement first enters IVM rewrite.
+     */
+    public IvmRewriteResult getOrCreateIvmRewriteResult() {
+        if (!ivmRewriteResult.isPresent()) {
+            ivmRewriteResult = Optional.of(new IvmRewriteResult());
+        }
+        return ivmRewriteResult.get();
+    }
+
+    /**
+     * Sets the unified IVM rewrite result for the current statement.
+     */
+    public void setIvmRewriteResult(IvmRewriteResult ivmRewriteResult) {
+        this.ivmRewriteResult = Optional.ofNullable(ivmRewriteResult);
     }
 
     public void setRewritePlan(Plan plan) {
@@ -387,6 +432,14 @@ public class CascadesContext implements ScheduleContext {
 
     public boolean isRewriteRoot() {
         return isRewriteRoot;
+    }
+
+    public void setMaterializedViewRewritePlanFragment(boolean materializedViewRewritePlanFragment) {
+        isMaterializedViewRewritePlanFragment = materializedViewRewritePlanFragment;
+    }
+
+    public boolean isMaterializedViewRewritePlanFragment() {
+        return isMaterializedViewRewritePlanFragment;
     }
 
     public Optional<Scope> getOuterScope() {
@@ -459,6 +512,14 @@ public class CascadesContext implements ScheduleContext {
 
     public Map<RelationId, Set<Expression>> getConsumerIdToFilters() {
         return this.statementContext.getConsumerIdToFilters();
+    }
+
+    public void putConsumerIdToLimitRows(RelationId id, long rows) {
+        this.statementContext.getConsumerIdToLimitRows().merge(id, rows, Math::max);
+    }
+
+    public Map<RelationId, Long> getConsumerIdToLimitRows() {
+        return this.statementContext.getConsumerIdToLimitRows();
     }
 
     public void addCTEConsumerGroup(CTEId cteId, Group g, Multimap<Slot, Slot> producerSlotToConsumerSlot) {
@@ -592,9 +653,5 @@ public class CascadesContext implements ScheduleContext {
 
     public boolean rewritePlanContainsTypes(Class<?>... types) {
         return getRewritePlan().containsType(types);
-    }
-
-    public RuntimeFilterContextV2 getRuntimeFilterV2Context() {
-        return runtimeFilterV2Context;
     }
 }

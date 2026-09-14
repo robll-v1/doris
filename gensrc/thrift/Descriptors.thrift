@@ -64,10 +64,17 @@ struct TMetaAccessPath {
   1: required list<string> path
 }
 
+const i32 TCOLUMN_ACCESS_PATH_VERSION_LEGACY = 0
+const i32 TCOLUMN_ACCESS_PATH_VERSION_TYPED = 1
+
 struct TColumnAccessPath {
   1: required TAccessPathType type
   2: optional TDataAccessPath data_access_path
   3: optional TMetaAccessPath meta_access_path
+  // The version is absent for legacy senders. Legacy paths all have DATA type and encode
+  // KEYS/VALUES/* selectors plus NULL/OFFSET metadata in data_access_path. Starting from the
+  // typed version, type selects the authoritative payload and META may use meta_access_path.
+  4: optional i32 version
 }
 
 struct TColumn {
@@ -96,6 +103,13 @@ struct TColumn {
     23: optional bool is_on_update_current_timestamp = false
     24: optional i32 variant_max_sparse_column_statistics_size = 10000
     25: optional i32 variant_sparse_hash_shard_count
+    26: optional bool variant_enable_doc_mode // deprecated, use TColumnType.variant_enable_doc_mode
+  27: optional i64 variant_doc_materialization_min_rows
+  28: optional i32 variant_doc_hash_shard_count
+  29: optional bool variant_enable_nested_group
+  // Dynamic default expression retained separately when default_value is a schema-change
+  // backfill literal. New writes must evaluate this expression at write time.
+  30: optional string default_value_expr
 }
 
 struct TSlotDescriptor {
@@ -210,6 +224,14 @@ enum TSchemaTableType {
     SCH_LOAD_JOBS = 64;
     SCH_FILE_CACHE_INFO = 65;
     SCH_DATABASE_PROPERTIES = 66;
+    SCH_AUTHENTICATION_INTEGRATIONS = 67;
+    SCH_TABLE_STREAMS = 68;
+    SCH_TABLE_STREAM_CONSUMPTION = 69;
+    SCH_BE_COMPACTION_TASKS = 70;
+    SCH_ROLE_MAPPINGS = 71;
+    SCH_BACKEND_MS_RPC_TABLE_THROTTLERS = 72;
+    SCH_EXTENSIONS = 73;
+    SCH_TSO_STATUS = 74;
 }
 
 enum THdfsCompression {
@@ -249,6 +271,10 @@ const map<string, THdfsCompression> COMPRESSION_MAP = {
 struct TOlapTableIndexTablets {
     1: required i64 index_id
     2: required list<i64> tablets
+    // only used in adaptive random bucket mode: FE-selected bucket owner BE for this index.
+    3: optional i64 bucket_be_id
+    // only used in adaptive random bucket mode: FE-selected bucket seqs for this index.
+    4: optional list<i32> local_bucket_seqs
 }
 
 // its a closed-open range
@@ -269,10 +295,20 @@ struct TOlapTablePartition {
     9: optional bool is_mutable = true
     // only used in List Partition
     10: optional bool is_default_partition;
-    // only used in random distribution scenario to make data distributed even 
+    // only used in random distribution scenario:
+    // - legacy mode: global round-robin index / fixed bucket index
+    // - adaptive random bucket mode: FE-selected starting bucket seq for this sink
     11: optional i64 load_tablet_idx
     12: optional i32 total_replica_num
     13: optional i32 load_required_replica_num
+    // tablet_id -> list of backend_ids that have version gaps (lastFailedVersion >= 0)
+    // used by BE to exclude these backends from success counting in majority write
+    14: optional map<i64, list<i64>> tablet_version_gap_backends
+    // only used in adaptive random bucket mode: FE-selected bucket owner BE for this sink
+    15: optional i64 bucket_be_id
+    // only used in adaptive random bucket mode: FE-selected bucket seqs for this sink.
+    // When set, BE uses them directly and skips recomputing from tablet locations.
+    16: optional list<i32> local_bucket_seqs
 }
 
 struct TOlapTablePartitionParam {
@@ -298,6 +334,8 @@ struct TOlapTablePartitionParam {
     11: optional bool enable_auto_detect_overwrite
     12: optional i64 overwrite_group_id
     13: optional bool partitions_is_fake = false
+    // remote insert fe master address
+    14: optional Types.TNetworkAddress master_address
 }
 
 struct TOlapTableIndex {
@@ -317,6 +355,7 @@ struct TOlapTableIndexSchema {
     4: optional list<TColumn> columns_desc
     5: optional list<TOlapTableIndex> indexes_desc
     6: optional Exprs.TExpr where_clause
+    7: optional i64 row_binlog_id
 }
 
 struct TOlapTableSchemaParam {
@@ -338,11 +377,14 @@ struct TOlapTableSchemaParam {
     14: optional Types.TUniqueKeyUpdateMode unique_key_update_mode
     15: optional i32 sequence_map_col_unique_id = -1
     16: optional TPartialUpdateNewRowPolicy partial_update_new_key_policy
+    17: optional list<TOlapTableIndexSchema> row_binlog_index_schemas
 }
 
 struct TTabletLocation {
     1: required i64 tablet_id
     2: required list<i64> node_ids
+    // used to write binlog tablet by base tablet with the same bucket idx
+    3: optional i64 base_tablet_id
 }
 
 struct TOlapTableLocationParam {
@@ -439,13 +481,14 @@ struct TMCTable {
   1: optional string region // deprecated
   2: optional string project
   3: optional string table
-  4: optional string access_key
-  5: optional string secret_key
+  4: optional string access_key // deprecated
+  5: optional string secret_key // deprecated
   6: optional string public_access // deprecated
   7: optional string odps_url   // deprecated
   8: optional string tunnel_url // deprecated 
   9: optional string endpoint
   10: optional string quota
+  11: optional map<string, string> properties // contains authentication properties
 }
 
 struct TTrinoConnectorTable {

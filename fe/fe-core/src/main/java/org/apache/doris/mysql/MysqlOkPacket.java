@@ -58,11 +58,11 @@ public class MysqlOkPacket extends MysqlPacket {
             // TODO(zhaochun): STATUS_FLAGS
             // if ((STATUS_FLAGS & MysqlStatusFlag.SERVER_SESSION_STATE_CHANGED) != 0) {
             // }
-        } else {
-            if (!Strings.isNullOrEmpty(infoMessage)) {
-                // NOTE: in datasheet, use EOF string, but in the code, mysql use length encoded string
-                serializer.writeLenEncodedString(infoMessage);
-            }
+        } else if (!Strings.isNullOrEmpty(infoMessage)) {
+            serializer.writeLenEncodedString(infoMessage);
+        } else if (capability.isDeprecatedEOF()) {
+            // Connector/J parses the info field for CLIENT_DEPRECATE_EOF even when it is empty.
+            serializer.writeVInt(0);
         }
     }
 }

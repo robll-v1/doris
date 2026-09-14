@@ -26,52 +26,31 @@ import org.apache.doris.system.Backend;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import mockit.Expectations;
-import mockit.Mocked;
-import org.junit.After;
-import org.junit.Assert;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.MockedStatic;
+import org.mockito.Mockito;
 
 import java.util.Map;
 
 public class BackendProcNodeTest {
     private Backend b1;
-    @Mocked
     private Env env;
-    @Mocked
     private EditLog editLog;
+    private MockedStatic<Env> mockedEnv;
 
-    @Before
+    @BeforeEach
     public void setUp() {
-        new Expectations() {
-            {
-                editLog.logAddBackend((Backend) any);
-                minTimes = 0;
+        env = Mockito.mock(Env.class);
+        editLog = Mockito.mock(EditLog.class);
 
-                editLog.logDropBackend((Backend) any);
-                minTimes = 0;
+        Mockito.when(env.getNextId()).thenReturn(10000L);
+        Mockito.when(env.getEditLog()).thenReturn(editLog);
 
-                editLog.logBackendStateChange((Backend) any);
-                minTimes = 0;
-
-                env.getNextId();
-                minTimes = 0;
-                result = 10000L;
-
-                env.getEditLog();
-                minTimes = 0;
-                result = editLog;
-            }
-        };
-
-        new Expectations(env) {
-            {
-                Env.getCurrentEnv();
-                minTimes = 0;
-                result = env;
-            }
-        };
+        mockedEnv = Mockito.mockStatic(Env.class);
+        mockedEnv.when(Env::getCurrentEnv).thenReturn(env);
 
         b1 = new Backend(1000, "host1", 10000);
         b1.updateOnce(10001, 10003, 10005);
@@ -81,8 +60,11 @@ public class BackendProcNodeTest {
         b1.setDisks(immutableMap);
     }
 
-    @After
+    @AfterEach
     public void tearDown() {
+        if (mockedEnv != null) {
+            mockedEnv.close();
+        }
     }
 
     @Test
@@ -92,11 +74,11 @@ public class BackendProcNodeTest {
 
         // fetch result
         result = node.fetchResult();
-        Assert.assertNotNull(result);
-        Assert.assertTrue(result instanceof BaseProcResult);
+        Assertions.assertNotNull(result);
+        Assertions.assertTrue(result instanceof BaseProcResult);
 
-        Assert.assertTrue(result.getRows().size() >= 1);
-        Assert.assertEquals(Lists.newArrayList("RootPath", "DataUsedCapacity", "OtherUsedCapacity", "AvailCapacity",
+        Assertions.assertTrue(result.getRows().size() >= 1);
+        Assertions.assertEquals(Lists.newArrayList("RootPath", "DataUsedCapacity", "OtherUsedCapacity", "AvailCapacity",
                 "TotalCapacity", "TotalUsedPct", "State", "PathHash", "StorageMedium"), result.getColumnNames());
     }
 

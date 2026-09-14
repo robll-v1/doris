@@ -271,31 +271,33 @@ public class MaterializedViewUtils {
      * Extract struct info from plan, support to get struct info from logical plan or plan in group.
      * @param plan maybe remove unnecessary plan node, and the logical output maybe wrong
      * @param originalPlan original plan, the output is right
+     * @param cascadesContext the cascadesContext when extractStructInfo
+     * @param targetTableIdSet the target relation id set which used to filter struct info,
+     *                            empty means no struct info match
      */
-    public static List<StructInfo> extractStructInfo(Plan plan, Plan originalPlan, CascadesContext cascadesContext,
-            BitSet materializedViewTableSet) {
+    public static List<StructInfo> extractStructInfoFuzzy(Plan plan, Plan originalPlan,
+                                                          CascadesContext cascadesContext, BitSet targetTableIdSet) {
         // If plan belong to some group, construct it with group struct info
         if (plan.getGroupExpression().isPresent()) {
             Group ownerGroup = plan.getGroupExpression().get().getOwnerGroup();
             StructInfoMap structInfoMap = ownerGroup.getStructInfoMap();
             // Refresh struct info in current level plan from top to bottom
             SessionVariable sessionVariable = cascadesContext.getConnectContext().getSessionVariable();
-            structInfoMap.refresh(ownerGroup, cascadesContext, new BitSet(), new HashSet<>(),
-                    sessionVariable.isEnableMaterializedViewNestRewrite());
-            structInfoMap.setRefreshVersion(cascadesContext.getMemo().getRefreshVersion());
-            Set<BitSet> queryTableSets = structInfoMap.getTableMaps();
+            int memoVersion = StructInfoMap.getMemoVersion(targetTableIdSet,
+                    cascadesContext.getMemo().getRefreshVersion());
+            structInfoMap.refresh(ownerGroup, cascadesContext, targetTableIdSet, new HashSet<>(),
+                    sessionVariable.isEnableMaterializedViewNestRewrite(), memoVersion, true);
+            structInfoMap.setRefreshVersion(targetTableIdSet, cascadesContext.getMemo().getRefreshVersion());
+            Set<BitSet> queryTableIdSets = structInfoMap.getTableMaps(true);
             ImmutableList.Builder<StructInfo> structInfosBuilder = ImmutableList.builder();
-            if (!queryTableSets.isEmpty()) {
-                for (BitSet queryTableSet : queryTableSets) {
-                    BitSet queryCommonTableSet = MaterializedViewUtils.transformToCommonTableId(queryTableSet,
-                            cascadesContext.getStatementContext().getRelationIdToCommonTableIdMap());
+            if (!queryTableIdSets.isEmpty()) {
+                for (BitSet queryTableIdSet : queryTableIdSets) {
                     // compare relation id corresponding table id
-                    if (!materializedViewTableSet.isEmpty()
-                            && !containsAll(materializedViewTableSet, queryCommonTableSet)) {
+                    if (!containsAll(targetTableIdSet, queryTableIdSet)) {
                         continue;
                     }
-                    StructInfo structInfo = structInfoMap.getStructInfo(cascadesContext, queryTableSet, ownerGroup,
-                            originalPlan, sessionVariable.isEnableMaterializedViewNestRewrite());
+                    StructInfo structInfo = structInfoMap.getStructInfo(cascadesContext, queryTableIdSet, ownerGroup,
+                            originalPlan, sessionVariable.isEnableMaterializedViewNestRewrite(), true);
                     if (structInfo != null) {
                         structInfosBuilder.add(structInfo);
                     }
@@ -341,6 +343,16 @@ public class MaterializedViewUtils {
     public static Plan rewriteByRules(
             CascadesContext cascadesContext, Function<CascadesContext, Plan> planRewriter,
             Plan rewrittenPlan, Plan originPlan, boolean mvRewrite) {
+        return rewriteByRules(cascadesContext, planRewriter, rewrittenPlan, originPlan, mvRewrite, false);
+    }
+
+    /**
+     * Optimize by rules, this support optimize by custom rules by define different rewriter according to different
+     * rules, this method is only for materialized view rewrite
+     */
+    public static Plan rewriteByRules(
+            CascadesContext cascadesContext, Function<CascadesContext, Plan> planRewriter,
+            Plan rewrittenPlan, Plan originPlan, boolean mvRewrite, boolean materializedViewRewritePlanFragment) {
         if (originPlan == null || rewrittenPlan == null) {
             return null;
         }
@@ -356,6 +368,7 @@ public class MaterializedViewUtils {
         CascadesContext rewrittenPlanContext = CascadesContext.initContext(
                 cascadesContext.getStatementContext(), rewrittenPlan,
                 cascadesContext.getCurrentJobContext().getRequiredProperties());
+        rewrittenPlanContext.setMaterializedViewRewritePlanFragment(materializedViewRewritePlanFragment);
         // Tmp old disable rule variable
         Set<String> oldDisableRuleNames = rewrittenPlanContext.getStatementContext().getConnectContext()
                 .getSessionVariable()
@@ -517,9 +530,9 @@ public class MaterializedViewUtils {
      * the function would be considered as deterministic function and will not return
      * in the result expression result
      */
-    public static List<Expression> extractNondeterministicFunction(Plan plan) {
+    public static List<Expression> extractMvNondeterministicFunction(Plan plan) {
         List<Expression> nondeterministicFunctions = new ArrayList<>();
-        plan.accept(NondeterministicFunctionCollector.INSTANCE, nondeterministicFunctions);
+        plan.accept(NondeterministicFunctionCollector.MV_INSTANCE, nondeterministicFunctions);
         return nondeterministicFunctions;
     }
 
@@ -615,8 +628,15 @@ public class MaterializedViewUtils {
 
         @Override
         public Boolean visitLogicalRelation(LogicalRelation relation, Void context) {
-            if (relation instanceof LogicalFileScan && ((LogicalFileScan) relation).getTableSample().isPresent()) {
-                return true;
+            if (relation instanceof LogicalFileScan) {
+                LogicalFileScan fileScan = (LogicalFileScan) relation;
+                // Relation scan operators can select data different from the MV refresh input.
+                // Treat them as query operators until rewrite can prove equivalent semantics.
+                if (fileScan.getTableSample().isPresent()
+                        || fileScan.getScanParams().isPresent()
+                        || fileScan.getTableSnapshot().isPresent()) {
+                    return true;
+                }
             }
             if (relation instanceof LogicalOlapScan) {
                 LogicalOlapScan logicalOlapScan = (LogicalOlapScan) relation;

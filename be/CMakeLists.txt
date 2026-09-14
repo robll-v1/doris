@@ -45,11 +45,18 @@ endif ()
 
 if (CMAKE_SYSTEM_NAME MATCHES "Linux")
     set (OS_LINUX 1)
-    add_definitions(-D OS_LINUX)
+    # No space after -D: "-D OS_LINUX" becomes two argv entries in some
+    # generators, and the dangling "-D" then swallows the next flag
+    # (doris_be_test lost its -fno-access-control this way).
+    add_definitions(-DOS_LINUX)
 elseif (CMAKE_SYSTEM_NAME MATCHES "Darwin")
     set (OS_MACOSX 1)
-    add_definitions(-D OS_MACOSX)
+    add_definitions(-DOS_MACOSX)
 endif ()
+
+if (OS_MACOSX)
+    add_definitions(-DBOOST_PROCESS_POSIX_NO_SIGTIMEDWAIT -UBOOST_POSIX_HAS_SIGTIMEDWAIT)
+endif()
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set (COMPILER_GCC 1)
@@ -72,12 +79,27 @@ add_definitions(-DGLOG_CUSTOM_PREFIX_SUPPORT)
 # Options
 option(GLIBC_COMPATIBILITY "Enable compatibility with older glibc libraries." ON)
 option(USE_LIBCPP "Use libc++" OFF)
-option(USE_UNWIND "Use libunwind" ON)
 option(USE_JEMALLOC "Use jemalloc" ON)
+# Merge groups of .cpp files into jumbo translation units for much faster full
+# builds. Turn OFF for precise per-file diagnostics, per-file tooling
+# (clang-tidy/coverage), or the finest-grained incremental rebuilds.
+option(ENABLE_UNITY_BUILD "Enable CMake unity builds for BE targets" ON)
+# Normalize to a strict ON/OFF. Every pilot target sets its UNITY_BUILD property
+# unconditionally from this value: OFF must be an explicit OFF, otherwise a
+# cache that also carries CMake's own CMAKE_UNITY_BUILD=ON leaves the property
+# ON (it initializes UNITY_BUILD at add_library time) and the escape hatch does
+# nothing.
+if (ENABLE_UNITY_BUILD)
+    set(DORIS_UNITY_BUILD ON)
+else()
+    set(DORIS_UNITY_BUILD OFF)
+endif()
 if (OS_MACOSX)
     set(GLIBC_COMPATIBILITY OFF)
     set(USE_LIBCPP ON)
     set(USE_UNWIND OFF)
+else()
+    set(USE_UNWIND ON)
 endif()
 
 if (DISPLAY_BUILD_TIME)
@@ -95,6 +117,7 @@ message(STATUS "USE_LIBCPP is ${USE_LIBCPP}")
 message(STATUS "USE_JEMALLOC is ${USE_JEMALLOC}")
 message(STATUS "USE_UNWIND is ${USE_UNWIND}")
 message(STATUS "ENABLE_PCH is ${ENABLE_PCH}")
+message(STATUS "ENABLE_UNITY_BUILD is ${ENABLE_UNITY_BUILD}")
 message(STATUS "USE_AVX2 is ${USE_AVX2}")
 
 # set CMAKE_BUILD_TYPE
@@ -119,7 +142,11 @@ endif()
 
 # Set dirs
 set(BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
-set(ENV{DORIS_HOME} "${BASE_DIR}/..")
+if (DEFINED ENV{DORIS_HOME})
+    message(STATUS "DORIS_HOME is $ENV{DORIS_HOME}")
+else()
+    message(FATAL_ERROR "DORIS_HOME is not defined")
+endif()
 set(BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}")
 set(GENSRC_DIR "${BASE_DIR}/../gensrc/build/")
 set(COMMON_SRC_DIR "${BASE_DIR}/../common")
@@ -131,6 +158,32 @@ if (NOT DEFINED ENV{DORIS_THIRDPARTY})
 endif()
 set(THIRDPARTY_DIR "$ENV{DORIS_THIRDPARTY}/installed")
 message(STATUS "THIRDPARTY_DIR is ${THIRDPARTY_DIR}")
+
+# Build-hygiene gates: seconds-level, zero-build-dependency text checks that
+# keep the backend's compile-time invariants from regressing (header layering
+# rules and budgets, extern-template pairing, unity-skip coverage for
+# test-included sources). Running them at configure time makes a violation a
+# build error on every path that builds the BE -- CI, build.sh, the UT build --
+# with no separate wiring, and it fails in the first seconds instead of
+# somewhere inside a long compile. Every failure message carries the mechanism
+# and the fix path; see build-support/check-build-hygiene.sh.
+option(ENABLE_BUILD_HYGIENE "Run the build-hygiene gates at configure time" ON)
+message(STATUS "ENABLE_BUILD_HYGIENE is ${ENABLE_BUILD_HYGIENE}")
+if (ENABLE_BUILD_HYGIENE)
+    execute_process(
+        COMMAND bash "${BASE_DIR}/../build-support/check-build-hygiene.sh"
+        ERROR_VARIABLE BUILD_HYGIENE_ERRORS
+        RESULT_VARIABLE BUILD_HYGIENE_RESULT
+    )
+    if (NOT BUILD_HYGIENE_RESULT EQUAL 0)
+        message(FATAL_ERROR
+            "build-hygiene gates failed (exit ${BUILD_HYGIENE_RESULT}):\n"
+            "${BUILD_HYGIENE_ERRORS}"
+            "Fix the violation (each message ends with its fix path), or "
+            "configure with -DENABLE_BUILD_HYGIENE=OFF to bypass in an "
+            "emergency.")
+    endif()
+endif()
 
 option(MAKE_TEST "ON for make unit test or OFF for not" OFF)
 message(STATUS "make test: ${MAKE_TEST}")
@@ -145,6 +198,23 @@ message(STATUS "build task executor simulator: ${BUILD_TASK_EXECUTOR_SIMULATOR}"
 
 option(BUILD_FILE_CACHE_LRU_TOOL "ON for building file cache lru tool or OFF for not" OFF)
 message(STATUS "build file cache lru tool: ${BUILD_FILE_CACHE_LRU_TOOL}")
+
+option(ENABLE_TDE "Enable TDE feature module" OFF)
+set(TDE_MODULE_DIR "" CACHE STRING "TDE feature module directory under be/src")
+option(ENABLE_TLS "Enable TLS feature module" OFF)
+set(TLS_MODULE_DIR "" CACHE STRING "TLS feature module directory under be/src")
+option(ENABLE_VARIANT_NESTED_GROUP "Enable Variant NestedGroup feature module" OFF)
+set(VARIANT_NESTED_GROUP_MODULE_DIR "" CACHE STRING "Variant NestedGroup feature module directory under be/src")
+
+if (ENABLE_TDE AND "${TDE_MODULE_DIR}" STREQUAL "")
+    message(FATAL_ERROR "ENABLE_TDE requires TDE_MODULE_DIR")
+endif()
+if (ENABLE_TLS AND "${TLS_MODULE_DIR}" STREQUAL "")
+    message(FATAL_ERROR "ENABLE_TLS requires TLS_MODULE_DIR")
+endif()
+if (ENABLE_VARIANT_NESTED_GROUP AND "${VARIANT_NESTED_GROUP_MODULE_DIR}" STREQUAL "")
+    message(FATAL_ERROR "ENABLE_VARIANT_NESTED_GROUP requires VARIANT_NESTED_GROUP_MODULE_DIR")
+endif()
 
 set(CMAKE_SKIP_RPATH TRUE)
 set(Boost_USE_STATIC_LIBS ON)
@@ -204,9 +274,31 @@ SET(ZSTD_HOME "$ENV{DORIS_THIRDPARTY}/installed")
 SET(ZSTD_INCLUDE_DIR "$ENV{DORIS_THIRDPARTY}/installed/include/zstd")
 SET(CONTRIB_PATH "${PROJECT_SOURCE_DIR}/../contrib")
 
+set(BUILD_TESTS OFF)
+add_subdirectory(
+    ${CONTRIB_PATH}/datasketches-cpp
+    ${PROJECT_BINARY_DIR}/datasketches-cpp
+    EXCLUDE_FROM_ALL)
+target_include_directories(
+    hll SYSTEM INTERFACE $<BUILD_INTERFACE:${CONTRIB_PATH}/datasketches-cpp/hll/include>)
+target_include_directories(
+    common SYSTEM INTERFACE $<BUILD_INTERFACE:${CONTRIB_PATH}/datasketches-cpp/common/include>)
+
 # Out of source build need to set the binary dir
 add_subdirectory(${CONTRIB_PATH}/apache-orc ${PROJECT_BINARY_DIR}/apache-orc EXCLUDE_FROM_ALL)
-target_compile_options(orc PRIVATE -Wno-implicit-fallthrough -w)
+target_compile_options(orc PRIVATE -fno-omit-frame-pointer -Wno-implicit-fallthrough -w)
+foreach(orc_tool
+        orc-contents
+        orc-metadata
+        orc-statistics
+        orc-scan
+        orc-memory
+        timezone-dump
+        csv-import)
+    if (TARGET ${orc_tool})
+        target_compile_options(${orc_tool} PRIVATE -fno-omit-frame-pointer)
+    endif()
+endforeach()
 
 option(BUILD_STATIC_LIBRARIES "Build static libraries" ON)
 option(BUILD_SHARED_LIBRARIES "Build shared libraries" OFF)
@@ -222,7 +314,7 @@ set(USE_BTHREAD OFF)
 # Out of source build need to set the binary dir
 add_subdirectory(${CONTRIB_PATH}/clucene ${PROJECT_BINARY_DIR}/clucene EXCLUDE_FROM_ALL)
 
-set(clucene_options -w -Wall)
+set(clucene_options -fno-omit-frame-pointer -w -Wall)
 if (COMPILER_CLANG)
     set(clucene_options ${clucene_options} -Wno-c++11-narrowing)
 else ()
@@ -249,6 +341,26 @@ install(DIRECTORY
 install(DIRECTORY
     ${BASE_DIR}/dict/pinyin
     DESTINATION ${OUTPUT_DIR}/dict)
+
+# Japanese kuromoji dictionary. A real build always requires it the
+# binary files. However, Unit-test builds (MAKE_TEST=ON) skip it entirely as they don't
+# package for real use.
+if (NOT MAKE_TEST)
+    install(CODE "
+        foreach(_kmj_f
+                \"${BASE_DIR}/dict/kuromoji/system.bin\"
+                \"${BASE_DIR}/dict/kuromoji/matrix.bin\"
+                \"${BASE_DIR}/dict/kuromoji/chardef.bin\"
+                \"${BASE_DIR}/dict/kuromoji/unkdict.bin\")
+            if(NOT EXISTS \"\${_kmj_f}\")
+                message(FATAL_ERROR \"kuromoji dictionary file \${_kmj_f} is missing; build the 'kuromoji_dict' target (stage mecab-ipadic via thirdparty) before packaging.\")
+            endif()
+        endforeach()
+    ")
+    install(DIRECTORY
+        ${BASE_DIR}/dict/kuromoji
+        DESTINATION ${OUTPUT_DIR}/dict)
+endif()
 
 # Check if functions are supported in this platform. All flags will generated
 # in gensrc/build/common/env_config.h.
@@ -282,6 +394,10 @@ endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_C_STANDARD 17)
 
+add_compile_options(
+  "-ffile-prefix-map=$ENV{DORIS_HOME}=."
+)
+
 add_compile_options(-g
                     -gdwarf-5
                     -Wall
@@ -293,8 +409,22 @@ add_compile_options(-g
                     -fno-omit-frame-pointer
                     $<$<COMPILE_LANGUAGE:CXX>:-Wnon-virtual-dtor>)
 
+# Faster dev compiles: DORIS_DEV_DEBUG_INFO=line-tables keeps only the line
+# tables (enough for stack traces and perf) instead of full debug info; 'full'
+# asks for the default full DWARF explicitly, which is what run-be-ut.sh needs
+# to be overridable with, since UT builds default to line-tables.
+# It must be appended after the -g/-gdwarf-5 above: clang lets the last debug-info
+# flag win, and this keeps the default command line unchanged.
+if ("${DORIS_DEV_DEBUG_INFO}" STREQUAL "line-tables")
+    if (NOT COMPILER_CLANG)
+        message(FATAL_ERROR "DORIS_DEV_DEBUG_INFO=line-tables requires clang")
+    endif()
+    add_compile_options(-gline-tables-only)
+elseif (NOT "${DORIS_DEV_DEBUG_INFO}" STREQUAL "" AND NOT "${DORIS_DEV_DEBUG_INFO}" STREQUAL "full")
+    message(FATAL_ERROR "Unknown DORIS_DEV_DEBUG_INFO value: ${DORIS_DEV_DEBUG_INFO} (supported: line-tables, full)")
+endif()
+
 add_compile_options(-Wno-unused-parameter
-                    -Wno-deprecated-declarations
                     -Wno-sign-compare)
 
 if (COMPILER_GCC)
@@ -306,7 +436,8 @@ if (COMPILER_GCC)
                         -Wno-nonnull
                         -Wno-stringop-overread
                         -Wno-stringop-overflow
-                        -Wno-array-bounds)
+                        -Wno-array-bounds
+                        -Wno-maybe-uninitialized)
 endif ()
 
 if (COMPILER_CLANG)
@@ -325,10 +456,18 @@ if (COMPILER_CLANG)
                         -Wunused-template
                         -Wunused-member-function
                         -Wunused-macros
-                        -Wconversion)
+                        -Wconversion
+                        -Wthread-safety)
     add_compile_options(-Wno-gnu-statement-expression
                         -Wno-implicit-float-conversion
-                        -Wno-sign-conversion)
+                        -Wno-sign-conversion
+                        # libstdc++-15 puts `#pragma GCC unroll` on loops in its own
+                        # headers (bits/stl_algobase.h); when a sanitizer/coverage
+                        # build compiles at low optimization the unroller punts and
+                        # clang's -Wpass-failed turns that missed *hint* into an
+                        # -Werror failure. The diagnostic carries no correctness
+                        # signal, so drop it.
+                        -Wno-pass-failed)
     if (USE_LIBCPP)
         add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-stdlib=libc++>)
         add_definitions(-DUSE_LIBCPP)
@@ -383,7 +522,7 @@ if (USE_JEMALLOC)
     add_definitions(-DUSE_JEMALLOC)
 endif()
 
-# Compile with libunwind
+# libunwind symbolization uses DWARF aranges for fast address-to-line lookup.
 if (USE_UNWIND)
     add_definitions(-DUSE_UNWIND)
     if (COMPILER_CLANG)
@@ -403,7 +542,11 @@ endif()
 #   -O3: Enable all compiler optimizations
 #   -DNDEBUG: Turn off dchecks/asserts/debug only code.
 set(CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
-set(CXX_FLAGS_ASAN "-O0 -fsanitize=address -fsanitize=undefined -fno-sanitize=float-cast-overflow  -fsanitize-ignorelist=${BASE_DIR}/../conf/ubsan_ignorelist.txt -DUNDEFINED_BEHAVIOR_SANITIZER -DADDRESS_SANITIZER")
+message(STATUS "UBSAN_IGNORELIST is ${UBSAN_IGNORELIST}")
+set(CXX_FLAGS_ASAN "-O0 -fsanitize=address -fsanitize=undefined -fno-sanitize=float-cast-overflow -DUNDEFINED_BEHAVIOR_SANITIZER -DADDRESS_SANITIZER")
+if (COMPILER_CLANG)
+    set(CXX_FLAGS_ASAN "${CXX_FLAGS_ASAN} -fsanitize-ignorelist=${UBSAN_IGNORELIST}")
+endif()
 set(CXX_FLAGS_LSAN "-O0 -fsanitize=leak -DLEAK_SANITIZER")
 ## Use for BE-UT
 set(CXX_FLAGS_ASAN_UT "-O0 -fsanitize=address -DADDRESS_SANITIZER")
@@ -513,21 +656,19 @@ set(DORIS_LINK_LIBS
     ${WL_START_GROUP}
     Agent
     Common
+    Core
     Exec
     Exprs
+    Format
     IO
-    Olap
+    Storage
     Runtime
-    RuntimeFilter
     Service
     Udf
     Util
     DorisGen
-    Webserver
-    Geo
-    GeoType
-    Vec
-    Pipeline
+    Load
+    InformationSchema
     Cloud
     ${WL_END_GROUP}
     CommonCPP
@@ -572,6 +713,13 @@ endif()
 if (absl_FOUND)
     set(COMMON_THIRDPARTY
         ${COMMON_THIRDPARTY}
+        absl::cord
+        absl::cord_internal
+        absl::cordz_functions
+        absl::cordz_info
+        absl::cordz_update_scope
+        absl::cordz_update_tracker
+        absl::crc_cord_state
         absl::flags
         absl::random_random
         absl::spinlock_wait
@@ -636,6 +784,11 @@ else()
         -lresolv
         -liconv
     )
+    # On macOS arm64, large binaries (>2GB) can cause the virtual address space
+    # to overlap with the dyld shared cache region, resulting in "dyld cache not
+    # loaded: syscall to map cache into shared region failed". Use -dead_strip to
+    # remove unreachable code/data and reduce binary size.
+    add_link_options(-Wl,-dead_strip)
 endif()
 
 
@@ -656,9 +809,35 @@ endif ()
 
 # Add sanitize static link flags
 if ("${CMAKE_BUILD_TYPE}" STREQUAL "DEBUG" OR "${CMAKE_BUILD_TYPE}" STREQUAL "RELEASE")
-    set(DORIS_LINK_LIBS ${DORIS_LINK_LIBS} ${MALLOCLIB})
+    if (OS_MACOSX AND ARCH_ARM AND (MAKE_TEST OR BUILD_BENCHMARK))
+        # doris_be_test's and benchmark_test's .text exceeds arm64's +/-128MB
+        # BL reach (BE_TEST/BE_BENCHMARK macros inflate it further) and Apple's
+        # linker emits no branch islands for tcmalloc's prebuilt archive
+        # ("fixup error ... B/BL out of range"). Tests and benchmarks don't
+        # need a custom allocator; fall back to system malloc here. ASAN
+        # builds never linked ${MALLOCLIB} anyway, which is why they never
+        # hit this. gperftools_stubs.cpp supplies the few symbols still
+        # referenced unconditionally. kuromoji_build_dict is a normal-build
+        # target this branch cannot cover; it opts out per target below.
+    else()
+        set(DORIS_LINK_LIBS ${DORIS_LINK_LIBS} ${MALLOCLIB})
+    endif()
 elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "ASAN" OR "${CMAKE_BUILD_TYPE}" STREQUAL "ASAN_UT")
     set(DORIS_LINK_LIBS ${DORIS_LINK_LIBS} ${ASAN_LIBS})
+    if (OS_LINUX)
+        # The fully static link resolves __cxa_throw/__cxa_rethrow/
+        # _Unwind_RaiseException to libstdc++.a's/libgcc_eh.a's strong
+        # definitions, silently bypassing the ASAN runtime's weak interceptors,
+        # so __asan_handle_no_return() never runs when un-instrumented
+        # third-party code (libthrift, ...) throws. The unwound instrumented
+        # frames keep their stack-shadow poison and the next deep call over the
+        # same stack range aborts with the kCurrentStackFrameMagic CHECK
+        # (the thrift retry/reopen crashes; same family as google/glog#978 and
+        # google/sanitizers#1010). Redirect every reference to wrappers that
+        # restore the shadow cleanup. See be/src/common/asan_cxa_throw_wrap.cpp.
+        set(DORIS_LINK_LIBS ${DORIS_LINK_LIBS} -Wl,--wrap=__cxa_throw -Wl,--wrap=__cxa_rethrow
+            -Wl,--wrap=_Unwind_RaiseException)
+    endif()
 elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "LSAN")
     set(DORIS_LINK_LIBS ${DORIS_LINK_LIBS} ${LSAN_LIBS})
 elseif ("${CMAKE_BUILD_TYPE}" STREQUAL "UBSAN")
@@ -673,7 +852,24 @@ endif()
 # NOTE(amos): This should come before -lc -lm to interpose symbols correctly.
 if (GLIBC_COMPATIBILITY)
     add_subdirectory(${SRC_DIR}/glibc-compatibility)
-    set(DORIS_LINK_LIBS ${DORIS_LINK_LIBS} glibc-compatibility-explicit glibc-compatibility)
+    # Keep lance_c here instead of COMMON_THIRDPARTY: placing its required libm there
+    # would resolve -lm symbol before Doris compatibility is scanned, preventing
+    # the linker from selecting Doris' optimized implementations.
+    # lance_c can also introduce single-precision math references after the
+    # compatibility archive has already been scanned. As ClickHouse does for its
+    # compatibility archive, force the GLIBC_2.27 math symbols to be undefined up
+    # front so the linker extracts Doris' musl implementations instead of binding
+    # late references to the toolchain's libm.
+    set(DORIS_LINK_LIBS ${DORIS_LINK_LIBS}
+        -Wl,-u,logf
+        -Wl,-u,powf
+        -Wl,-u,expf
+        -Wl,-u,exp2f
+        -Wl,-u,log2f
+        glibc-compatibility-explicit
+        glibc-compatibility
+        -lm
+        lance_c)
 endif()
 
 if (NOT OS_MACOSX)
@@ -714,10 +910,16 @@ if (ENABLE_CLANG_COVERAGE AND ENABLE_CLANG_COVERAGE STREQUAL ON AND COMPILER_CLA
 endif ()
 
 if (MAKE_TEST)
-    add_compile_options(-fprofile-arcs -ftest-coverage -DGTEST_USE_OWN_TR1_TUPLE=0)
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fprofile-arcs -ftest-coverage")
-    if (NOT OS_MACOSX)
-        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -lgcov")
+    add_compile_options(-DGTEST_USE_OWN_TR1_TUPLE=0)
+    # Only add GCC-style coverage when using GCC compiler
+    # to avoid duplicate symbol errors (e.g., __gcov_fork, __gcov_reset)
+    # between libgcov.a and libclang_rt.profile-x86_64.a
+    if (COMPILER_GCC)
+        add_compile_options(-fprofile-arcs -ftest-coverage)
+        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fprofile-arcs -ftest-coverage")
+        if (NOT OS_MACOSX)
+            set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -lgcov")
+        endif()
     endif()
     add_definitions(-DBE_TEST)
     if (ARCH_ARM)
@@ -815,41 +1017,122 @@ function(pch_reuse target)
     endif()
 endfunction(pch_reuse target)
 
+# Every unity opt-out goes through this helper. set_source_files_properties()
+# silently ignores paths that do not exist, so a skip entry going stale after
+# a rename or move would quietly re-join its unity batch -- slower builds, or
+# new file-scope clashes, with no diagnostic anywhere. Fail the configure
+# instead. Entries under GENSRC_DIR are exempt: they are emitted by
+# add_custom_command at build time (wkt_lex.l.cpp, the generated
+# thrift/protobuf sources) and legitimately do not exist on a fresh configure.
+function(doris_skip_unity_inclusion)
+    foreach(entry IN LISTS ARGN)
+        string(FIND "${entry}" "${GENSRC_DIR}" gensrc_prefix_pos)
+        if(NOT gensrc_prefix_pos EQUAL 0 AND NOT EXISTS "${entry}")
+            message(FATAL_ERROR
+                "unity skip entry does not exist (renamed or moved?): ${entry}")
+        endif()
+    endforeach()
+    set_source_files_properties(${ARGN} PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+endfunction()
+
 
 add_subdirectory(${SRC_DIR}/agent)
 add_subdirectory(${SRC_DIR}/common)
+add_subdirectory(${SRC_DIR}/core)
 add_subdirectory(${SRC_DIR}/exec)
 add_subdirectory(${SRC_DIR}/exprs)
+add_subdirectory(${SRC_DIR}/format)
 add_subdirectory(${SRC_DIR}/gen_cpp)
-add_subdirectory(${SRC_DIR}/geo)
-add_subdirectory(${SRC_DIR}/http)
 add_subdirectory(${SRC_DIR}/io)
-add_subdirectory(${SRC_DIR}/olap/rowset/segment_v2/ann_index)
-add_subdirectory(${SRC_DIR}/olap)
+add_subdirectory(${SRC_DIR}/storage/index/ann)
+add_subdirectory(${SRC_DIR}/storage)
 add_subdirectory(${SRC_DIR}/runtime)
-add_subdirectory(${SRC_DIR}/runtime_filter)
 add_subdirectory(${SRC_DIR}/service) # this include doris_be
 add_subdirectory(${SRC_DIR}/udf)
 add_subdirectory(${SRC_DIR}/cloud)
+add_subdirectory(${SRC_DIR}/load)
+add_subdirectory(${SRC_DIR}/information_schema)
 
 option(BUILD_META_TOOL "Build meta tool" OFF)
-if (BUILD_META_TOOL)
+option(BUILD_INDEX_TOOL "Build index tool" OFF)
+if (BUILD_META_TOOL OR BUILD_INDEX_TOOL)
     add_subdirectory(${SRC_DIR}/tools)
+endif()
+
+if (NOT MAKE_TEST)
+    # Offline generator: compiles the UTF-8 mecab-ipadic source into binary files.
+    set(KUROMOJI_BUILD_DICT_SRCS ${SRC_DIR}/tools/kuromoji_build_dict.cpp)
+    set(KUROMOJI_BUILD_DICT_LINK_LIBS ${DORIS_LINK_LIBS})
+    if (OS_MACOSX AND ARCH_ARM AND MALLOCLIB STREQUAL "tcmalloc")
+        # The tool only calls the dictionary builder/parser, but they return
+        # Status, and Status reaches config.cpp (-> ExecEnv), status.cpp
+        # (-> thrift/protobuf/BackendOptions) and stack_util.cpp, so the link
+        # closure is effectively the whole BE and __TEXT exceeds arm64's
+        # +/-128MB direct-branch reach. Apple's linker lays tcmalloc's custom
+        # google_malloc/malloc_hook sections out after __text and cannot
+        # insert branch islands there ("fixup error (kind=arm64_b26) ... B/BL
+        # out of range") -- the failure doris_be_test and benchmark_test hit
+        # (see the MALLOCLIB branch above). An offline converter does not need
+        # a custom allocator: link it against the system malloc and let
+        # gperftools_stubs.cpp supply the few gperftools symbols that are still
+        # referenced unconditionally. doris_be keeps tcmalloc.
+        list(REMOVE_ITEM KUROMOJI_BUILD_DICT_LINK_LIBS ${MALLOCLIB})
+        list(APPEND KUROMOJI_BUILD_DICT_SRCS ${BASE_DIR}/test/testutil/gperftools_stubs.cpp)
+    endif()
+    add_executable(kuromoji_build_dict EXCLUDE_FROM_ALL ${KUROMOJI_BUILD_DICT_SRCS})
+    target_include_directories(kuromoji_build_dict PRIVATE ${PROJECT_SOURCE_DIR}/..)
+    pch_reuse(kuromoji_build_dict)
+    set_target_properties(kuromoji_build_dict PROPERTIES ENABLE_EXPORTS 1)
+    if (COMPILER_CLANG)
+        target_compile_options(kuromoji_build_dict PRIVATE
+            -Wno-implicit-int-conversion
+            -Wno-shorten-64-to-32)
+    endif()
+    target_link_libraries(kuromoji_build_dict ${KUROMOJI_BUILD_DICT_LINK_LIBS})
+
+    set(KUROMOJI_IPADIC_SRC "${THIRDPARTY_DIR}/share/mecab-ipadic-2.7.0-20250920"
+        CACHE PATH "UTF-8 mecab-ipadic source directory used to generate the kuromoji dictionary")
+    set(KUROMOJI_DICT_OUT "${BASE_DIR}/dict/kuromoji")
+    file(GLOB KUROMOJI_IPADIC_SRC_FILES CONFIGURE_DEPENDS
+         "${KUROMOJI_IPADIC_SRC}/*.csv"
+         "${KUROMOJI_IPADIC_SRC}/*.def")
+    get_filename_component(KUROMOJI_LIBJVM_DIR "${LIB_JVM}" DIRECTORY)
+    set(KUROMOJI_DYLD_PATH "${KUROMOJI_LIBJVM_DIR}")
+    set(KUROMOJI_LD_PATH "${KUROMOJI_LIBJVM_DIR}")
+    if (NOT "$ENV{DYLD_LIBRARY_PATH}" STREQUAL "")
+        set(KUROMOJI_DYLD_PATH "${KUROMOJI_LIBJVM_DIR}:$ENV{DYLD_LIBRARY_PATH}")
+    endif()
+    if (NOT "$ENV{LD_LIBRARY_PATH}" STREQUAL "")
+        set(KUROMOJI_LD_PATH "${KUROMOJI_LIBJVM_DIR}:$ENV{LD_LIBRARY_PATH}")
+    endif()
+    add_custom_command(
+        OUTPUT "${KUROMOJI_DICT_OUT}/system.bin" "${KUROMOJI_DICT_OUT}/matrix.bin"
+               "${KUROMOJI_DICT_OUT}/chardef.bin" "${KUROMOJI_DICT_OUT}/unkdict.bin"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${KUROMOJI_DICT_OUT}"
+        COMMAND ${CMAKE_COMMAND} -E env
+                "DYLD_LIBRARY_PATH=${KUROMOJI_DYLD_PATH}"
+                "LD_LIBRARY_PATH=${KUROMOJI_LD_PATH}"
+                $<TARGET_FILE:kuromoji_build_dict> "${KUROMOJI_IPADIC_SRC}" "${KUROMOJI_DICT_OUT}"
+        DEPENDS kuromoji_build_dict ${KUROMOJI_IPADIC_SRC_FILES}
+        COMMENT "Generating kuromoji IPADIC dictionary from ${KUROMOJI_IPADIC_SRC}"
+        VERBATIM)
+    # ALL so a real build generates the dictionary before the install step runs.
+    add_custom_target(kuromoji_dict ALL DEPENDS "${KUROMOJI_DICT_OUT}/system.bin")
 endif()
 
 option(BUILD_FILE_CACHE_MICROBENCH_TOOL "Build file cache mirobench Tool" OFF)
 if (BUILD_FILE_CACHE_MICROBENCH_TOOL)
     add_subdirectory(${SRC_DIR}/io/tools)
-endif()
-
-option(BUILD_INDEX_TOOL "Build index tool" OFF)
-if (BUILD_INDEX_TOOL)
-    add_subdirectory(${SRC_DIR}/index-tools)
+    add_subdirectory(${SRC_DIR}/io/cache/benchmark)
+    install(FILES
+        ${BASE_DIR}/../bin/start_file_cache_microbench.sh
+        PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
+        GROUP_READ GROUP_WRITE GROUP_EXECUTE
+        WORLD_READ WORLD_EXECUTE
+        DESTINATION ${OUTPUT_DIR}/bin)
 endif()
 
 add_subdirectory(${SRC_DIR}/util)
-add_subdirectory(${SRC_DIR}/vec)
-add_subdirectory(${SRC_DIR}/pipeline)
 
 # this include doris_be_test
 if (MAKE_TEST)
@@ -893,7 +1176,10 @@ if (BUILD_BENCHMARK)
     if (NOT ${CMAKE_BUILD_TYPE} STREQUAL "RELEASE")
         message(FATAL_ERROR "Benchmark should be built with RELEASE build type, current build type is ${CMAKE_BUILD_TYPE}")
     endif()
-    add_executable(benchmark_test ${BASE_DIR}/benchmark/benchmark_main.cpp)
+    add_executable(benchmark_test ${BASE_DIR}/benchmark/benchmark_main.cpp
+        # No-ops everywhere except macOS/arm64, where benchmark_test links
+        # without tcmalloc (see the MALLOCLIB branch above).
+        ${BASE_DIR}/test/testutil/gperftools_stubs.cpp)
     set_target_properties(benchmark_test PROPERTIES COMPILE_FLAGS "-fno-access-control")
     target_link_libraries(benchmark_test ${DORIS_LINK_LIBS})
     message(STATUS "Add benchmark to build")

@@ -23,11 +23,12 @@
 #include <string>
 
 #include "common/status.h"
-#include "http/http_client.h"
+#include "core/pod_array.h"
 #include "io/fs/file_handle_cache.h"
 #include "io/fs/file_reader.h"
 #include "io/fs/file_system.h"
-#include "util/runtime_profile.h"
+#include "runtime/runtime_profile.h"
+#include "service/http/http_client.h"
 #include "util/slice.h"
 
 namespace doris::io {
@@ -41,7 +42,7 @@ public:
                                          const std::map<std::string, std::string>& props,
                                          const FileReaderOptions& opts, RuntimeProfile* profile);
 
-    explicit HttpFileReader(const OpenFileInfo& fileInfo, std::string url);
+    explicit HttpFileReader(const OpenFileInfo& fileInfo, std::string url, int64_t mtime);
     ~HttpFileReader() override;
 
     Status open(const FileReaderOptions& opts);
@@ -52,6 +53,8 @@ public:
     bool closed() const override { return _closed.load(std::memory_order_acquire); }
     size_t size() const override { return _file_size; }
 
+    int64_t mtime() const override { return _mtime; }
+
 private:
     // Prepare and initialize the HTTP client for a new request
     Status prepare_client(bool set_fail_on_error = true);
@@ -60,7 +63,11 @@ private:
     // Returns OK on success with _range_supported set appropriately
     Status detect_range_support();
 
-    std::unique_ptr<char[]> _read_buffer;
+    // Start the CDC client process
+    // Called at the start of open() when enable_cdc_client=true.
+    Status setup_cdc_client();
+
+    PODArray<char> _read_buffer;
     static constexpr size_t READ_BUFFER_SIZE = 1 << 20; // 1MB
     // Default maximum file size for servers that don't support Range requests
     static constexpr size_t DEFAULT_MAX_REQUEST_SIZE = 100 << 20; // 100MB
@@ -78,10 +85,17 @@ private:
     int64_t _last_modified = 0;
     std::atomic<bool> _closed = false;
     std::unique_ptr<HttpClient> _client;
+    int64_t _mtime;
 
     // Configuration for non-Range request handling
     bool _enable_range_request = true;                         // Whether Range request is required
     size_t _max_request_size_bytes = DEFAULT_MAX_REQUEST_SIZE; // Max size for non-Range downloads
+
+    // Full file cache for non-Range mode to avoid repeated downloads
+    std::string _full_file_cache;   // Cache complete file content
+    bool _full_file_cached = false; // Whether full file has been cached
+
+    bool _enable_chunk_response = false; // Whether server returns chunk streaming response
 };
 
 } // namespace doris::io

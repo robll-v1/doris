@@ -42,7 +42,7 @@ struct TTabletSchema {
     14: optional i32 version_col_idx = -1
     15: optional bool is_dynamic_schema = false // deprecated
     16: optional bool store_row_column = false
-    17: optional bool enable_single_replica_compaction = false
+    // 17: deprecated enable_single_replica_compaction
     18: optional bool skip_write_index_on_load = false
     19: optional list<i32> cluster_key_uids
     // col unique id for row store column
@@ -51,6 +51,12 @@ struct TTabletSchema {
     22: optional bool variant_enable_flatten_nested = false
     23: optional i64 storage_page_size = 65536
     24: optional i64 storage_dict_page_size = 262144
+    25: optional list<Types.TColumnGroup> seq_map
+    26: optional i32 commit_tso_col_idx = -1
+    27: optional i32 row_lsn_col_idx = -1
+    28: optional i32 binlog_tso_idx = -1
+    29: optional i32 binlog_lsn_idx = -1
+    30: optional i32 binlog_op_idx = -1
 }
 
 // this enum stands for different storage format in src_backends
@@ -75,6 +81,11 @@ enum TTabletType {
     TABLET_TYPE_MEMORY = 1
 }
 
+enum TTabletRole {
+    TABLET_ROLE_DATA = 0,
+    TABLET_ROLE_ROW_BINLOG = 1
+}
+
 enum TObjStorageType {
     UNKNOWN = 0,
     AWS = 1,
@@ -91,7 +102,12 @@ enum TCredProviderType {
     // used for creating different credentials provider when creating s3client
     DEFAULT = 0,  // DefaultAWSCredentialsProviderChain
     SIMPLE = 1,  // SimpleAWSCredentialsProvider, corresponding to (ak, sk)
-    INSTANCE_PROFILE = 2  // InstanceProfileCredentialsProvider
+    INSTANCE_PROFILE = 2,  // InstanceProfileCredentialsProvider
+    ENV = 3,  // EnvironmentAWSCredentialsProvider
+    SYSTEM_PROPERTIES = 4,  // SystemPropertiesCredentialsProvider
+    WEB_IDENTITY = 5,  // STSAssumeRoleWebIdentityCredentialsProvider
+    CONTAINER = 6,  // GeneralHTTPCredentialsProvider, for ECS task roles and EKS Pod Identity
+    ANONYMOUS = 7  // AnonymousAWSCredentialsProvider
 }
 
 struct TS3StorageParam {
@@ -161,6 +177,7 @@ struct TCleanTrashReq {}
 
 struct TCleanUDFCacheReq {
     1: optional string function_signature //function_name(arg_type)
+    2: optional i64 function_id // function id for cleaning cached library files
 }
 
 enum TCompressionType {
@@ -184,11 +201,18 @@ enum TInvertedIndexStorageFormat {
     V2 = 2       // Segment id per idx: Indexes are organized based on segment identifiers, grouping indexes by their associated segment.
 }
 
+enum TBinlogFormat {
+    STATEMENT_AND_SNAPSHOT = 0,
+    ROW = 1
+}
+
 struct TBinlogConfig {
     1: optional bool enable;
     2: optional i64 ttl_seconds;
     3: optional i64 max_bytes;
     4: optional i64 max_history_nums;
+    5: optional TBinlogFormat binlog_format;
+    6: optional bool need_historical_value;
 }
 
 struct TCreateTabletReq {
@@ -220,13 +244,15 @@ struct TCreateTabletReq {
     21: optional TBinlogConfig binlog_config
     22: optional string compaction_policy = "size_based"
     23: optional i64 time_series_compaction_goal_size_mbytes = 1024
-    24: optional i64 time_series_compaction_file_count_threshold = 2000
+    24: optional i64 time_series_compaction_file_count_threshold = 1000
     25: optional i64 time_series_compaction_time_threshold_seconds = 3600
     26: optional i64 time_series_compaction_empty_rowsets_threshold = 5
     27: optional i64 time_series_compaction_level_threshold = 1
     28: optional TInvertedIndexStorageFormat inverted_index_storage_format = TInvertedIndexStorageFormat.DEFAULT // Deprecated
     29: optional Types.TInvertedIndexFileStorageFormat inverted_index_file_storage_format = Types.TInvertedIndexFileStorageFormat.V2
     30: optional TEncryptionAlgorithm tde_algorithm
+    31: optional i32 vertical_compaction_num_columns_per_group = 5
+    32: optional TTabletRole tablet_role = TTabletRole.TABLET_ROLE_DATA
 
     // For cloud
     1000: optional bool is_in_memory = false
@@ -456,6 +482,7 @@ struct TPartitionVersionInfo {
     1: required Types.TPartitionId partition_id
     2: required Types.TVersion version
     3: required Types.TVersionHash version_hash // Deprecated
+    4: optional i64 commit_tso = -1
 }
 
 struct TMoveDirReq {
@@ -536,11 +563,12 @@ struct TTabletMetaInfo {
     11: optional i64 time_series_compaction_goal_size_mbytes
     12: optional i64 time_series_compaction_file_count_threshold
     13: optional i64 time_series_compaction_time_threshold_seconds
-    14: optional bool enable_single_replica_compaction
+    // 14: deprecated enable_single_replica_compaction
     15: optional bool skip_write_index_on_load
     16: optional bool disable_auto_compaction
     17: optional i64 time_series_compaction_empty_rowsets_threshold
     18: optional i64 time_series_compaction_level_threshold
+    19: optional i32 vertical_compaction_num_columns_per_group
 }
 
 struct TUpdateTabletMetaInfoReq {
@@ -562,6 +590,14 @@ struct TCooldownConf {
 
 struct TPushCooldownConfReq {
     1: required list<TCooldownConf> cooldown_confs
+}
+
+// Request to make temporary cloud rowsets visible
+struct TMakeCloudTmpRsVisibleRequest {
+    1: required i64 txn_id
+    2: required list<Types.TTabletId> tablet_ids // tablets on this BE involved in the transaction
+    3: required map<Types.TPartitionId, Types.TVersion> partition_version_map
+    4: optional i64 version_update_time_ms
 }
 
 struct TAgentTaskRequest {
@@ -606,6 +642,7 @@ struct TAgentTaskRequest {
 
     // For cloud
     1000: optional TCalcDeleteBitmapRequest calc_delete_bitmap_req
+    1001: optional TMakeCloudTmpRsVisibleRequest make_cloud_tmp_rs_visible_req
 }
 
 struct TAgentResult {

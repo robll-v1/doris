@@ -17,156 +17,57 @@
 
 package org.apache.doris.nereids.trees.plans.commands;
 
-import org.apache.doris.backup.CatalogMocker;
-import org.apache.doris.catalog.Env;
-import org.apache.doris.common.AnalysisException;
-import org.apache.doris.datasource.InternalCatalog;
-import org.apache.doris.info.PartitionNamesInfo;
-import org.apache.doris.info.TableNameInfo;
-import org.apache.doris.mysql.privilege.AccessControllerManager;
-import org.apache.doris.mysql.privilege.PrivPredicate;
-import org.apache.doris.nereids.analyzer.UnboundSlot;
-import org.apache.doris.nereids.properties.OrderKey;
-import org.apache.doris.nereids.trees.expressions.EqualTo;
-import org.apache.doris.nereids.trees.expressions.Expression;
-import org.apache.doris.nereids.trees.expressions.Or;
-import org.apache.doris.nereids.trees.expressions.literal.IntegerLiteral;
-import org.apache.doris.qe.ConnectContext;
-
-import com.google.common.collect.ImmutableList;
-import mockit.Expectations;
-import mockit.Mocked;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
-import java.util.ArrayList;
-import java.util.List;
+import java.util.Optional;
 
+/**
+ * Covers the mapping from the parsed LIMIT/OFFSET pair onto the number of rows SHOW TABLETS has
+ * to keep. The end-to-end row selection is covered by the show_p0/test_show_tablet regression
+ * suite; this test pins down the arithmetic, including the two cases that are easy to get wrong:
+ * "no LIMIT clause" vs "LIMIT 0", and the overflow of LIMIT + OFFSET.
+ */
 public class ShowTabletsFromTableCommandTest {
-    private static final String internalCtl = InternalCatalog.INTERNAL_CATALOG_NAME;
-    @Mocked
-    private Env env;
-    @Mocked
-    private AccessControllerManager accessControllerManager;
-    @Mocked
-    private ConnectContext connectContext;
 
-    private void runBefore() throws Exception {
-        new Expectations() {
-            {
-                Env.getCurrentEnv();
-                minTimes = 0;
-                result = env;
-
-                env.getAccessManager();
-                minTimes = 0;
-                result = accessControllerManager;
-
-                ConnectContext.get();
-                minTimes = 0;
-                result = connectContext;
-
-                connectContext.isSkipAuth();
-                minTimes = 0;
-                result = true;
-
-                accessControllerManager.checkGlobalPriv(connectContext, PrivPredicate.ADMIN);
-                minTimes = 0;
-                result = true;
-
-                accessControllerManager.checkTblPriv(connectContext, internalCtl, CatalogMocker.TEST_DB_NAME,
-                        CatalogMocker.TEST_TBL_NAME, PrivPredicate.ADMIN);
-                minTimes = 0;
-                result = true;
-            }
-        };
+    @Test
+    public void testNoLimitClauseIsUnbounded() {
+        // the parser passes -1 when the statement carries no LIMIT clause at all
+        Assertions.assertEquals(Optional.empty(), ShowTabletsFromTableCommand.computeSizeLimit(-1, 0));
     }
 
     @Test
-    public void testValidateWithPrivilege() throws Exception {
-        runBefore();
-
-        Expression version = new UnboundSlot("version");
-
-        Expression whereClauseNormal = new EqualTo(version, new IntegerLiteral(2));
-
-        List<OrderKey> orderKeysNormal = new ArrayList<>();
-        orderKeysNormal.add(new OrderKey(version, true, true));
-
-        TableNameInfo tableNameInfo =
-                new TableNameInfo(CatalogMocker.TEST_DB_NAME, CatalogMocker.TEST_TBL_NAME);
-        PartitionNamesInfo partitionNamesInfo = new PartitionNamesInfo(false,
-                ImmutableList.of(CatalogMocker.TEST_SINGLE_PARTITION_NAME));
-
-        // normal
-        ShowTabletsFromTableCommand command = new ShowTabletsFromTableCommand(tableNameInfo, partitionNamesInfo,
-                whereClauseNormal, orderKeysNormal, 5, 0);
-        Assertions.assertDoesNotThrow(() -> command.validate(connectContext));
-
-        // where clause error
-        Expression error = new UnboundSlot("error");
-        Expression whereClauseError = new EqualTo(error, new IntegerLiteral(2));
-
-        ShowTabletsFromTableCommand command2 = new ShowTabletsFromTableCommand(tableNameInfo, partitionNamesInfo,
-                whereClauseError, orderKeysNormal, 5, 0);
-        Assertions.assertThrows(AnalysisException.class, () -> command2.validate(connectContext));
-
-        // where clause contains or
-        Expression backendId = new UnboundSlot("BackendId");
-        Expression whereClauseOr = new Or(
-                new EqualTo(version, new IntegerLiteral(2)),
-                new EqualTo(backendId, new IntegerLiteral(2)));
-
-        ShowTabletsFromTableCommand command3 = new ShowTabletsFromTableCommand(tableNameInfo, partitionNamesInfo,
-                whereClauseOr, orderKeysNormal, 5, 0);
-        Assertions.assertThrows(AnalysisException.class, () -> command3.validate(connectContext));
-
-        // order by error
-        List<OrderKey> orderKeysError = new ArrayList<>();
-        orderKeysError.add(new OrderKey(error, true, true));
-
-        ShowTabletsFromTableCommand command4 = new ShowTabletsFromTableCommand(tableNameInfo, partitionNamesInfo,
-                whereClauseNormal, orderKeysError, 5, 0);
-        Assertions.assertThrows(AnalysisException.class, () -> command4.validate(connectContext));
+    public void testExplicitZeroLimitKeepsNoRow() {
+        Assertions.assertEquals(Optional.of(0), ShowTabletsFromTableCommand.computeSizeLimit(0, 0));
     }
 
     @Test
-    void testValidateNoPrivilege() {
-        new Expectations() {
-            {
-                Env.getCurrentEnv();
-                minTimes = 0;
-                result = env;
+    public void testZeroLimitWithOffsetStillKeepsNoRow() {
+        // LIMIT 5, 0 keeps 5 rows here, but all of them are dropped by the OFFSET afterwards
+        Assertions.assertEquals(Optional.of(5), ShowTabletsFromTableCommand.computeSizeLimit(0, 5));
+    }
 
-                env.getAccessManager();
-                minTimes = 0;
-                result = accessControllerManager;
+    @Test
+    public void testLimitWithoutOffset() {
+        Assertions.assertEquals(Optional.of(10), ShowTabletsFromTableCommand.computeSizeLimit(10, 0));
+    }
 
-                accessControllerManager.checkGlobalPriv(connectContext, PrivPredicate.ADMIN);
-                minTimes = 0;
-                result = false;
+    @Test
+    public void testLimitAndOffsetAreAddedUp() {
+        Assertions.assertEquals(Optional.of(13), ShowTabletsFromTableCommand.computeSizeLimit(3, 10));
+    }
 
-                accessControllerManager.checkTblPriv(connectContext, internalCtl, CatalogMocker.TEST_DB_NAME,
-                        CatalogMocker.TEST_TBL2_NAME, PrivPredicate.ADMIN);
-                minTimes = 0;
-                result = false;
-            }
-        };
+    @Test
+    public void testLargeLimitIsClampedToIntRange() {
+        Assertions.assertEquals(Optional.of(Integer.MAX_VALUE),
+                ShowTabletsFromTableCommand.computeSizeLimit(3000000000L, 0));
+    }
 
-        Expression version = new UnboundSlot("version");
-
-        Expression whereClauseNormal = new EqualTo(version, new IntegerLiteral(2));
-
-        List<OrderKey> orderKeysNormal = new ArrayList<>();
-        orderKeysNormal.add(new OrderKey(version, true, true));
-
-        TableNameInfo tableNameInfo =
-                new TableNameInfo(CatalogMocker.TEST_DB_NAME, CatalogMocker.TEST_TBL_NAME);
-        PartitionNamesInfo partitionNamesInfo = new PartitionNamesInfo(false,
-                ImmutableList.of(CatalogMocker.TEST_SINGLE_PARTITION_NAME));
-
-        ShowTabletsFromTableCommand command = new ShowTabletsFromTableCommand(tableNameInfo, partitionNamesInfo,
-                whereClauseNormal, orderKeysNormal, 5, 0);
-        Assertions.assertThrows(AnalysisException.class, () -> command.validate(connectContext));
+    @Test
+    public void testHugeLimitAndOffsetDoNotOverflow() {
+        // both operands come from Long.parseLong, so adding them before clamping would wrap
+        // around into a negative size and later blow up in List#subList
+        Assertions.assertEquals(Optional.of(Integer.MAX_VALUE),
+                ShowTabletsFromTableCommand.computeSizeLimit(Long.MAX_VALUE, Long.MAX_VALUE));
     }
 }

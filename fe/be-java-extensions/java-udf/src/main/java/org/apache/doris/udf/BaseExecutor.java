@@ -40,7 +40,6 @@ import org.apache.thrift.TException;
 import org.apache.thrift.protocol.TBinaryProtocol;
 
 import java.io.FileNotFoundException;
-import java.io.IOException;
 import java.lang.reflect.Constructor;
 import java.net.MalformedURLException;
 import java.net.URLClassLoader;
@@ -110,8 +109,8 @@ public abstract class BaseExecutor {
             if (request.getFn().isSetExpirationTime()) {
                 expirationTime = request.getFn().getExpirationTime();
             }
-            objCache = getClassCache(jarPath, request.getFn().getSignature(), expirationTime,
-                    funcRetType, parameterTypes);
+            objCache = getClassCache(jarPath, request.getFn().getSignature(), request.getFn().getId(),
+                    expirationTime, funcRetType, parameterTypes);
             Constructor<?> ctor = objCache.udfClass.getConstructor();
             udf = ctor.newInstance();
         } catch (MalformedURLException e) {
@@ -132,13 +131,21 @@ public abstract class BaseExecutor {
     }
 
 
-    public UdfClassCache getClassCache(String jarPath, String signature, long expirationTime,
-            Type funcRetType, Type... parameterTypes)
+    public UdfClassCache getClassCache(String jarPath, String functionSignature, long functionId,
+            long expirationTime, Type funcRetType, Type... parameterTypes)
             throws MalformedURLException, FileNotFoundException, ClassNotFoundException, InternalException,
             UdfRuntimeException {
         UdfClassCache cache = null;
         if (isStaticLoad) {
-            cache = ScannerLoader.getUdfClassLoader(signature);
+            cache = ScannerLoader.getUdfClassLoader(functionId);
+            if (cache != null) {
+                // Reuse the cached classLoader to ensure dependent classes can be loaded.
+                // NOTE: cache.classLoader may be null when the UDF was originally loaded via
+                // the system class loader (jarPath empty / custom_lib UDF); see
+                // UdfClassCache#classLoader. A null value here is a valid cached state and
+                // must NOT trigger a rebuild — only an actual cache miss does.
+                classLoader = cache.classLoader;
+            }
         }
         if (cache == null) {
             ClassLoader loader;
@@ -156,9 +163,18 @@ public abstract class BaseExecutor {
             cache.allMethods = new HashMap<>();
             cache.udfClass = Class.forName(className, true, loader);
             cache.methodAccess = MethodAccess.get(cache.udfClass);
+            cache.classLoader = classLoader;
             checkAndCacheUdfClass(cache, funcRetType, parameterTypes);
             if (isStaticLoad) {
-                ScannerLoader.cacheClassLoader(signature, cache, expirationTime);
+                UdfClassCache effective = ScannerLoader.cacheClassLoader(
+                        functionSignature, functionId, cache, expirationTime);
+                if (effective != cache) {
+                    // Another thread won the publish race. Our locally-built cache (and its
+                    // URLClassLoader) was already closed inside cacheClassLoader(); switch to
+                    // the published one so we share its live classLoader.
+                    cache = effective;
+                    classLoader = cache.classLoader;
+                }
             }
         }
         return cache;
@@ -171,24 +187,17 @@ public abstract class BaseExecutor {
      * Close the class loader we may have created.
      */
     public void close() {
-        if (classLoader != null) {
-            try {
-                classLoader.close();
-            } catch (IOException e) {
-                // Log and ignore.
-                if (LOG.isDebugEnabled()) {
-                    LOG.debug("Error closing the URLClassloader.", e);
-                }
-            }
-        }
         // Close the output table if it exists.
         if (outputTable != null) {
             outputTable.close();
         }
-        // We are now un-usable (because the class loader has been
-        // closed), so null out method_ and classLoader_.
-        classLoader = null;
-        objCache.methodAccess = null;
+        if (!isStaticLoad) {
+            // close classLoader via UdfClassCache.close() if not in static load mode.
+            // In static load mode, the classLoader is cached and should not be closed here.
+            objCache.close();
+            objCache.methodAccess = null;
+            classLoader = null;
+        }
     }
 
     protected ColumnValueConverter getInputConverter(TPrimitiveType primitiveType, Class clz)
@@ -226,7 +235,8 @@ public abstract class BaseExecutor {
                 break;
             }
             case DATETIME:
-            case DATETIMEV2: {
+            case DATETIMEV2:
+            case TIMESTAMP_NS: {
                 if (org.joda.time.DateTime.class.equals(clz)) {
                     return (Object[] columnData) -> {
                         Object[] result = new org.joda.time.DateTime[columnData.length];
@@ -335,7 +345,8 @@ public abstract class BaseExecutor {
                 break;
             }
             case DATETIME:
-            case DATETIMEV2: {
+            case DATETIMEV2:
+            case TIMESTAMP_NS: {
                 if (org.joda.time.DateTime.class.equals(clz)) {
                     return (Object[] columnData) -> {
                         Object[] result = new LocalDateTime[columnData.length];

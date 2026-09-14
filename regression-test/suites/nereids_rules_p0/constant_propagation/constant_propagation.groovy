@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 suite('constant_propagation') {
+    sql "set parallel_pipeline_task_num=2"
     def explain_and_result = { tag, sql ->
         "qt_${tag}_shape"          "explain shape plan ${sql}"
         "order_qt_${tag}_result"   "${sql}"
@@ -393,7 +394,7 @@ suite('constant_propagation') {
 
     test {
         sql 'select a, b, a + b, c from t1 where a = 1 and b = 2 group by a, b'
-        exception "c not in aggregate's output"
+        exception "PROJECT expression 'c' must appear in the GROUP BY clause or be used in an aggregate function"
     }
 
     explain_and_result 'union_1', '''

@@ -164,4 +164,32 @@ suite("test_split_by_string") {
                       split_by_string("", txt)
                 FROM test_split_by_string_2 ORDER BY rid;
              """
+
+    qt_sql_alias "select split('abcde','');"
+    qt_sql_alias "select split('你a好b世c界','');"
+    qt_sql_alias "select split('12553','');"
+    qt_sql_alias "select split('','');"
+    qt_sql_alias "select split('',',');"
+    qt_sql_alias "select split('','a');"
+
+    qt_sql_alias "select split('a1b1c1d','1');"
+    qt_sql_alias "select split(',,,',',');"
+    qt_sql_alias "select split('a,b,c,abcde',',');"
+    qt_sql_alias "select split(',,a,b,c,',',');"
+    qt_sql_alias "select split('null',',');"
+    
+    // split by string
+    qt_sql_alias "select split('1,,2,3,,4,5,,abcde', ',,');"
+    qt_sql_alias "select split('abcde','');"
+    qt_sql_alias "select split('','');"
+    qt_sql_alias "select split('',',');"
+    qt_sql_alias "select split('','a');"
+
+    qt_sql_alias "select split('1,,2,3,,,,,,4,5, abcde', ',,');"
+    qt_sql_alias "select split(',,,,',',,');"
+    qt_sql_alias "select split('a,,b,,c',',,');"
+    qt_sql_alias "select split('a,,b,,c,,',',,');"
+    qt_sql_alias "select split(',,a,,b,,c,,',',,');"
+    qt_sql_alias "select split('null',',');"
+
 }

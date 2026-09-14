@@ -25,9 +25,12 @@
 #include <chrono>
 #include <thread>
 
-#include "olap/options.h"
-#include "olap/storage_engine.h"
+#include "agent/agent_server.h"
+#include "cloud/cloud_storage_engine.h"
 #include "runtime/cluster_info.h"
+#include "runtime/exec_env.h"
+#include "storage/options.h"
+#include "storage/storage_engine.h"
 
 namespace doris {
 
@@ -52,6 +55,55 @@ TEST(TaskWorkerPoolTest, TaskWorkerPool) {
     _ = workers.submit_task(task); // Ignore
 
     EXPECT_EQ(count.load(), 2);
+}
+
+TEST(TaskWorkerPoolTest, PreSubmitCallback) {
+    std::atomic_int callback_count {0};
+    std::atomic_int pre_submit_count {0};
+    TaskWorkerPool workers(
+            "test", 1,
+            [&](auto&& task) {
+                std::this_thread::sleep_for(200ms);
+                ++callback_count;
+            },
+            [&](auto&& task) { ++pre_submit_count; });
+
+    TAgentTaskRequest task;
+    task.__set_signature(-1);
+    auto _ = workers.submit_task(task);
+    _ = workers.submit_task(task);
+
+    // pre_submit_callback is called synchronously before enqueue
+    EXPECT_EQ(pre_submit_count.load(), 2);
+
+    std::this_thread::sleep_for(600ms);
+    workers.stop();
+    EXPECT_EQ(callback_count.load(), 2);
+    EXPECT_EQ(pre_submit_count.load(), 2);
+}
+
+TEST(TaskWorkerPoolTest, PreSubmitCallbackWithDedup) {
+    std::atomic_int pre_submit_count {0};
+    std::atomic_int callback_count {0};
+    TaskWorkerPool workers(
+            "test", 1,
+            [&](auto&& task) {
+                std::this_thread::sleep_for(500ms);
+                ++callback_count;
+            },
+            [&](auto&& task) { ++pre_submit_count; });
+
+    TAgentTaskRequest task;
+    task.__set_task_type(TTaskType::ALTER);
+    task.__set_signature(12345);
+    auto _ = workers.submit_task(task);
+    _ = workers.submit_task(task); // Should be deduped by register_task_info
+
+    EXPECT_EQ(pre_submit_count.load(), 1); // Only called once, second was deduped
+
+    std::this_thread::sleep_for(600ms);
+    workers.stop();
+    EXPECT_EQ(callback_count.load(), 1);
 }
 
 TEST(TaskWorkerPoolTest, PriorTaskWorkerPool) {
@@ -130,6 +182,21 @@ TEST(TaskWorkerPoolTest, ReportWorkerPool) {
     worker.notify(); // Ignore
     std::this_thread::sleep_for(100ms);
     EXPECT_EQ(count.load(), 3);
+}
+
+TEST(AgentServerTest, CloudRegistersCleanUdfCacheWorker) {
+    auto* exec_env = ExecEnv::GetInstance();
+    auto engine = std::make_unique<CloudStorageEngine>(EngineOptions {});
+    auto* cloud_engine = engine.get();
+    exec_env->set_storage_engine(std::move(engine));
+    Defer defer {[exec_env] { exec_env->set_storage_engine(nullptr); }};
+
+    ClusterInfo cluster_info;
+    AgentServer agent_server(exec_env, &cluster_info);
+
+    agent_server.cloud_start_workers(*cloud_engine, exec_env);
+
+    EXPECT_TRUE(agent_server._workers.contains(TTaskType::CLEAN_UDF_CACHE));
 }
 
 } // namespace doris

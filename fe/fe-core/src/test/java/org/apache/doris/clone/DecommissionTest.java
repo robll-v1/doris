@@ -18,6 +18,7 @@
 package org.apache.doris.clone;
 
 import org.apache.doris.catalog.Env;
+import org.apache.doris.catalog.LocalTabletInvertedIndex;
 import org.apache.doris.catalog.TabletInvertedIndex;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.ExceptionChecker;
@@ -29,46 +30,42 @@ import org.apache.doris.nereids.trees.plans.commands.CreateDatabaseCommand;
 import org.apache.doris.nereids.trees.plans.commands.CreateTableCommand;
 import org.apache.doris.nereids.trees.plans.commands.info.DecommissionBackendOp;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
-import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.StmtExecutor;
 import org.apache.doris.system.Backend;
 import org.apache.doris.system.SystemInfoService;
 import org.apache.doris.thrift.TDisk;
 import org.apache.doris.thrift.TStorageMedium;
-import org.apache.doris.utframe.UtFrameUtils;
+import org.apache.doris.utframe.TestWithFeService;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Maps;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.junit.AfterClass;
-import org.junit.Assert;
-import org.junit.BeforeClass;
-import org.junit.Test;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
-import java.util.UUID;
 import java.util.stream.Collectors;
 
-public class DecommissionTest {
+public class DecommissionTest extends TestWithFeService {
     private static final Logger LOG = LogManager.getLogger(TabletReplicaTooSlowTest.class);
-    // use a unique dir so that it won't be conflict with other unit test which
-    // may also start a Mocked Frontend
-    private static String runningDirBase = "fe";
-    private static String runningDir = runningDirBase + "/mocked/DecommissionTest/" + UUID.randomUUID() + "/";
-    private static ConnectContext connectContext;
 
     private static Random random = new Random(System.currentTimeMillis());
 
     private long id = 10086;
 
     private final SystemInfoService systemInfoService = new SystemInfoService();
-    private final TabletInvertedIndex invertedIndex = new TabletInvertedIndex();
+    private final TabletInvertedIndex invertedIndex = new LocalTabletInvertedIndex();
 
-    @BeforeClass
-    public static void beforeClass() throws Exception {
+    @Override
+    protected int backendNum() {
+        return 4;
+    }
+
+    @Override
+    protected void beforeCreatingConnectContext() throws Exception {
         FeConstants.runningUnitTest = true;
         System.out.println(runningDir);
         FeConstants.runningUnitTest = true;
@@ -80,12 +77,16 @@ public class DecommissionTest {
         Config.max_scheduling_tablets = 10000;
         Config.schedule_batch_size = 10000;
         Config.disable_balance = true;
+        Config.max_bucket_num_per_partition = 0;
         // 4 backends:
         // 127.0.0.1
         // 127.0.0.2
         // 127.0.0.3
         // 127.0.0.4
-        UtFrameUtils.createDorisClusterWithMultiTag(runningDir, 4);
+    }
+
+    @Override
+    protected void runBeforeAll() throws Exception {
         List<Backend> backends = Env.getCurrentSystemInfo().getAllBackendsByAllCluster().values().asList();
         for (Backend be : backends) {
             Map<String, TDisk> backendDisks = Maps.newHashMap();
@@ -112,7 +113,6 @@ public class DecommissionTest {
             be.updateDisks(backendDisks);
         }
 
-        connectContext = UtFrameUtils.createDefaultCtx();
 
         // create database
         String createDbStmtStr = "create database test;";
@@ -124,12 +124,7 @@ public class DecommissionTest {
         }
     }
 
-    @AfterClass
-    public static void tearDown() {
-        //UtFrameUtils.cleanDorisFeDir(runningDirBase);
-    }
-
-    private static void createTable(String sql) throws Exception {
+    private void createTableStmt(String sql) throws Exception {
         NereidsParser nereidsParser = new NereidsParser();
         LogicalPlan parsed = nereidsParser.parseSingle(sql);
         StmtExecutor stmtExecutor = new StmtExecutor(connectContext, sql);
@@ -148,7 +143,7 @@ public class DecommissionTest {
                 + "(\n"
                 + "    \"replication_num\" = \"1\"\n"
                 + ")";
-        ExceptionChecker.expectThrowsNoException(() -> createTable(createStr));
+        ExceptionChecker.expectThrowsNoException(() -> createTableStmt(createStr));
         int totalReplicaNum = 1 * 2400;
         checkBalance(1, totalReplicaNum, 4);
 
@@ -160,7 +155,7 @@ public class DecommissionTest {
         AlterSystemCommand command = new AlterSystemCommand(op, PlanType.ALTER_SYSTEM_DECOMMISSION_BACKEND);
         command.doRun(connectContext, new StmtExecutor(connectContext, ""));
 
-        Assert.assertEquals(true, backend.isDecommissioned());
+        Assertions.assertEquals(true, backend.isDecommissioned());
 
         checkBalance(200, totalReplicaNum, 3);
     }
@@ -176,13 +171,13 @@ public class DecommissionTest {
         }
 
         List<Long> backendIds = Env.getCurrentSystemInfo().getAllBackendIds(true);
-        Assert.assertEquals(backendNum, backendIds.size());
+        Assertions.assertEquals(backendNum, backendIds.size());
         List<Integer> tabletNums = backendIds.stream()
                 .map(beId -> Env.getCurrentInvertedIndex().getTabletNumByBackendId(beId))
                 .collect(Collectors.toList());
 
         int avgReplicaNum = totalReplicaNum / backendNum;
         boolean balanced = tabletNums.stream().allMatch(num -> Math.abs(num - avgReplicaNum) <= 30);
-        Assert.assertTrue("not balance, tablet nums = " + tabletNums, balanced);
+        Assertions.assertTrue(balanced, "not balance, tablet nums = " + tabletNums);
     }
 }

@@ -43,6 +43,8 @@
 #include "common/status.h"
 #include "runtime/exec_env.h"
 #include "service/backend_options.h"
+#include "util/client_connection_provider.h"
+#include "util/defer_op.h"
 #include "util/dns_cache.h"
 #include "util/network_util.h"
 
@@ -51,13 +53,19 @@ class PBackendService_Stub;
 class PFunctionService_Stub;
 } // namespace doris
 
+// Entry that holds both resolved IP and stub, similar to Java's BackendServiceClientExtIp
+template <typename T>
+struct StubEntry {
+    std::string real_ip;
+    std::shared_ptr<T> stub;
+};
+
 template <typename T>
 using StubMap = phmap::parallel_flat_hash_map<
-        std::string, std::shared_ptr<T>, std::hash<std::string>, std::equal_to<std::string>,
-        std::allocator<std::pair<const std::string, std::shared_ptr<T>>>, 8, std::mutex>;
+        std::string, StubEntry<T>, std::hash<std::string>, std::equal_to<std::string>,
+        std::allocator<std::pair<const std::string, StubEntry<T>>>, 8, std::mutex>;
 
 namespace doris {
-#include "common/compile_check_begin.h"
 class FailureDetectClosure : public ::google::protobuf::Closure {
 public:
     FailureDetectClosure(std::shared_ptr<AtomicStatus>& channel_st,
@@ -167,29 +175,64 @@ public:
             Status status = dns_cache->get(host, &realhost);
             if (!status.ok()) {
                 LOG(WARNING) << "failed to get ip from host:" << status.to_string();
+                // The hostname is no longer resolvable, which normally means the backend
+                // was dropped from the cluster. Returning early is not enough: any stub
+                // cached under this host:port still holds a brpc Channel bound to the last
+                // resolved (now dead) IP, and brpc keeps health-checking that socket
+                // forever, which is the source of the endless
+                // "Fail to wait EPOLLOUT ... Connection timed out" warnings. Drop it here
+                // so the socket is closed along with the last reference to the stub.
+                _stub_map.erase(fmt::format("{}:{}", host, port));
                 return nullptr;
             }
         }
-        std::string host_port = get_host_port(realhost, port);
+
+        // Use original host:port as key (like Java's TNetworkAddress address)
+        // This allows us to detect IP changes when DNS resolution changes
+        std::string host_port = fmt::format("{}:{}", host, port);
+
         std::shared_ptr<T> stub_ptr;
-        auto get_value = [&stub_ptr](const auto& v) { stub_ptr = v.second; };
-        if (LIKELY(_stub_map.if_contains(host_port, get_value))) {
-            DCHECK(stub_ptr != nullptr);
-            // All client created from this cache will use FailureDetectChannel, so it is
-            // safe to do static cast here.
-            // Check if the base channel is OK, if not ignore the stub and create new one.
-            if (static_cast<FailureDetectChannel*>(stub_ptr->channel())->channel_status()->ok()) {
-                return stub_ptr;
+        bool need_remove = false;
+
+        auto check_entry = [&](const auto& v) {
+            const StubEntry<T>& entry = v.second;
+            // Check if cached IP matches current resolved IP
+            if (entry.real_ip != realhost) {
+                // IP changed (DNS resolution changed)
+                LOG(WARNING) << "Cached ip changed for " << host << ", before ip: " << entry.real_ip
+                             << ", current ip: " << realhost;
+                need_remove = true;
+            } else if (!static_cast<FailureDetectChannel*>(entry.stub->channel())
+                                ->channel_status()
+                                ->ok()) {
+                // Client is not in normal state, need to recreate
+                // At this point we cannot judge the progress of reconnecting the underlying channel.
+                // In the worst case, it may take two minutes. But we can't stand the connection refused
+                // for two minutes, so rebuild the channel directly.
+                need_remove = true;
             } else {
+                // Cache hit: IP matches and client is healthy
+                stub_ptr = entry.stub;
+            }
+        };
+
+        if (LIKELY(_stub_map.if_contains(host_port, check_entry))) {
+            if (stub_ptr != nullptr) {
+                return stub_ptr;
+            }
+            // IP changed or client unhealthy, need to remove old entry
+            if (need_remove) {
                 _stub_map.erase(host_port);
             }
         }
 
-        // new one stub and insert into map
-        auto stub = get_new_client_no_cache(host_port);
+        // Create new stub using resolved IP for actual connection
+        std::string real_host_port = get_host_port(realhost, port);
+        auto stub = get_new_client_no_cache(real_host_port);
         if (stub != nullptr) {
+            StubEntry<T> entry {realhost, stub};
             _stub_map.try_emplace_l(
-                    host_port, [&stub](const auto& v) { stub = v.second; }, stub);
+                    host_port, [&stub](const auto& v) { stub = v.second.stub; }, entry);
         }
         return stub;
     }
@@ -210,8 +253,13 @@ public:
     std::shared_ptr<T> get_new_client_no_cache(const std::string& host_port,
                                                const std::string& protocol = "",
                                                const std::string& connection_type = "",
-                                               const std::string& connection_group = "") {
+                                               const std::string& connection_group = "",
+                                               int connect_timeout_ms = 2000, int max_retry = 10) {
         brpc::ChannelOptions options;
+        Status status = doris::client::configure_brpc_channel_options(&options);
+        if (!status.ok()) {
+            throw status;
+        }
         if (protocol != "") {
             options.protocol = protocol;
         } else if (_protocol != "") {
@@ -229,9 +277,9 @@ public:
         }
         // Add random connection id to connection_group to make sure use new socket
         options.connection_group += std::to_string(_connection_id.fetch_add(1));
-        options.connect_timeout_ms = 2000;
+        options.connect_timeout_ms = connect_timeout_ms;
         options.timeout_ms = 2000;
-        options.max_retry = 10;
+        options.max_retry = max_retry;
 
         std::unique_ptr<FailureDetectChannel> channel(new FailureDetectChannel());
         int ret_code = 0;
@@ -319,5 +367,4 @@ private:
 
 using InternalServiceClientCache = BrpcClientCache<PBackendService_Stub>;
 using FunctionServiceClientCache = BrpcClientCache<PFunctionService_Stub>;
-#include "common/compile_check_end.h"
 } // namespace doris

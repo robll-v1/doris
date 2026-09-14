@@ -21,6 +21,7 @@ import org.apache.doris.catalog.ScalarType;
 import org.apache.doris.catalog.Type;
 import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.trees.expressions.literal.StringLikeLiteral;
+import org.apache.doris.nereids.types.coercion.CharacterType;
 import org.apache.doris.nereids.types.coercion.DateLikeType;
 import org.apache.doris.nereids.types.coercion.ScaleTimeType;
 
@@ -35,14 +36,24 @@ public class TimeStampTzType extends DateLikeType implements ScaleTimeType {
     public static final int MAX_SCALE = 6;
     public static final TimeStampTzType SYSTEM_DEFAULT = new TimeStampTzType(0);
     public static final TimeStampTzType MAX = new TimeStampTzType(MAX_SCALE);
+    public static final TimeStampTzType WILDCARD = new TimeStampTzType(-1);
 
     private static final int WIDTH = 8;
 
     private final int scale;
 
     private TimeStampTzType(int scale) {
-        Preconditions.checkArgument(0 <= scale && scale <= MAX_SCALE);
+        Preconditions.checkArgument(scale == -1 || (0 <= scale && scale <= MAX_SCALE));
         this.scale = scale;
+    }
+
+    @Override
+    public boolean isInjectiveCastTo(DataType target) {
+        if (target instanceof TimeStampTzType) {
+            TimeStampTzType timeStampTzType = (TimeStampTzType) target;
+            return timeStampTzType.getScale() >= this.scale;
+        }
+        return target instanceof CharacterType;
     }
 
     @Override
@@ -81,6 +92,22 @@ public class TimeStampTzType extends DateLikeType implements ScaleTimeType {
     public ScaleTimeType scaleTypeForType(DataType dataType) {
         DateTimeV2Type dateTimeV2Type = DateTimeV2Type.forType(dataType);
         return TimeStampTzType.of(dateTimeV2Type.getScale());
+    }
+
+    /**
+     * Determine the minimum scale
+     */
+    public static TimeStampTzType forTypeFromMicroSeconds(long microSecond) {
+        if (microSecond == 0) {
+            return TimeStampTzType.of(0);
+        }
+        int scale = TimeStampTzType.MAX_SCALE;
+        long value = microSecond;
+        while (scale > 0 && value % 10 == 0) {
+            value /= 10;
+            scale--;
+        }
+        return TimeStampTzType.of(scale);
     }
 
     @Override

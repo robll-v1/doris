@@ -26,8 +26,8 @@ import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
+import org.apache.doris.common.util.DatasourcePrintableMap;
 import org.apache.doris.common.util.DebugPointUtil;
-import org.apache.doris.common.util.PrintableMap;
 import org.apache.doris.common.util.TimeUtils;
 import org.apache.doris.persist.gson.GsonUtils;
 import org.apache.doris.qe.SimpleScheduler;
@@ -126,7 +126,7 @@ public class Backend implements Writable {
     // the locationTag is also saved in tagMap, use a single field here to avoid
     // creating this everytime we get it.
     @SerializedName(value = "locationTag", alternate = {"tag"})
-    private Tag locationTag = Tag.DEFAULT_BACKEND_TAG;
+    private volatile Tag locationTag = Tag.DEFAULT_BACKEND_TAG;
 
     @SerializedName("nodeRole")
     private Tag nodeRoleTag = Tag.DEFAULT_NODE_ROLE_TAG;
@@ -1090,7 +1090,7 @@ public class Backend implements Writable {
             displayTagMap.put("compute_group_name", displayTagMap.remove("cloud_cluster_name"));
         }
 
-        return "{" + new PrintableMap<>(displayTagMap, ":", true, false).toString() + "}";
+        return "{" + new DatasourcePrintableMap<>(displayTagMap, ":", true, false).toString() + "}";
     }
 
     public Long getPublishTaskLastTimeAccumulated() {
@@ -1138,4 +1138,3 @@ public class Backend implements Writable {
     }
 
 }
-

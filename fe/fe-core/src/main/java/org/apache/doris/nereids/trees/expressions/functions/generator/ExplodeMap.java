@@ -21,6 +21,7 @@ import org.apache.doris.catalog.FunctionSignature;
 import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.functions.AlwaysNullable;
+import org.apache.doris.nereids.trees.expressions.literal.StructLiteral;
 import org.apache.doris.nereids.trees.expressions.shape.UnaryExpression;
 import org.apache.doris.nereids.trees.expressions.visitor.ExpressionVisitor;
 import org.apache.doris.nereids.types.MapType;
@@ -62,18 +63,20 @@ public class ExplodeMap extends TableGeneratingFunction implements UnaryExpressi
 
     @Override
     public void checkLegalityBeforeTypeCoercion() {
-        if (!(child().getDataType() instanceof MapType)) {
+        Expression argument = getArgument(0);
+        if (!(argument.getDataType() instanceof MapType)) {
             throw new AnalysisException("only support map type for explode_map function but got "
-                    + child().getDataType());
+                    + argument.getDataType());
         }
     }
 
     @Override
     public List<FunctionSignature> getSignatures() {
+        MapType dataType = (MapType) child().getDataType();
         return ImmutableList.of(
                 FunctionSignature.ret(new StructType(ImmutableList.of(
-                                new StructField("col1", ((MapType) child().getDataType()).getKeyType(), true, ""),
-                                new StructField("col2", ((MapType) child().getDataType()).getValueType(), true, ""))))
+                                new StructField(StructLiteral.COL_PREFIX + "1", dataType.getKeyType(), true, ""),
+                                new StructField(StructLiteral.COL_PREFIX + "2", dataType.getValueType(), true, ""))))
                         .args(child().getDataType())
         );
     }

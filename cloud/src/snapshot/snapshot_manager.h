@@ -19,6 +19,9 @@
 
 #include <gen_cpp/cloud.pb.h>
 
+#include <string>
+#include <string_view>
+
 #include "meta-store/txn_kv.h"
 #include "meta-store/versionstamp.h"
 
@@ -30,6 +33,12 @@ class StorageVaultAccessor;
 class InstanceDataMigrator;
 class InstanceChainCompactor;
 class MetaChecker;
+
+struct SnapshotRetainedAnalysisResult {
+    MetaServiceCode code;
+    std::string message;
+    std::string result_json;
+};
 
 // A abstract class for managing cluster snapshots.
 class SnapshotManager {
@@ -52,8 +61,25 @@ public:
     virtual void clone_instance(const CloneInstanceRequest& request,
                                 CloneInstanceResponse* response);
 
+    // Manually trigger snapshot compact for an instance.
+    virtual std::pair<MetaServiceCode, std::string> compact_snapshot(std::string_view instance_id);
+
+    // Decouple a cloned instance from its source snapshot.
+    //
+    // It removes the snapshot reference key in the source instance, and clears
+    // source_snapshot_id and source_instance_id from the cloned instance PB.
+    // The instance must have been created via clone_instance, and its snapshot_compact_status
+    // must be SNAPSHOT_COMPACT_DONE.
+    std::pair<MetaServiceCode, std::string> decouple_instance(std::string_view instance_id);
+
     virtual std::pair<MetaServiceCode, std::string> set_multi_version_status(
             std::string_view instance_id, MultiVersionStatus multi_version_status);
+
+    virtual SnapshotRetainedAnalysisResult analyze_snapshot_retained(std::string_view request_body);
+
+    virtual SnapshotRetainedAnalysisResult get_snapshot_retained_analysis(
+            std::string_view request_body, std::string_view instance_id,
+            std::string_view analysis_id);
 
     virtual int check_snapshots(InstanceChecker* checker);
 
@@ -83,6 +109,14 @@ public:
     static bool parse_snapshot_versionstamp(std::string_view snapshot_id,
                                             Versionstamp* versionstamp);
 
+    // Get all snapshots of the specific instance.
+    //
+    // If the instance is created by rollback, also get the snapshots of all its predecessor instances.
+    // If the required_snapshot_id is not empty, only get the snapshot with the specific snapshot_id.
+    static std::pair<MetaServiceCode, std::string> get_all_snapshots(
+            Transaction* txn, std::string_view instance_id, std::string_view required_snapshot_id,
+            std::vector<std::pair<SnapshotPB, Versionstamp>>* snapshots);
+
     // Migrate the single version keys to multi-version keys for the instance.
     // Return 0 for success otherwise error.
     virtual int migrate_to_versioned_keys(InstanceDataMigrator* migrator);
@@ -91,7 +125,7 @@ public:
     // Return 0 for success otherwise error.
     virtual int compact_snapshot_chains(InstanceChainCompactor* compactor);
 
-private:
+protected:
     SnapshotManager(const SnapshotManager&) = delete;
     SnapshotManager& operator=(const SnapshotManager&) = delete;
 

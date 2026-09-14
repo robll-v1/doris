@@ -25,11 +25,11 @@ import org.apache.doris.catalog.PartitionKey;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.util.RangeUtils;
 
+import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Range;
 import com.google.common.collect.Sets;
 import org.apache.commons.collections4.CollectionUtils;
-import org.apache.hadoop.util.Lists;
 
 import java.util.HashMap;
 import java.util.List;
@@ -44,7 +44,8 @@ public class MTMVRelatedPartitionDescTransferGenerator implements MTMVRelatedPar
 
     @Override
     public void apply(MTMVPartitionInfo mvPartitionInfo, Map<String, String> mvProperties,
-            RelatedPartitionDescResult lastResult, List<Column> partitionColumns) throws AnalysisException {
+            RelatedPartitionDescResult lastResult, List<Column> partitionColumns,
+                      Map<List<String>, Set<String>> queryUsedPartitionMap) throws AnalysisException {
         Map<MTMVRelatedTableIf, Map<PartitionKeyDesc, Set<String>>> descs = lastResult.getDescs();
         Map<PartitionKeyDesc, Map<MTMVRelatedTableIf, Set<String>>> res = Maps.newHashMap();
         for (Entry<MTMVRelatedTableIf, Map<PartitionKeyDesc, Set<String>>> entry : descs.entrySet()) {

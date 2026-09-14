@@ -28,7 +28,6 @@
 #include <mutex>
 #include <optional>
 #include <random>
-#include <ranges>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -114,4 +113,15 @@ TEST_F(LRUQueueTest, SameElementsDifferentOrder) {
     queue2->add(UInt128Wrapper(123), 0, 1024, lock);
 
     EXPECT_EQ(queue1->levenshtein_distance_from(*queue2, lock), 2);
+}
+
+TEST_F(LRUQueueTest, ResizeUpdatesCacheSize) {
+    std::mutex mutex;
+    std::lock_guard lock(mutex);
+
+    auto iter = queue1->add(UInt128Wrapper(123), 0, 1024, lock);
+    EXPECT_EQ(queue1->get_capacity(lock), 1024);
+
+    queue1->resize(iter, 2048, lock);
+    EXPECT_EQ(queue1->get_capacity(lock), 2048);
 }

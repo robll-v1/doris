@@ -35,25 +35,115 @@
 #include "common/logging.h"
 #include "common/object_pool.h"
 #include "common/status.h"
+#include "core/value/vdatetime_value.h"
+#include "exec/operator/operator.h"
+#include "exec/pipeline/pipeline_fragment_context.h"
+#include "exec/pipeline/pipeline_task.h"
+#include "exec/runtime_filter/runtime_filter_consumer.h"
+#include "exec/runtime_filter/runtime_filter_mgr.h"
+#include "exec/runtime_filter/runtime_filter_producer.h"
+#include "exprs/function/cast/cast_to_date_or_datetime_impl.hpp"
 #include "io/fs/s3_file_system.h"
-#include "olap/id_manager.h"
-#include "olap/storage_engine.h"
-#include "pipeline/exec/operator.h"
-#include "pipeline/pipeline_task.h"
+#include "load/load_path_mgr.h"
 #include "runtime/exec_env.h"
 #include "runtime/fragment_mgr.h"
-#include "runtime/load_path_mgr.h"
 #include "runtime/memory/mem_tracker_limiter.h"
 #include "runtime/query_context.h"
 #include "runtime/thread_context.h"
-#include "runtime_filter/runtime_filter_mgr.h"
+#include "storage/id_manager.h"
+#include "storage/storage_engine.h"
+#include "util/thrift_util.h"
 #include "util/timezone_utils.h"
 #include "util/uid_util.h"
-#include "vec/runtime/vdatetime_value.h"
 
 namespace doris {
-#include "common/compile_check_begin.h"
 using namespace ErrorCode;
+
+Status RuntimeState::add_iceberg_commit_datas(TIcebergCommitData iceberg_commit_data) {
+    ThriftSerializer serializer(false, 256);
+    uint32_t serialized_size = 0;
+    uint8_t* buffer = nullptr;
+    RETURN_IF_ERROR(serializer.serialize(&iceberg_commit_data, &serialized_size, &buffer));
+
+    // This is an early per-vector guard only; the assembled RPC is measured again before send.
+    constexpr size_t report_envelope_headroom = 1024 * 1024;
+    const size_t thrift_limit = coordinator_thrift_message_limit();
+    const size_t commit_data_limit =
+            thrift_limit > report_envelope_headroom ? thrift_limit - report_envelope_headroom : 0;
+    std::lock_guard<std::mutex> budget_lock(_external_file_report_state->mutex);
+    // Parallel task states share this budget because FE receives their vectors in one fragment report.
+    if (_external_file_report_state->iceberg_serialized_bytes + serialized_size + sizeof(uint32_t) >
+        commit_data_limit) {
+        return Status::InternalError(
+                "Iceberg commit metadata exceeds the Thrift report limit; reduce output file "
+                "count");
+    }
+    std::lock_guard<std::mutex> data_lock(_iceberg_commit_datas_mutex);
+    _external_file_report_state->iceberg_serialized_bytes += serialized_size + sizeof(uint32_t);
+    _iceberg_commit_datas.emplace_back(std::move(iceberg_commit_data));
+    return Status::OK();
+}
+
+size_t RuntimeState::coordinator_thrift_message_limit() const {
+    int32_t effective_thrift_limit = std::max(config::thrift_max_message_size, 0);
+    if (_query_options.__isset.coordinator_thrift_max_message_size &&
+        _query_options.coordinator_thrift_max_message_size > 0) {
+        // An older FE omits this field; otherwise the receiver's smaller limit is authoritative.
+        effective_thrift_limit = std::min(effective_thrift_limit,
+                                          _query_options.coordinator_thrift_max_message_size);
+    }
+    return static_cast<size_t>(effective_thrift_limit);
+}
+
+void RuntimeState::append_external_file_commit_data(TReportExecStatusParams* params,
+                                                    bool final_report) const {
+    if (!final_report) {
+        // Ownership-bearing commit vectors must only appear in the final report that transfers them.
+        return;
+    }
+    if (auto updates = hive_partition_updates(); !updates.empty()) {
+        params->__isset.hive_partition_updates = true;
+        params->hive_partition_updates.insert(params->hive_partition_updates.end(), updates.begin(),
+                                              updates.end());
+    }
+    append_iceberg_commit_datas(&params->iceberg_commit_datas);
+    if (!params->iceberg_commit_datas.empty()) {
+        params->__isset.iceberg_commit_datas = true;
+    }
+    if (auto commit_datas = mc_commit_datas(); !commit_datas.empty()) {
+        params->__isset.mc_commit_datas = true;
+        params->mc_commit_datas.insert(params->mc_commit_datas.end(), commit_datas.begin(),
+                                       commit_datas.end());
+    }
+}
+
+void RuntimeState::add_rejected_external_file_report_cleanup(std::function<void()> cleanup) {
+    std::lock_guard lock(_external_file_report_state->mutex);
+    _external_file_report_state->rejected_report_cleanups.emplace_back(std::move(cleanup));
+}
+
+void RuntimeState::finalize_external_file_report_cleanup(ExternalFileReportOutcome outcome) {
+    std::vector<std::function<void()>> cleanups;
+    {
+        std::lock_guard lock(_external_file_report_state->mutex);
+        if (outcome == ExternalFileReportOutcome::ACKNOWLEDGED) {
+            _external_file_report_state->rejected_report_cleanups.clear();
+            return;
+        }
+        if (outcome == ExternalFileReportOutcome::AMBIGUOUS) {
+            // Once an ACK can have been lost, a later rejection cannot prove FE never accepted the files.
+            _external_file_report_state->ownership_may_have_transferred = true;
+            return;
+        }
+        if (_external_file_report_state->ownership_may_have_transferred) {
+            return;
+        }
+        cleanups.swap(_external_file_report_state->rejected_report_cleanups);
+    }
+    for (auto& cleanup : cleanups) {
+        cleanup();
+    }
+}
 
 RuntimeState::RuntimeState(const TPlanFragmentExecParams& fragment_exec_params,
                            const TQueryOptions& query_options, const TQueryGlobals& query_globals,
@@ -105,7 +195,7 @@ RuntimeState::RuntimeState(const TUniqueId& instance_id, const TUniqueId& query_
 RuntimeState::RuntimeState(const TUniqueId& query_id, int32_t fragment_id,
                            const TQueryOptions& query_options, const TQueryGlobals& query_globals,
                            ExecEnv* exec_env, QueryContext* ctx)
-        : _profile("PipelineX  " + std::to_string(fragment_id)),
+        : _profile(fmt::format("PipelineX(fragment_id={})", fragment_id)),
           _load_channel_profile("<unnamed>"),
           _obj_pool(new ObjectPool()),
           _unreported_error_idx(0),
@@ -130,7 +220,7 @@ RuntimeState::RuntimeState(const TUniqueId& query_id, int32_t fragment_id,
                            const TQueryOptions& query_options, const TQueryGlobals& query_globals,
                            ExecEnv* exec_env,
                            const std::shared_ptr<MemTrackerLimiter>& query_mem_tracker)
-        : _profile("PipelineX  " + std::to_string(fragment_id)),
+        : _profile(fmt::format("PipelineX(fragment_id={})", fragment_id)),
           _load_channel_profile("<unnamed>"),
           _obj_pool(new ObjectPool()),
           _unreported_error_idx(0),
@@ -184,8 +274,15 @@ RuntimeState::~RuntimeState() {
     if (_error_log_file != nullptr && _error_log_file->is_open()) {
         _error_log_file->close();
     }
-
     _obj_pool->clear();
+}
+
+const std::set<int>& RuntimeState::get_deregister_runtime_filter() const {
+    return _registered_runtime_filter_ids;
+}
+
+void RuntimeState::merge_register_runtime_filter(const std::set<int>& runtime_filter_ids) {
+    _registered_runtime_filter_ids.insert(runtime_filter_ids.begin(), runtime_filter_ids.end());
 }
 
 Status RuntimeState::init(const TUniqueId& fragment_instance_id, const TQueryOptions& query_options,
@@ -204,7 +301,11 @@ Status RuntimeState::init(const TUniqueId& fragment_instance_id, const TQueryOpt
     } else if (!query_globals.now_string.empty()) {
         _timezone = TimezoneUtils::default_time_zone;
         VecDateTimeValue dt;
-        dt.from_date_str(query_globals.now_string.c_str(), query_globals.now_string.size());
+        CastParameters params;
+        DORIS_CHECK((CastToDateOrDatetime::from_string_strict_mode<DatelikeParseMode::STRICT,
+                                                                   DatelikeTargetType::DATE_TIME>(
+                {query_globals.now_string.c_str(), query_globals.now_string.size()}, dt, nullptr,
+                params)));
         int64_t timestamp;
         dt.unix_timestamp(&timestamp, _timezone);
         _timestamp_ms = timestamp * 1000;
@@ -335,6 +436,21 @@ Status RuntimeState::append_error_msg_to_file(std::function<std::string()> line,
     if (query_type() != TQueryType::LOAD) {
         return Status::OK();
     }
+
+    const auto error_limit_status = [this]() -> Status {
+        if (_load_zero_tolerance) {
+            return Status::DataQualityError(
+                    "Encountered unqualified data, stop processing. Please check if the source "
+                    "data matches the schema, and consider disabling strict mode or increasing "
+                    "max_filter_ratio.");
+        }
+        return Status::OK();
+    };
+    if (_num_print_error_rows.load(std::memory_order_relaxed) > MAX_ERROR_NUM) {
+        return error_limit_status();
+    }
+
+    std::lock_guard<std::mutex> l(_load_error_log_lock);
     // If file haven't been opened, open it here
     if (_error_log_file == nullptr) {
         Status status = create_error_log_file();
@@ -351,14 +467,7 @@ Status RuntimeState::append_error_msg_to_file(std::function<std::string()> line,
     }
     // If num of printed error row exceeds the limit, don't add error messages to error log file any more
     if (_num_print_error_rows.fetch_add(1, std::memory_order_relaxed) > MAX_ERROR_NUM) {
-        // if _load_zero_tolerance, return Error to stop the load process immediately.
-        if (_load_zero_tolerance) {
-            return Status::DataQualityError(
-                    "Encountered unqualified data, stop processing. Please check if the source "
-                    "data matches the schema, and consider disabling strict mode or increasing "
-                    "max_filter_ratio.");
-        }
-        return Status::OK();
+        return error_limit_status();
     }
 
     fmt::memory_buffer out;
@@ -380,33 +489,52 @@ Status RuntimeState::append_error_msg_to_file(std::function<std::string()> line,
     return Status::OK();
 }
 
+std::string RuntimeState::get_first_error_msg() const {
+    std::lock_guard<std::mutex> l(_load_error_log_lock);
+    return _first_error_msg;
+}
+
 std::string RuntimeState::get_error_log_file_path() {
-    DBUG_EXECUTE_IF("RuntimeState::get_error_log_file_path.block", {
-        if (!_error_log_file_path.empty()) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
-    });
-    std::lock_guard<std::mutex> l(_s3_error_log_file_lock);
-    if (_s3_error_fs && _error_log_file && _error_log_file->is_open()) {
-        // close error log file
-        _error_log_file->close();
-        std::string error_log_absolute_path =
-                _exec_env->load_path_mgr()->get_load_error_absolute_path(_error_log_file_path);
-        // upload error log file to s3
-        Status st = _s3_error_fs->upload(error_log_absolute_path, _s3_error_log_file_path);
-        if (!st.ok()) {
-            // upload failed and return local error log file path
-            LOG(WARNING) << "Fail to upload error file to s3, error_log_file_path="
-                         << _error_log_file_path << ", error=" << st;
+    std::lock_guard<std::mutex> s3_lock(_s3_error_log_file_lock);
+    std::shared_ptr<io::S3FileSystem> s3_error_fs;
+    std::string local_error_log_file_path;
+    std::string remote_error_log_file_path;
+    {
+        std::lock_guard<std::mutex> load_lock(_load_error_log_lock);
+        DBUG_EXECUTE_IF("RuntimeState::get_error_log_file_path.block", {
+            if (!_error_log_file_path.empty()) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+        });
+        if (!_s3_error_fs || !_error_log_file || !_error_log_file->is_open()) {
             return _error_log_file_path;
         }
-        // expiration must be less than a week (in seconds) for presigned url
-        static const unsigned EXPIRATION_SECONDS = 7 * 24 * 60 * 60 - 1;
-        // Use public or private endpoint based on configuration
-        _error_log_file_path =
-                _s3_error_fs->generate_presigned_url(_s3_error_log_file_path, EXPIRATION_SECONDS,
-                                                     config::use_public_endpoint_for_error_log);
+
+        // close error log file
+        _error_log_file->close();
+        s3_error_fs = _s3_error_fs;
+        local_error_log_file_path = _error_log_file_path;
+        remote_error_log_file_path = _s3_error_log_file_path;
     }
+
+    std::string error_log_absolute_path =
+            _exec_env->load_path_mgr()->get_load_error_absolute_path(local_error_log_file_path);
+    // upload error log file to s3
+    Status st = s3_error_fs->upload(error_log_absolute_path, remote_error_log_file_path);
+    if (!st.ok()) {
+        // upload failed and return local error log file path
+        LOG(WARNING) << "Fail to upload error file to s3, error_log_file_path="
+                     << local_error_log_file_path << ", error=" << st;
+        return local_error_log_file_path;
+    }
+    // expiration must be less than a week (in seconds) for presigned url
+    static const unsigned EXPIRATION_SECONDS = 7 * 24 * 60 * 60 - 1;
+    // Use public or private endpoint based on configuration
+    auto presigned_url =
+            s3_error_fs->generate_presigned_url(remote_error_log_file_path, EXPIRATION_SECONDS,
+                                                config::use_public_endpoint_for_error_log);
+    std::lock_guard<std::mutex> load_lock(_load_error_log_lock);
+    _error_log_file_path = std::move(presigned_url);
     return _error_log_file_path;
 }
 
@@ -414,8 +542,8 @@ void RuntimeState::resize_op_id_to_local_state(int operator_size) {
     _op_id_to_local_state.resize(-operator_size);
 }
 
-void RuntimeState::emplace_local_state(
-        int id, std::unique_ptr<doris::pipeline::PipelineXLocalStateBase> state) {
+void RuntimeState::emplace_local_state(int id,
+                                       std::unique_ptr<doris::PipelineXLocalStateBase> state) {
     id = -id;
     DCHECK_LT(id, _op_id_to_local_state.size())
             << state->parent()->get_name() << " node id = " << state->parent()->node_id();
@@ -423,7 +551,7 @@ void RuntimeState::emplace_local_state(
     _op_id_to_local_state[id] = std::move(state);
 }
 
-doris::pipeline::PipelineXLocalStateBase* RuntimeState::get_local_state(int id) {
+doris::PipelineXLocalStateBase* RuntimeState::get_local_state(int id) {
     DCHECK_GT(_op_id_to_local_state.size(), -id);
     return _op_id_to_local_state[-id].get();
 }
@@ -441,12 +569,12 @@ Result<RuntimeState::LocalState*> RuntimeState::get_local_state_result(int id) {
 };
 
 void RuntimeState::emplace_sink_local_state(
-        int id, std::unique_ptr<doris::pipeline::PipelineXSinkLocalStateBase> state) {
+        int id, std::unique_ptr<doris::PipelineXSinkLocalStateBase> state) {
     DCHECK(!_sink_local_state) << " id=" << id << " state: " << state->debug_string(0);
     _sink_local_state = std::move(state);
 }
 
-doris::pipeline::PipelineXSinkLocalStateBase* RuntimeState::get_sink_local_state() {
+doris::PipelineXSinkLocalStateBase* RuntimeState::get_sink_local_state() {
     return _sink_local_state.get();
 }
 
@@ -468,11 +596,24 @@ RuntimeFilterMgr* RuntimeState::global_runtime_filter_mgr() {
 
 Status RuntimeState::register_producer_runtime_filter(
         const TRuntimeFilterDesc& desc, std::shared_ptr<RuntimeFilterProducer>* producer_filter) {
+    _registered_runtime_filter_ids.insert(desc.filter_id);
     // Producers are created by local runtime filter mgr and shared by global runtime filter manager.
     // When RF is published, consumers in both global and local RF mgr will be found.
     RETURN_IF_ERROR(local_runtime_filter_mgr()->register_producer_filter(_query_ctx, desc,
                                                                          producer_filter));
-    RETURN_IF_ERROR(global_runtime_filter_mgr()->register_local_merger_producer_filter(
+    // Stamp the producer with the current recursive CTE stage so that outgoing merge RPCs
+    // carry the correct round number and stale messages from old rounds are discarded.
+    // PFC must still be alive: this runs inside a pipeline task, so the execution context
+    // cannot have expired yet.
+    // In unit-test scenarios the task execution context is never set (no PipelineFragmentContext
+    // exists), so skip the stage stamping — the default stage (0) is correct.
+    if (task_execution_context_inited()) {
+        auto pfc = std::static_pointer_cast<PipelineFragmentContext>(
+                get_task_execution_context().lock());
+        DORIS_CHECK(pfc);
+        (*producer_filter)->set_stage(pfc->rec_cte_stage());
+    }
+    RETURN_IF_ERROR(global_runtime_filter_mgr()->register_local_merge_producer_filter(
             _query_ctx, desc, *producer_filter));
     return Status::OK();
 }
@@ -480,9 +621,24 @@ Status RuntimeState::register_producer_runtime_filter(
 Status RuntimeState::register_consumer_runtime_filter(
         const TRuntimeFilterDesc& desc, bool need_local_merge, int node_id,
         std::shared_ptr<RuntimeFilterConsumer>* consumer_filter) {
-    bool need_merge = desc.has_remote_targets || need_local_merge;
+    _registered_runtime_filter_ids.insert(desc.filter_id);
+    bool need_merge = desc.has_remote_targets || need_local_merge ||
+                      (desc.__isset.force_local_merge && desc.force_local_merge);
     RuntimeFilterMgr* mgr = need_merge ? global_runtime_filter_mgr() : local_runtime_filter_mgr();
-    return mgr->register_consumer_filter(_query_ctx, desc, node_id, consumer_filter);
+    RETURN_IF_ERROR(mgr->register_consumer_filter(this, desc, node_id, consumer_filter));
+    // Stamp the consumer with the current recursive CTE stage so that incoming publish RPCs
+    // from old rounds are detected and discarded.
+    // PFC must still be alive: this runs inside a pipeline task, so the execution context
+    // cannot have expired yet.
+    // In unit-test scenarios the task execution context is never set (no PipelineFragmentContext
+    // exists), so skip the stage stamping — the default stage (0) is correct.
+    if (task_execution_context_inited()) {
+        auto pfc = std::static_pointer_cast<PipelineFragmentContext>(
+                get_task_execution_context().lock());
+        DORIS_CHECK(pfc);
+        (*consumer_filter)->set_stage(pfc->rec_cte_stage());
+    }
+    return Status::OK();
 }
 
 bool RuntimeState::is_nereids() const {
@@ -498,15 +654,14 @@ std::vector<std::shared_ptr<RuntimeProfile>> RuntimeState::build_pipeline_profil
         std::size_t pipeline_size) {
     std::unique_lock lc(_pipeline_profile_lock);
     if (!_pipeline_id_to_profile.empty()) {
-        throw Exception(ErrorCode::INTERNAL_ERROR,
-                        "build_pipeline_profile can only be called once.");
+        return _pipeline_id_to_profile;
     }
     _pipeline_id_to_profile.resize(pipeline_size);
     {
         size_t pip_idx = 0;
         for (auto& pipeline_profile : _pipeline_id_to_profile) {
             pipeline_profile =
-                    std::make_shared<RuntimeProfile>("Pipeline : " + std::to_string(pip_idx));
+                    std::make_shared<RuntimeProfile>(fmt::format("Pipeline(id={})", pip_idx));
             pip_idx++;
         }
     }
@@ -525,5 +680,4 @@ bool RuntimeState::low_memory_mode() const {
 void RuntimeState::set_id_file_map() {
     _id_file_map = _exec_env->get_id_manager()->add_id_file_map(_query_id, execution_timeout());
 }
-#include "common/compile_check_end.h"
 } // end namespace doris

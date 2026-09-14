@@ -18,6 +18,8 @@
 package org.apache.doris.nereids.rules.analysis;
 
 import org.apache.doris.catalog.Type;
+import org.apache.doris.mtmv.ivm.IvmException;
+import org.apache.doris.mtmv.ivm.IvmFailureReason;
 import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.rules.Rule;
 import org.apache.doris.nereids.rules.RuleType;
@@ -28,6 +30,7 @@ import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.expressions.WindowExpression;
 import org.apache.doris.nereids.trees.expressions.functions.agg.AggregateFunction;
 import org.apache.doris.nereids.trees.expressions.functions.generator.TableGeneratingFunction;
+import org.apache.doris.nereids.trees.expressions.functions.generator.Unnest;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.GroupingScalarFunction;
 import org.apache.doris.nereids.trees.expressions.typecoercion.TypeCheckResult;
 import org.apache.doris.nereids.trees.plans.Plan;
@@ -40,14 +43,19 @@ import org.apache.doris.nereids.trees.plans.logical.LogicalJoin;
 import org.apache.doris.nereids.trees.plans.logical.LogicalOneRowRelation;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalProject;
+import org.apache.doris.nereids.trees.plans.logical.LogicalQualify;
+import org.apache.doris.nereids.trees.plans.logical.LogicalRepeat;
 import org.apache.doris.nereids.trees.plans.logical.LogicalSort;
 import org.apache.doris.nereids.trees.plans.logical.LogicalWindow;
 import org.apache.doris.nereids.trees.plans.logical.OutputPrunable;
 import org.apache.doris.nereids.util.ExpressionUtils;
+import org.apache.doris.nereids.util.PlanUtils;
 import org.apache.doris.nereids.util.Utils;
+import org.apache.doris.qe.ConnectContext;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Maps;
 
 import java.util.List;
@@ -91,7 +99,6 @@ public class CheckAnalysis implements AnalysisRuleFactory {
             .put(LogicalProject.class, Utils.fastArray(
                     TableGeneratingFunction.class))
             .put(LogicalSort.class, Utils.fastArray(
-                    GroupingScalarFunction.class,
                     TableGeneratingFunction.class))
             .put(LogicalWindow.class, Utils.fastArray(
                     GroupingScalarFunction.class,
@@ -102,9 +109,6 @@ public class CheckAnalysis implements AnalysisRuleFactory {
     private static final Map<Class<? extends LogicalPlan>, Class<? extends Expression>[]>
             UNEXPECTED_EXPRESSION_TYPE_MAP_AFTER_FILL_MISSING_SLOT = ImmutableMap.<Class<? extends LogicalPlan>,
                     Class<? extends Expression>[]>builder()
-            .put(LogicalSort.class, Utils.fastArray(
-                    AggregateFunction.class,
-                    WindowExpression.class))
             // OneRowRelationToProject will extract window expression
             .put(LogicalOneRowRelation.class, Utils.fastArray(
                     WindowExpression.class))
@@ -120,16 +124,14 @@ public class CheckAnalysis implements AnalysisRuleFactory {
     public List<Rule> buildRules() {
         return ImmutableList.of(
             RuleType.CHECK_ANALYSIS.build(
-                any().then(plan -> {
+                any().thenApply(ctx -> {
+                    Plan plan = ctx.root;
                     checkExpressionInputTypes(plan);
                     checkUnexpectedExpressions(plan);
+                    checkAggregateFunction(plan);
+                    checkGroupingScalarFunction(plan);
+                    checkIvmExpression(plan, ctx.connectContext);
                     return null;
-                })
-            ),
-            RuleType.CHECK_AGGREGATE_ANALYSIS.build(
-                aggregate().then(agg -> {
-                    checkAggregate(agg);
-                    return agg;
                 })
             ),
             RuleType.CHECK_OBJECT_TYPE_ANALYSIS.build(
@@ -160,7 +162,10 @@ public class CheckAnalysis implements AnalysisRuleFactory {
             }
             expr.foreachUp(e -> {
                 for (Class<? extends Expression> type : unexpectedExpressionTypes) {
-                    if (type.isInstance(e)) {
+                    // PushDownUnnestInProject will push down Unnest in Project list in rewrite phase
+                    // it relays on many rules like normalizeXXX to separate Unnest into LogicalProject first
+                    // here, we allow Unnest in analysis phase and deal with it in rewrite phase
+                    if (type.isInstance(e) && !(e instanceof Unnest)) {
                         throw new AnalysisException(plan.getType() + " can not contains "
                                 + type.getSimpleName() + " expression: " + ((Expression) e).toSql());
                     }
@@ -178,15 +183,92 @@ public class CheckAnalysis implements AnalysisRuleFactory {
         }
     }
 
-    private void checkAggregate(Aggregate<? extends Plan> aggregate) {
-        for (Expression expr : aggregate.getGroupByExpressions()) {
-            if (ExpressionUtils.hasNonWindowAggregateFunction(expr)) {
-                throw new AnalysisException(
-                        "GROUP BY expression must not contain aggregate functions: " + expr.toSql());
+    private void checkGroupingScalarFunction(Plan plan) {
+        Set<GroupingScalarFunction> groupingScalarFunctions
+                = ExpressionUtils.collect(plan.getExpressions(), GroupingScalarFunction.class::isInstance);
+        if (groupingScalarFunctions.isEmpty()) {
+            return;
+        }
+        if (hadFillMissingSlots && !(plan instanceof LogicalRepeat)) {
+            throw new AnalysisException("after fill up missing slots, " + plan.getType()
+                    + " should not contains grouping function: "
+                    + groupingScalarFunctions.iterator().next().toSql());
+        }
+        Plan bottomPlan = plan;
+        if (bottomPlan instanceof LogicalSort) {
+            bottomPlan = bottomPlan.child(0);
+        }
+        if (bottomPlan instanceof LogicalQualify) {
+            bottomPlan = bottomPlan.child(0);
+        }
+        if (bottomPlan instanceof LogicalHaving) {
+            bottomPlan = bottomPlan.child(0);
+        }
+        if (!(bottomPlan instanceof LogicalRepeat)) {
+            throw new AnalysisException(plan.getType() + " should not contain grouping expression '"
+                    + groupingScalarFunctions.iterator().next().toSql()
+                    + "', only when GROUP BY GROUPING SET/ROLLUP/CUBE can contain grouping expression.");
+        }
+        Set<Expression> groupByExpressions
+                = ImmutableSet.copyOf(((LogicalRepeat<?>) bottomPlan).getGroupByExpressions());
+        for (GroupingScalarFunction groupingScalarFunction : groupingScalarFunctions) {
+            for (Expression child : groupingScalarFunction.children()) {
+                if (!groupByExpressions.contains(child)) {
+                    throw new AnalysisException(plan.getType()
+                            + " 's GROUPING function '" + groupingScalarFunction.toSql()
+                            + "', its argument '" + child.toSql()
+                            + "' must appear in GROUP BY clause.");
+                }
             }
+        }
+    }
+
+    private void checkAggregateFunction(Plan plan) {
+        if (plan instanceof Aggregate) {
+            Aggregate<?> aggregate = (Aggregate<?>) plan;
+            for (Expression expr : aggregate.getGroupByExpressions()) {
+                if (ExpressionUtils.hasNonWindowAggregateFunction(expr)) {
+                    throw new AnalysisException(
+                            "GROUP BY expression must not contain aggregate functions: " + expr.toSql());
+                }
+                if (expr.containsType(WindowExpression.class)) {
+                    throw new AnalysisException(
+                            "GROUP BY expression must not contain window functions: " + expr.toSql());
+                }
+                if (expr.containsType(GroupingScalarFunction.class)) {
+                    throw new AnalysisException(
+                            "GROUP BY expression must not contain grouping functions: " + expr.toSql());
+                }
+            }
+        } else {
+            if (hadFillMissingSlots) {
+                // after fill missing slots, expect only agg can contain non-window aggregate function
+                for (Expression expr : plan.getExpressions()) {
+                    List<AggregateFunction> aggregateFunctions
+                            = PlanUtils.CollectNonWindowedAggFuncs.collect(expr);
+                    if (!aggregateFunctions.isEmpty()) {
+                        throw new AnalysisException("after fill up missing slots, " + plan.getType()
+                                + " 's expression " + expr.toSql()
+                                + " should not contains aggregate function: "
+                                + aggregateFunctions.get(0).toSql());
+                    }
+                }
+            }
+        }
+    }
+
+    private void checkIvmExpression(Plan plan, ConnectContext connectContext) {
+        if (connectContext == null
+                || connectContext.getStatementContext() == null
+                || !connectContext.getStatementContext().isIvmMTMVRewrite()) {
+            return;
+        }
+        for (Expression expr : plan.getExpressions()) {
             if (expr.containsType(WindowExpression.class)) {
-                throw new AnalysisException(
-                        "GROUP BY expression must not contain window functions: " + expr.toSql());
+                WindowExpression windowExpr = (WindowExpression) ExpressionUtils.collect(
+                        ImmutableList.of(expr), WindowExpression.class::isInstance).iterator().next();
+                throw new IvmException(IvmFailureReason.PLAN_PATTERN_UNSUPPORTED,
+                        "IVM does not support window functions: " + windowExpr.toSql());
             }
         }
     }

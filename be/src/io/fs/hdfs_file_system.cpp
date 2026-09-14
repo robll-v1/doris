@@ -31,6 +31,7 @@
 
 #include "common/config.h"
 #include "common/status.h"
+#include "core/pod_array.h"
 #include "io/fs/err_utils.h"
 #include "io/fs/hdfs/hdfs_mgr.h"
 #include "io/fs/hdfs_file_reader.h"
@@ -39,6 +40,7 @@
 #include "io/hdfs_builder.h"
 #include "io/hdfs_util.h"
 #include "runtime/exec_env.h"
+#include "util/bvar_helper.h"
 #include "util/obj_lru_cache.h"
 #include "util/slice.h"
 
@@ -53,14 +55,13 @@ namespace doris::io {
 
 Result<std::shared_ptr<HdfsFileSystem>> HdfsFileSystem::create(
         const std::map<std::string, std::string>& properties, std::string fs_name, std::string id,
-        RuntimeProfile* profile, std::string root_path) {
+        std::string root_path) {
     return HdfsFileSystem::create(parse_properties(properties), std::move(fs_name), std::move(id),
-                                  profile, std::move(root_path));
+                                  std::move(root_path));
 }
 
 Result<std::shared_ptr<HdfsFileSystem>> HdfsFileSystem::create(const THdfsParams& hdfs_params,
                                                                std::string fs_name, std::string id,
-                                                               RuntimeProfile* profile,
                                                                std::string root_path) {
 #ifdef USE_HADOOP_HDFS
     if (!config::enable_java_support) {
@@ -69,18 +70,17 @@ Result<std::shared_ptr<HdfsFileSystem>> HdfsFileSystem::create(const THdfsParams
                 "true."));
     }
 #endif
-    std::shared_ptr<HdfsFileSystem> fs(new HdfsFileSystem(
-            hdfs_params, std::move(fs_name), std::move(id), profile, std::move(root_path)));
+    std::shared_ptr<HdfsFileSystem> fs(new HdfsFileSystem(hdfs_params, std::move(fs_name),
+                                                          std::move(id), std::move(root_path)));
     RETURN_IF_ERROR_RESULT(fs->init());
     return fs;
 }
 
 HdfsFileSystem::HdfsFileSystem(const THdfsParams& hdfs_params, std::string fs_name, std::string id,
-                               RuntimeProfile* profile, std::string root_path)
+                               std::string root_path)
         : RemoteFileSystem(std::move(root_path), std::move(id), FileSystemType::HDFS),
           _hdfs_params(hdfs_params),
-          _fs_name(std::move(fs_name)),
-          _profile(profile) {
+          _fs_name(std::move(fs_name)) {
     if (_fs_name.empty()) {
         _fs_name = hdfs_params.fs_name;
     }
@@ -111,15 +111,18 @@ Status HdfsFileSystem::create_file_impl(const Path& file, FileWriterPtr* writer,
 Status HdfsFileSystem::open_file_internal(const Path& file, FileReaderSPtr* reader,
                                           const FileReaderOptions& opts) {
     CHECK_HDFS_HANDLER(_fs_handler);
-    *reader =
-            DORIS_TRY(HdfsFileReader::create(file, _fs_handler->hdfs_fs, _fs_name, opts, _profile));
+    *reader = DORIS_TRY(HdfsFileReader::create(file, _fs_handler->hdfs_fs, _fs_name, opts));
     return Status::OK();
 }
 
 Status HdfsFileSystem::create_directory_impl(const Path& dir, bool failed_if_exists) {
     CHECK_HDFS_HANDLER(_fs_handler);
     Path real_path = convert_path(dir, _fs_name);
-    int res = hdfsCreateDirectory(_fs_handler->hdfs_fs, real_path.string().c_str());
+    int res;
+    {
+        SCOPED_BVAR_LATENCY(hdfs_bvar::hdfs_create_dir_latency);
+        res = hdfsCreateDirectory(_fs_handler->hdfs_fs, real_path.string().c_str());
+    }
     if (res == -1) {
         return Status::IOError("failed to create directory {}: {}", dir.native(), hdfs_error());
     }
@@ -182,6 +185,7 @@ Status HdfsFileSystem::exists_impl(const Path& path, bool* res) const {
 Status HdfsFileSystem::file_size_impl(const Path& path, int64_t* file_size) const {
     CHECK_HDFS_HANDLER(_fs_handler);
     Path real_path = convert_path(path, _fs_name);
+    SCOPED_BVAR_LATENCY(hdfs_bvar::hdfs_get_path_info_latency);
     hdfsFileInfo* file_info = hdfsGetPathInfo(_fs_handler->hdfs_fs, real_path.string().c_str());
     if (file_info == nullptr) {
         return Status::IOError("failed to get file size of {}: {}", path.native(), hdfs_error());
@@ -224,6 +228,7 @@ Status HdfsFileSystem::list_impl(const Path& path, bool only_file, std::vector<F
 }
 
 Status HdfsFileSystem::rename_impl(const Path& orig_name, const Path& new_name) {
+    CHECK_HDFS_HANDLER(_fs_handler);
     Path normal_orig_name = convert_path(orig_name, _fs_name);
     Path normal_new_name = convert_path(new_name, _fs_name);
     int ret = hdfsRename(_fs_handler->hdfs_fs, normal_orig_name.c_str(), normal_new_name.c_str());
@@ -296,18 +301,19 @@ Status HdfsFileSystem::download_impl(const Path& remote_file, const Path& local_
     // 4. read remote and write to local
     LOG(INFO) << "read remote file: " << remote_file << " to local: " << local_file;
     constexpr size_t buf_sz = 1024 * 1024;
-    std::unique_ptr<char[]> read_buf(new char[buf_sz]);
+    PODArray<char> read_buf;
+    read_buf.resize(buf_sz);
     size_t cur_offset = 0;
     while (true) {
         size_t read_len = 0;
-        Slice file_slice(read_buf.get(), buf_sz);
+        Slice file_slice(read_buf.data(), buf_sz);
         RETURN_IF_ERROR(hdfs_reader->read_at(cur_offset, file_slice, &read_len));
         cur_offset += read_len;
         if (read_len == 0) {
             break;
         }
 
-        RETURN_IF_ERROR(local_writer->append({read_buf.get(), read_len}));
+        RETURN_IF_ERROR(local_writer->append({read_buf.data(), read_len}));
     }
     return local_writer->close();
 }

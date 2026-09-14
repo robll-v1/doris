@@ -20,8 +20,8 @@ package org.apache.doris.hudi;
 import org.apache.doris.common.classloader.ThreadClassLoaderContext;
 import org.apache.doris.common.jni.JniScanner;
 import org.apache.doris.common.jni.vec.ColumnType;
-import org.apache.doris.common.security.authentication.PreExecutionAuthenticator;
-import org.apache.doris.common.security.authentication.PreExecutionAuthenticatorCache;
+import org.apache.doris.kerberos.PreExecutionAuthenticator;
+import org.apache.doris.kerberos.PreExecutionAuthenticatorCache;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
@@ -137,6 +137,7 @@ public class HadoopHudiJniScanner extends JniScanner {
         } else {
             zoneId = ZoneId.of(params.get("time_zone"));
         }
+        // Hudi keeps one session zone for every timestamp encoding to preserve its JNI contract.
         this.columnValue = new HadoopHudiColumnValue(zoneId);
         this.fetchSize = fetchSize;
         this.classLoader = this.getClass().getClassLoader();
@@ -168,7 +169,7 @@ public class HadoopHudiJniScanner extends JniScanner {
                 ArrayWritable value = reader.createValue();
                 long startTime = System.nanoTime();
                 int numRows = 0;
-                for (; numRows < fetchSize; numRows++) {
+                for (; numRows < batchSize; numRows++) {
                     if (!reader.next(key, value)) {
                         break;
                     }

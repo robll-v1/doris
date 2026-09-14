@@ -21,13 +21,15 @@ import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.DatabaseIf;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.TableIf;
+import org.apache.doris.catalog.constraint.ConstraintManager;
 import org.apache.doris.catalog.constraint.PrimaryKeyConstraint;
 import org.apache.doris.catalog.constraint.UniqueConstraint;
+import org.apache.doris.catalog.info.TableNameInfo;
 import org.apache.doris.common.IdGenerator;
 import org.apache.doris.datasource.CatalogIf;
+import org.apache.doris.info.TableNameInfoUtils;
 import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.memo.GroupExpression;
-import org.apache.doris.nereids.processor.post.runtimefilterv2.RuntimeFilterV2;
 import org.apache.doris.nereids.properties.DataTrait;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.properties.PhysicalProperties;
@@ -40,7 +42,7 @@ import org.apache.doris.nereids.trees.plans.RelationId;
 import org.apache.doris.nereids.trees.plans.algebra.CatalogRelation;
 import org.apache.doris.nereids.util.Utils;
 import org.apache.doris.qe.ConnectContext;
-import org.apache.doris.statistics.Statistics;
+import org.apache.doris.statistics.model.Statistics;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
@@ -197,24 +199,23 @@ public abstract class PhysicalCatalogRelation extends PhysicalRelation implement
             getAppliedRuntimeFilters()
                     .stream().forEach(rf -> shapeBuilder.append(" RF").append(rf.getId().asInt()));
         }
-        if (!runtimeFiltersV2.isEmpty()) {
-            shapeBuilder.append(" RFV2:");
-            for (RuntimeFilterV2 rfv2 : runtimeFiltersV2) {
-                shapeBuilder.append(" RF").append(rfv2.getId().asInt());
-            }
-        }
         return shapeBuilder.toString();
     }
 
     @Override
     public void computeUnique(DataTrait.Builder builder) {
         Set<Slot> outputSet = Utils.fastToImmutableSet(getOutputSet());
-        for (PrimaryKeyConstraint c : table.getPrimaryKeyConstraints()) {
+        TableNameInfo tableNameInfo = TableNameInfoUtils.fromTableOrNull(table);
+        if (tableNameInfo == null) {
+            return;
+        }
+        ConstraintManager cm = Env.getCurrentEnv().getConstraintManager();
+        for (PrimaryKeyConstraint c : cm.getPrimaryKeyConstraints(tableNameInfo)) {
             Set<Column> columns = c.getPrimaryKeys(table);
             builder.addUniqueSlot((ImmutableSet) findSlotsByColumn(outputSet, columns));
         }
 
-        for (UniqueConstraint c : table.getUniqueConstraints()) {
+        for (UniqueConstraint c : cm.getUniqueConstraints(tableNameInfo)) {
             Set<Column> columns = c.getUniqueKeys(table);
             builder.addUniqueSlot((ImmutableSet) findSlotsByColumn(outputSet, columns));
         }
@@ -236,7 +237,12 @@ public abstract class PhysicalCatalogRelation extends PhysicalRelation implement
                 slotSet.add(slotRef);
             }
         }
-        return slotSet.build();
+        // A composite constraint (e.g. UNIQUE(a,b)) must appear in the output COMPLETELY to be
+        // registered. When the scan output misses a constrained column (e.g. a non-base index
+        // that only covers (a,c)), registering the partial set {a} wrongly marks {a} as unique
+        // and lets EliminateGroupByKey derive a -> c. Return empty in that case.
+        ImmutableSet<SlotReference> matched = slotSet.build();
+        return matched.size() == columns.size() ? matched : ImmutableSet.of();
     }
 
     @Override

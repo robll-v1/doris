@@ -27,6 +27,7 @@ import org.apache.doris.planner.ScanNode;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.SessionVariable;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -56,12 +57,6 @@ public abstract class TableValuedFunctionIf {
                 return new HttpStreamTableValuedFunction(params);
             case LocalTableValuedFunction.NAME:
                 return new LocalTableValuedFunction(params);
-            case IcebergTableValuedFunction.NAME:
-                return IcebergTableValuedFunction.create(params);
-            case HudiTableValuedFunction.NAME:
-                return new HudiTableValuedFunction(params);
-            case PaimonTableValuedFunction.NAME:
-                return PaimonTableValuedFunction.create(params);
             case BackendsTableValuedFunction.NAME:
                 return new BackendsTableValuedFunction(params);
             case FrontendsTableValuedFunction.NAME:
@@ -78,6 +73,23 @@ public abstract class TableValuedFunctionIf {
                 return new JobsTableValuedFunction(params);
             case TasksTableValuedFunction.NAME:
                 return new TasksTableValuedFunction(params);
+            case ParquetMetadataTableValuedFunction.NAME:
+                return new ParquetMetadataTableValuedFunction(params);
+            case ParquetMetadataTableValuedFunction.NAME_FILE_METADATA: {
+                Map<String, String> copy = new HashMap<>(params);
+                copy.put("mode", "parquet_file_metadata");
+                return new ParquetMetadataTableValuedFunction(copy);
+            }
+            case ParquetMetadataTableValuedFunction.NAME_KV_METADATA: {
+                Map<String, String> copy = new HashMap<>(params);
+                copy.put("mode", "parquet_kv_metadata");
+                return new ParquetMetadataTableValuedFunction(copy);
+            }
+            case ParquetMetadataTableValuedFunction.NAME_BLOOM_PROBE: {
+                Map<String, String> copy = new HashMap<>(params);
+                copy.put("mode", "parquet_bloom_probe");
+                return new ParquetMetadataTableValuedFunction(copy);
+            }
             case GroupCommitTableValuedFunction.NAME:
                 return new GroupCommitTableValuedFunction(params);
             case QueryTableValueFunction.NAME:
@@ -88,6 +100,8 @@ public abstract class TableValuedFunctionIf {
                 return new FileTableValuedFunction(params);
             case HttpTableValuedFunction.NAME:
                 return new HttpTableValuedFunction(params);
+            case TableBinlogFunction.NAME:
+                return new TableBinlogFunction(params);
             default:
                 throw new AnalysisException("Could not find table function " + funcName);
         }
@@ -98,6 +112,10 @@ public abstract class TableValuedFunctionIf {
     public abstract List<Column> getTableColumns() throws AnalysisException;
 
     public abstract ScanNode getScanNode(PlanNodeId id, TupleDescriptor desc, SessionVariable sv);
+
+    public String getHiveParquetTimeZone() {
+        return "";
+    }
 
     public void checkAuth(ConnectContext ctx) {
 

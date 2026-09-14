@@ -42,10 +42,10 @@ public:
     // - /path_to_file
     // TODO(plat1ko): Support related path for cloud mode
     static Result<FileReaderSPtr> create(Path path, const hdfsFS& fs, std::string fs_name,
-                                         const FileReaderOptions& opts, RuntimeProfile* profile);
+                                         const FileReaderOptions& opts);
 
     HdfsFileReader(Path path, std::string fs_name, FileHandleCache::Accessor accessor,
-                   RuntimeProfile* profile);
+                   int64_t mtime = 0);
 
     ~HdfsFileReader() override;
 
@@ -57,37 +57,21 @@ public:
 
     bool closed() const override { return _closed.load(std::memory_order_acquire); }
 
+    int64_t mtime() const override { return _mtime; }
+
 protected:
     Status read_at_impl(size_t offset, Slice result, size_t* bytes_read,
                         const IOContext* io_ctx) override;
-
-    void _collect_profile_before_close() override;
 
     Status do_read_at_impl(size_t offset, Slice result, size_t* bytes_read,
                            const IOContext* io_ctx);
 
 private:
-#ifdef USE_HADOOP_HDFS
-    struct HDFSProfile {
-        RuntimeProfile::Counter* total_bytes_read = nullptr;
-        RuntimeProfile::Counter* total_local_bytes_read = nullptr;
-        RuntimeProfile::Counter* total_short_circuit_bytes_read = nullptr;
-        RuntimeProfile::Counter* total_total_zero_copy_bytes_read = nullptr;
-
-        RuntimeProfile::Counter* total_hedged_read = nullptr;
-        RuntimeProfile::Counter* hedged_read_in_cur_thread = nullptr;
-        RuntimeProfile::Counter* hedged_read_wins = nullptr;
-    };
-#endif
-
     Path _path;
     std::string _fs_name;
     FileHandleCache::Accessor _accessor;
     CachedHdfsFileHandle* _handle = nullptr; // owned by _cached_file_handle
     std::atomic<bool> _closed = false;
-    RuntimeProfile* _profile = nullptr;
-#ifdef USE_HADOOP_HDFS
-    HDFSProfile _hdfs_profile;
-#endif
+    int64_t _mtime;
 };
 } // namespace doris::io

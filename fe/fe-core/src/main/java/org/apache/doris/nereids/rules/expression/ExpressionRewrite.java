@@ -51,6 +51,7 @@ import org.apache.doris.nereids.trees.plans.logical.LogicalSetOperation;
 import org.apache.doris.nereids.trees.plans.logical.LogicalSink;
 import org.apache.doris.nereids.trees.plans.logical.LogicalSort;
 import org.apache.doris.nereids.trees.plans.logical.LogicalTopN;
+import org.apache.doris.nereids.trees.plans.logical.LogicalUnion;
 import org.apache.doris.nereids.trees.plans.logical.LogicalWindow;
 import org.apache.doris.nereids.util.ExpressionUtils;
 import org.apache.doris.nereids.util.JoinUtils;
@@ -107,12 +108,10 @@ public class ExpressionRewrite implements RewriteRuleFactory {
                 new LogicalCteConsumerRewrite().build(),
                 new LogicalResultSinkRewrite().build(),
                 new LogicalFileSinkRewrite().build(),
-                new LogicalHiveTableSinkRewrite().build(),
-                new LogicalIcebergTableSinkRewrite().build(),
-                new LogicalJdbcTableSinkRewrite().build(),
+                new LogicalExternalRowLevelMergeSinkRewrite().build(),
+                new LogicalConnectorTableSinkRewrite().build(),
                 new LogicalOlapTableSinkRewrite().build(),
                 new LogicalDictionarySinkRewrite().build(),
-                new LogicalDeferMaterializeResultSinkRewrite().build(),
                 new LogicalOlapTableSinkExpressionRewrite().build());
     }
 
@@ -127,10 +126,18 @@ public class ExpressionRewrite implements RewriteRuleFactory {
                 List<Function> newGenerators = generators.stream()
                         .map(func -> (Function) rewriter.rewrite(func, context))
                         .collect(ImmutableList.toImmutableList());
-                if (generators.equals(newGenerators)) {
+                // lateral ON conjuncts must be rewritten together with the generators:
+                // they reference the child output, so an ExprId replacement (e.g. any_value
+                // wrapping in EliminateGroupByKeyByUniform) that is not applied here would
+                // leave a stale slot and fail final slot validation.
+                List<Expression> conjuncts = generate.getConjuncts();
+                List<Expression> newConjuncts = conjuncts.stream()
+                        .map(conjunct -> rewriter.rewrite(conjunct, context))
+                        .collect(ImmutableList.toImmutableList());
+                if (generators.equals(newGenerators) && conjuncts.equals(newConjuncts)) {
                     return generate;
                 }
-                return generate.withGenerators(newGenerators);
+                return generate.withGeneratorsAndConjuncts(newGenerators, newConjuncts);
             }).toRule(RuleType.REWRITE_GENERATE_EXPRESSION);
         }
     }
@@ -232,10 +239,10 @@ public class ExpressionRewrite implements RewriteRuleFactory {
                 List<Expression> groupByExprs = agg.getGroupByExpressions();
                 ExpressionRewriteContext context = new ExpressionRewriteContext(agg, ctx.cascadesContext);
                 List<Expression> newGroupByExprs = rewriter.rewrite(groupByExprs, context);
-
+                boolean groupByChanged = !newGroupByExprs.equals(groupByExprs);
                 List<NamedExpression> outputExpressions = agg.getOutputExpressions();
                 RewriteResult<NamedExpression> result = rewriteAll(outputExpressions, rewriter, context);
-                if (!result.changed) {
+                if (!result.changed && !groupByChanged) {
                     return agg;
                 }
                 return new LogicalAggregate<>(newGroupByExprs, result.result,
@@ -384,10 +391,33 @@ public class ExpressionRewrite implements RewriteRuleFactory {
                     changed |= result.changed;
                     newSlotsList.add(result.result);
                 }
-                if (!changed) {
-                    return setOperation;
+                if (setOperation instanceof LogicalUnion) {
+                    LogicalUnion logicalUnion = (LogicalUnion) setOperation;
+                    List<List<NamedExpression>> constantExprsList = logicalUnion.getConstantExprsList();
+                    ImmutableList.Builder<List<NamedExpression>> newConstantListBuilder = ImmutableList.builder();
+                    for (List<NamedExpression> oneRowProject : constantExprsList) {
+                        Builder<NamedExpression> rewrittenExprs = ImmutableList
+                                .builderWithExpectedSize(oneRowProject.size());
+                        for (NamedExpression project : oneRowProject) {
+                            NamedExpression newProject = (NamedExpression) rewriter.rewrite(project, context);
+                            if (!changed && !project.deepEquals(newProject)) {
+                                changed = true;
+                            }
+                            rewrittenExprs.add(newProject);
+                        }
+                        newConstantListBuilder.add(rewrittenExprs.build());
+                    }
+                    if (!changed) {
+                        return setOperation;
+                    }
+                    return logicalUnion.withChildrenAndConstExprsList(setOperation.children(), newSlotsList,
+                            newConstantListBuilder.build());
+                } else {
+                    if (!changed) {
+                        return setOperation;
+                    }
+                    return setOperation.withChildrenAndTheirOutputs(setOperation.children(), newSlotsList);
                 }
-                return setOperation.withChildrenAndTheirOutputs(setOperation.children(), newSlotsList);
             })
             .toRule(RuleType.REWRITE_SET_OPERATION_EXPRESSION);
         }
@@ -478,26 +508,18 @@ public class ExpressionRewrite implements RewriteRuleFactory {
         }
     }
 
-    private class LogicalHiveTableSinkRewrite extends OneRewriteRuleFactory {
+    private class LogicalExternalRowLevelMergeSinkRewrite extends OneRewriteRuleFactory {
         @Override
         public Rule build() {
-            return logicalHiveTableSink().thenApply(ExpressionRewrite.this::applyRewriteToSink)
+            return logicalExternalRowLevelMergeSink().thenApply(ExpressionRewrite.this::applyRewriteToSink)
                     .toRule(RuleType.REWRITE_SINK_EXPRESSION);
         }
     }
 
-    private class LogicalIcebergTableSinkRewrite extends OneRewriteRuleFactory {
+    private class LogicalConnectorTableSinkRewrite extends OneRewriteRuleFactory {
         @Override
         public Rule build() {
-            return logicalIcebergTableSink().thenApply(ExpressionRewrite.this::applyRewriteToSink)
-                    .toRule(RuleType.REWRITE_SINK_EXPRESSION);
-        }
-    }
-
-    private class LogicalJdbcTableSinkRewrite extends OneRewriteRuleFactory {
-        @Override
-        public Rule build() {
-            return logicalJdbcTableSink().thenApply(ExpressionRewrite.this::applyRewriteToSink)
+            return logicalConnectorTableSink().thenApply(ExpressionRewrite.this::applyRewriteToSink)
                     .toRule(RuleType.REWRITE_SINK_EXPRESSION);
         }
     }
@@ -514,14 +536,6 @@ public class ExpressionRewrite implements RewriteRuleFactory {
         @Override
         public Rule build() {
             return logicalDictionarySink().thenApply(ExpressionRewrite.this::applyRewriteToSink)
-                    .toRule(RuleType.REWRITE_SINK_EXPRESSION);
-        }
-    }
-
-    private class LogicalDeferMaterializeResultSinkRewrite extends OneRewriteRuleFactory {
-        @Override
-        public Rule build() {
-            return logicalDeferMaterializeResultSink().thenApply(ExpressionRewrite.this::applyRewriteToSink)
                     .toRule(RuleType.REWRITE_SINK_EXPRESSION);
         }
     }

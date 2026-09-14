@@ -23,11 +23,11 @@
 #include "cloud/cloud_meta_mgr.h"
 #include "cloud/cloud_storage_engine.h"
 #include "cloud/config.h"
-#include "olap/delta_writer.h"
-#include "runtime/tablets_channel.h"
+#include "load/channel/tablets_channel.h"
+#include "load/delta_writer/delta_writer.h"
+#include "storage/tablet_info.h"
 
 namespace doris {
-#include "common/compile_check_begin.h"
 
 CloudTabletsChannel::CloudTabletsChannel(CloudStorageEngine& engine, const TabletsChannelKey& key,
                                          const UniqueId& load_id, bool is_high_priority,
@@ -38,7 +38,40 @@ CloudTabletsChannel::~CloudTabletsChannel() = default;
 
 std::unique_ptr<BaseDeltaWriter> CloudTabletsChannel::create_delta_writer(
         const WriteRequest& request) {
-    return std::make_unique<CloudDeltaWriter>(_engine, request, _profile, _load_id);
+    DCHECK(request.write_req_type == WriteRequestType::DATA);
+    DCHECK(request.table_schema_param != nullptr);
+
+    if (request.binlog_tablet_id <= 0) {
+        return std::make_unique<CloudDeltaWriter>(_engine, request, _profile, _load_id);
+    }
+
+    int64_t row_binlog_index_id = 0;
+    for (const auto* index_schema : request.table_schema_param->indexes()) {
+        if (index_schema->index_id == request.index_id) {
+            row_binlog_index_id = index_schema->row_binlog_id;
+            break;
+        }
+    }
+    DCHECK(row_binlog_index_id > 0);
+
+    const auto* row_binlog_index_schema =
+            request.table_schema_param->row_binlog_index_schema(row_binlog_index_id);
+    DCHECK(row_binlog_index_schema != nullptr);
+
+    WriteRequest group_build_req = request;
+    group_build_req.write_req_type = WriteRequestType::GROUP;
+
+    WriteRequest sub_data_req = request;
+    sub_data_req.write_req_type = WriteRequestType::DATA;
+
+    WriteRequest sub_row_binlog_req = request;
+    sub_row_binlog_req.write_req_type = WriteRequestType::ROW_BINLOG;
+    sub_row_binlog_req.tablet_id = request.binlog_tablet_id;
+    sub_row_binlog_req.index_id = row_binlog_index_schema->index_id;
+    sub_row_binlog_req.schema_hash = row_binlog_index_schema->schema_hash;
+
+    return std::make_unique<CloudDeltaWriter>(_engine, group_build_req, sub_data_req,
+                                              sub_row_binlog_req, _profile, _load_id);
 }
 
 Status CloudTabletsChannel::add_batch(const PTabletWriterAddBlockRequest& request,
@@ -46,7 +79,9 @@ Status CloudTabletsChannel::add_batch(const PTabletWriterAddBlockRequest& reques
     // FIXME(plat1ko): Too many duplicate code with `TabletsChannel`
     SCOPED_TIMER(_add_batch_timer);
     int64_t cur_seq = 0;
-    _add_batch_number_counter->update(1);
+    if (_add_batch_number_counter != nullptr) {
+        _add_batch_number_counter->update(1);
+    }
 
     auto status = _get_current_seq(cur_seq, request);
     if (UNLIKELY(!status.ok())) {
@@ -59,8 +94,27 @@ Status CloudTabletsChannel::add_batch(const PTabletWriterAddBlockRequest& reques
         return Status::OK();
     }
 
-    std::unordered_map<int64_t, DorisVector<uint32_t>> tablet_to_rowidxs;
-    _build_tablet_to_rowidxs(request, &tablet_to_rowidxs);
+    if (request.is_adaptive_random_bucket()) {
+        std::unordered_map<int64_t, DorisVector<uint32_t>> partition_to_rowidxs;
+        RETURN_IF_ERROR(_build_partition_to_rowidxs_for_adaptive_random_bucket(
+                request, &partition_to_rowidxs));
+        if (!partition_to_rowidxs.empty() && !config::skip_writing_empty_rowset_metadata) {
+            std::unordered_set<int64_t> partition_ids;
+            partition_ids.reserve(partition_to_rowidxs.size());
+            for (const auto& [partition_id, _] : partition_to_rowidxs) {
+                partition_ids.insert(partition_id);
+            }
+            {
+                std::lock_guard<std::mutex> l(_tablet_writers_lock);
+                RETURN_IF_ERROR(_init_writers_by_partition_ids(partition_ids));
+            }
+        }
+        return _write_block_data_for_adaptive_random_bucket(request, cur_seq, partition_to_rowidxs,
+                                                            response);
+    }
+
+    std::unordered_map<int64_t, TabletAddRowsPayload> tablet_to_rows;
+    _build_tablet_to_rows(request, &tablet_to_rows);
 
     std::unordered_set<int64_t> partition_ids;
     std::vector<CloudDeltaWriter*> writers;
@@ -68,7 +122,7 @@ Status CloudTabletsChannel::add_batch(const PTabletWriterAddBlockRequest& reques
         // add_batch may concurrency with inc_open but not under _lock.
         // so need to protect it with _tablet_writers_lock.
         std::lock_guard<std::mutex> l(_tablet_writers_lock);
-        for (auto& [tablet_id, _] : tablet_to_rowidxs) {
+        for (auto& [tablet_id, _] : tablet_to_rows) {
             auto tablet_writer_it = _tablet_writers.find(tablet_id);
             if (tablet_writer_it == _tablet_writers.end()) {
                 return Status::InternalError("unknown tablet to append data, tablet={}", tablet_id);
@@ -83,7 +137,15 @@ Status CloudTabletsChannel::add_batch(const PTabletWriterAddBlockRequest& reques
         }
     }
 
-    return _write_block_data(request, cur_seq, tablet_to_rowidxs, response);
+    return _write_block_data(request, cur_seq, tablet_to_rows, response);
+}
+
+Status CloudTabletsChannel::_prepare_adaptive_random_bucket_writer(BaseDeltaWriter* writer) {
+    auto* cloud_writer = static_cast<CloudDeltaWriter*>(writer);
+    if (!cloud_writer->is_init()) {
+        return CloudDeltaWriter::batch_init({cloud_writer});
+    }
+    return Status::OK();
 }
 
 Status CloudTabletsChannel::_init_writers_by_partition_ids(
@@ -250,9 +312,9 @@ Status CloudTabletsChannel::close(LoadChannel* parent, const PTabletWriterAddBlo
         }
     }
 
-    // 6. set txn related delete bitmap if necessary
+    // 6. set txn related info if necessary
     for (auto it = writers_to_commit.begin(); it != writers_to_commit.end();) {
-        auto st = (*it)->set_txn_related_delete_bitmap();
+        auto st = (*it)->set_txn_related_info();
         if (!st.ok()) {
             _add_error_tablet(tablet_errors, (*it)->tablet_id(), st);
             _close_status = std::move(st);
@@ -261,7 +323,7 @@ Status CloudTabletsChannel::close(LoadChannel* parent, const PTabletWriterAddBlo
         it++;
     }
 
-    tablet_vec->Reserve(static_cast<int>(writers_to_commit.size()));
+    tablet_vec->Reserve(static_cast<int>(writers_to_commit.size() * 2));
     for (auto* writer : writers_to_commit) {
         PTabletInfo* tablet_info = tablet_vec->Add();
         tablet_info->set_tablet_id(writer->tablet_id());
@@ -269,6 +331,13 @@ Status CloudTabletsChannel::close(LoadChannel* parent, const PTabletWriterAddBlo
         tablet_info->set_schema_hash(0);
         tablet_info->set_received_rows(writer->total_received_rows());
         tablet_info->set_num_rows_filtered(writer->num_rows_filtered());
+        if (writer->binlog_tablet_id() > 0) {
+            PTabletInfo* binlog_tablet_info = tablet_vec->Add();
+            binlog_tablet_info->set_tablet_id(writer->binlog_tablet_id());
+            binlog_tablet_info->set_schema_hash(0);
+            binlog_tablet_info->set_received_rows(writer->total_received_rows());
+            binlog_tablet_info->set_num_rows_filtered(writer->num_rows_filtered());
+        }
         // These stats may be larger than the actual value if the txn is aborted
         writer->update_tablet_stats();
     }
@@ -277,5 +346,4 @@ Status CloudTabletsChannel::close(LoadChannel* parent, const PTabletWriterAddBlo
     return Status::OK();
 }
 
-#include "common/compile_check_end.h"
 } // namespace doris

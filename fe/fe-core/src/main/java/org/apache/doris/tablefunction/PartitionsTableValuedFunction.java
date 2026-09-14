@@ -28,10 +28,8 @@ import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.MetaNotFoundException;
 import org.apache.doris.datasource.CatalogIf;
 import org.apache.doris.datasource.InternalCatalog;
-import org.apache.doris.datasource.hive.HMSExternalCatalog;
-import org.apache.doris.datasource.hive.HMSExternalTable;
-import org.apache.doris.datasource.maxcompute.MaxComputeExternalCatalog;
-import org.apache.doris.datasource.maxcompute.MaxComputeExternalTable;
+import org.apache.doris.datasource.plugin.PluginDrivenExternalCatalog;
+import org.apache.doris.datasource.plugin.PluginDrivenExternalTable;
 import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.qe.ConnectContext;
@@ -44,7 +42,6 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Maps;
-import org.apache.commons.collections4.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -88,7 +85,10 @@ public class PartitionsTableValuedFunction extends MetadataTableValuedFunction {
             new Column("ReplicaAllocation", ScalarType.createStringType()),
             new Column("IsMutable", ScalarType.createType(PrimitiveType.BOOLEAN)),
             new Column("SyncWithBaseTables", ScalarType.createType(PrimitiveType.BOOLEAN)),
-            new Column("UnsyncTables", ScalarType.createStringType()));
+            new Column("UnsyncTables", ScalarType.createStringType()),
+            new Column("CommittedVersion", ScalarType.createType(PrimitiveType.BIGINT)),
+            new Column("RowCount", ScalarType.createType(PrimitiveType.BIGINT)),
+            new Column("InvertedIndexStorageFormat", ScalarType.createStringType()));
 
     private static final ImmutableList<Column> SCHEMA_FOR_EXTERNAL_TABLE = ImmutableList.of(
             new Column("Partition", ScalarType.createStringType()));
@@ -140,7 +140,7 @@ public class PartitionsTableValuedFunction extends MetadataTableValuedFunction {
             // check ctl, db, tbl
             validParams.put(key.toLowerCase(), params.get(key));
         }
-        String catalogName = validParams.get(CATALOG);
+        String catalogName = validParams.getOrDefault(CATALOG, InternalCatalog.INTERNAL_CATALOG_NAME);
         String dbName = validParams.get(DB);
         String tableName = validParams.get(TABLE);
         if (StringUtils.isEmpty(catalogName) || StringUtils.isEmpty(dbName) || StringUtils.isEmpty(tableName)) {
@@ -156,6 +156,10 @@ public class PartitionsTableValuedFunction extends MetadataTableValuedFunction {
     }
 
     private void analyze(String catalogName, String dbName, String tableName) {
+        CatalogIf catalog = Env.getCurrentEnv().getCatalogMgr().getCatalog(catalogName);
+        if (catalog == null) {
+            throw new AnalysisException("can not find catalog: " + catalogName);
+        }
         if (!Env.getCurrentEnv().getAccessManager()
                 .checkTblPriv(ConnectContext.get(), catalogName, dbName,
                         tableName, PrivPredicate.SHOW)) {
@@ -164,13 +168,8 @@ public class PartitionsTableValuedFunction extends MetadataTableValuedFunction {
                     catalogName + ": " + dbName + ": " + tableName);
             throw new AnalysisException(message);
         }
-        CatalogIf catalog = Env.getCurrentEnv().getCatalogMgr().getCatalog(catalogName);
-        if (catalog == null) {
-            throw new AnalysisException("can not find catalog: " + catalogName);
-        }
         // disallow unsupported catalog
-        if (!(catalog.isInternalCatalog() || catalog instanceof HMSExternalCatalog
-                || catalog instanceof MaxComputeExternalCatalog)) {
+        if (!(catalog.isInternalCatalog() || catalog instanceof PluginDrivenExternalCatalog)) {
             throw new AnalysisException(String.format("Catalog of type '%s' is not allowed in ShowPartitionsStmt",
                     catalog.getType()));
         }
@@ -182,23 +181,17 @@ public class PartitionsTableValuedFunction extends MetadataTableValuedFunction {
         TableIf table = null;
         try {
             table = db.get().getTableOrMetaException(tableName, TableType.OLAP,
-                    TableType.HMS_EXTERNAL_TABLE, TableType.MAX_COMPUTE_EXTERNAL_TABLE);
+                    TableType.PLUGIN_EXTERNAL_TABLE);
         } catch (MetaNotFoundException e) {
             throw new AnalysisException(e.getMessage(), e);
         }
 
-        if (table instanceof HMSExternalTable) {
-            if (((HMSExternalTable) table).isView()) {
-                throw new AnalysisException("Table " + tableName + " is not a partitioned table");
-            }
-            if (CollectionUtils.isEmpty(((HMSExternalTable) table).getPartitionColumns())) {
-                throw new AnalysisException("Table " + tableName + " is not a partitioned table");
-            }
-            return;
-        }
-
-        if (table instanceof MaxComputeExternalTable) {
-            if (((MaxComputeExternalTable) table).getOdpsTable().getPartitions().isEmpty()) {
+        if (table instanceof PluginDrivenExternalTable) {
+            // Keyed on partition columns (isPartitionedTable), consistent with the SHOW PARTITIONS
+            // gate (ShowPartitionsCommand). A partitioned-but-empty table returns 0 rows rather than
+            // throwing -- a deliberate, more-correct deviation from legacy MC's partition-instance
+            // check above.
+            if (!((PluginDrivenExternalTable) table).isPartitionedTable()) {
                 throw new AnalysisException("Table " + tableName + " is not a partitioned table");
             }
         }

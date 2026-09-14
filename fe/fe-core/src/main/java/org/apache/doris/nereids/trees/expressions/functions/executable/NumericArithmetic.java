@@ -17,6 +17,7 @@
 
 package org.apache.doris.nereids.trees.expressions.functions.executable;
 
+import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.trees.expressions.ExecFunction;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.literal.BigIntLiteral;
@@ -322,6 +323,9 @@ public class NumericArithmetic {
             boolean isLowerInclusive, boolean isUpperInclusive) {
         if (input instanceof DoubleLiteral) {
             double inputValue = ((DoubleLiteral) input).getValue();
+            if (Double.isNaN(inputValue)) {
+                return false;
+            }
             boolean lowerCheck = isLowerInclusive ? (inputValue >= lowerBound) : (inputValue > lowerBound);
             // Check upper bound
             boolean upperCheck = isUpperInclusive ? (inputValue <= upperBound) : (inputValue < upperBound);
@@ -725,11 +729,7 @@ public class NumericArithmetic {
      */
     @ExecFunction(name = "signbit")
     public static Expression signbit(DoubleLiteral first) {
-        if (first.getValue() < 0) {
-            return BooleanLiteral.of(true);
-        } else {
-            return BooleanLiteral.of(false);
-        }
+        return BooleanLiteral.of(Double.doubleToRawLongBits(first.getValue()) < 0);
     }
 
     /**
@@ -1107,5 +1107,44 @@ public class NumericArithmetic {
     @ExecFunction(name = "bool_xor")
     public static Expression boolxor(BooleanLiteral first) {
         return first;
+    }
+
+    /**
+     * interval
+     */
+    @ExecFunction(name = "interval")
+    public static Expression interval(NullLiteral compareValue, Literal... thresholds) {
+        return new IntegerLiteral(-1);
+    }
+
+    /**
+     * interval
+     */
+    @ExecFunction(name = "interval")
+    public static Expression interval(BigIntLiteral compareValue, Literal... thresholds) {
+        long value = compareValue.getValue();
+
+        long[] thresholdValues = new long[thresholds.length];
+        for (int i = 0; i < thresholds.length; i++) {
+            if (thresholds[i] instanceof NullLiteral) {
+                thresholdValues[i] = 0;
+            } else if (thresholds[i] instanceof BigIntLiteral) {
+                thresholdValues[i] = ((BigIntLiteral) thresholds[i]).getValue();
+            } else {
+                throw new AnalysisException("Thresholds must be BigIntLiteral or NullLiteral");
+            }
+        }
+
+        int low = 0;
+        int high = thresholdValues.length;
+        while (low < high) {
+            int mid = low + ((high - low) >>> 1);
+            if (thresholdValues[mid] <= value) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        return new IntegerLiteral(low);
     }
 }

@@ -39,6 +39,8 @@ import org.apache.doris.nereids.trees.expressions.functions.agg.Count;
 import org.apache.doris.nereids.trees.expressions.functions.agg.CountByEnum;
 import org.apache.doris.nereids.trees.expressions.functions.agg.Covar;
 import org.apache.doris.nereids.trees.expressions.functions.agg.CovarSamp;
+import org.apache.doris.nereids.trees.expressions.functions.agg.DataSketchesHllUnionAgg;
+import org.apache.doris.nereids.trees.expressions.functions.agg.ExponentialMovingAverage;
 import org.apache.doris.nereids.trees.expressions.functions.agg.GroupArrayIntersect;
 import org.apache.doris.nereids.trees.expressions.functions.agg.GroupArrayUnion;
 import org.apache.doris.nereids.trees.expressions.functions.agg.GroupBitAnd;
@@ -69,12 +71,20 @@ import org.apache.doris.nereids.trees.expressions.functions.agg.OrthogonalBitmap
 import org.apache.doris.nereids.trees.expressions.functions.agg.OrthogonalBitmapUnionCount;
 import org.apache.doris.nereids.trees.expressions.functions.agg.Percentile;
 import org.apache.doris.nereids.trees.expressions.functions.agg.PercentileApprox;
+import org.apache.doris.nereids.trees.expressions.functions.agg.PercentileApproxArray;
 import org.apache.doris.nereids.trees.expressions.functions.agg.PercentileApproxWeighted;
 import org.apache.doris.nereids.trees.expressions.functions.agg.PercentileArray;
 import org.apache.doris.nereids.trees.expressions.functions.agg.PercentileReservoir;
 import org.apache.doris.nereids.trees.expressions.functions.agg.QuantileUnion;
+import org.apache.doris.nereids.trees.expressions.functions.agg.RegrAvgx;
+import org.apache.doris.nereids.trees.expressions.functions.agg.RegrAvgy;
+import org.apache.doris.nereids.trees.expressions.functions.agg.RegrCount;
 import org.apache.doris.nereids.trees.expressions.functions.agg.RegrIntercept;
+import org.apache.doris.nereids.trees.expressions.functions.agg.RegrR2;
 import org.apache.doris.nereids.trees.expressions.functions.agg.RegrSlope;
+import org.apache.doris.nereids.trees.expressions.functions.agg.RegrSxx;
+import org.apache.doris.nereids.trees.expressions.functions.agg.RegrSxy;
+import org.apache.doris.nereids.trees.expressions.functions.agg.RegrSyy;
 import org.apache.doris.nereids.trees.expressions.functions.agg.Retention;
 import org.apache.doris.nereids.trees.expressions.functions.agg.Sem;
 import org.apache.doris.nereids.trees.expressions.functions.agg.SequenceCount;
@@ -90,10 +100,13 @@ import org.apache.doris.nereids.trees.expressions.functions.agg.TopNWeighted;
 import org.apache.doris.nereids.trees.expressions.functions.agg.Variance;
 import org.apache.doris.nereids.trees.expressions.functions.agg.VarianceSamp;
 import org.apache.doris.nereids.trees.expressions.functions.agg.WindowFunnel;
+import org.apache.doris.nereids.trees.expressions.functions.agg.WindowFunnelV2;
+import org.apache.doris.nereids.trees.expressions.functions.combinator.CombineCombinator;
 import org.apache.doris.nereids.trees.expressions.functions.combinator.ForEachCombinator;
 import org.apache.doris.nereids.trees.expressions.functions.combinator.MergeCombinator;
 import org.apache.doris.nereids.trees.expressions.functions.combinator.UnionCombinator;
 import org.apache.doris.nereids.trees.expressions.functions.udf.JavaUdaf;
+import org.apache.doris.nereids.trees.expressions.functions.udf.PythonUdaf;
 
 /** AggregateFunctionVisitor. */
 public interface AggregateFunctionVisitor<R, C> {
@@ -124,6 +137,10 @@ public interface AggregateFunctionVisitor<R, C> {
         return visitAggregateFunction(bitmapAgg, context);
     }
 
+    default R visitExponentialMovingAverage(ExponentialMovingAverage ema, C context) {
+        return visitNullableAggregateFunction(ema, context);
+    }
+
     default R visitBitmapIntersect(BitmapIntersect bitmapIntersect, C context) {
         return visitAggregateFunction(bitmapIntersect, context);
     }
@@ -141,15 +158,15 @@ public interface AggregateFunctionVisitor<R, C> {
     }
 
     default R visitBoolAnd(BoolAnd boolAnd, C context) {
-        return visitAggregateFunction(boolAnd, context);
+        return visitNullableAggregateFunction(boolAnd, context);
     }
 
     default R visitBoolOr(BoolOr boolOr, C context) {
-        return visitAggregateFunction(boolOr, context);
+        return visitNullableAggregateFunction(boolOr, context);
     }
 
     default R visitBoolXor(BoolXor boolXor, C context) {
-        return visitAggregateFunction(boolXor, context);
+        return visitNullableAggregateFunction(boolXor, context);
     }
 
     default R visitCollectList(CollectList collectList, C context) {
@@ -232,6 +249,10 @@ public interface AggregateFunctionVisitor<R, C> {
         return visitAggregateFunction(histogram, context);
     }
 
+    default R visitDataSketchesHllUnionAgg(DataSketchesHllUnionAgg datasketchesHllUnionAgg, C context) {
+        return visitAggregateFunction(datasketchesHllUnionAgg, context);
+    }
+
     default R visitHllUnion(HllUnion hllUnion, C context) {
         return visitAggregateFunction(hllUnion, context);
     }
@@ -312,6 +333,10 @@ public interface AggregateFunctionVisitor<R, C> {
         return visitNullableAggregateFunction(percentileApprox, context);
     }
 
+    default R visitPercentileApproxArray(PercentileApproxArray percentileApproxArray, C context) {
+        return visitAggregateFunction(percentileApproxArray, context);
+    }
+
     default R visitPercentileArray(PercentileArray percentileArray, C context) {
         return visitAggregateFunction(percentileArray, context);
     }
@@ -320,12 +345,40 @@ public interface AggregateFunctionVisitor<R, C> {
         return visitAggregateFunction(quantileUnion, context);
     }
 
+    default R visitRegrAvgx(RegrAvgx regrAvgx, C context) {
+        return visitAggregateFunction(regrAvgx, context);
+    }
+
+    default R visitRegrAvgy(RegrAvgy regrAvgy, C context) {
+        return visitAggregateFunction(regrAvgy, context);
+    }
+
+    default R visitRegrCount(RegrCount regrCount, C context) {
+        return visitAggregateFunction(regrCount, context);
+    }
+
     default R visitRegrIntercept(RegrIntercept regrIntercept, C context) {
         return visitAggregateFunction(regrIntercept, context);
     }
 
+    default R visitRegrR2(RegrR2 regrR2, C context) {
+        return visitAggregateFunction(regrR2, context);
+    }
+
     default R visitRegrSlope(RegrSlope regrSlope, C context) {
         return visitAggregateFunction(regrSlope, context);
+    }
+
+    default R visitRegrSxx(RegrSxx regrSxx, C context) {
+        return visitAggregateFunction(regrSxx, context);
+    }
+
+    default R visitRegrSxy(RegrSxy regrSxy, C context) {
+        return visitAggregateFunction(regrSxy, context);
+    }
+
+    default R visitRegrSyy(RegrSyy regrSyy, C context) {
+        return visitAggregateFunction(regrSyy, context);
     }
 
     default R visitRetention(Retention retention, C context) {
@@ -388,7 +441,15 @@ public interface AggregateFunctionVisitor<R, C> {
         return visitNullableAggregateFunction(windowFunnel, context);
     }
 
+    default R visitWindowFunnelV2(WindowFunnelV2 windowFunnelV2, C context) {
+        return visitNullableAggregateFunction(windowFunnelV2, context);
+    }
+
     default R visitMergeCombinator(MergeCombinator combinator, C context) {
+        return visitAggregateFunction(combinator, context);
+    }
+
+    default R visitCombineCombinator(CombineCombinator combinator, C context) {
         return visitAggregateFunction(combinator, context);
     }
 
@@ -404,4 +465,7 @@ public interface AggregateFunctionVisitor<R, C> {
         return visitAggregateFunction(javaUdaf, context);
     }
 
+    default R visitPythonUdaf(PythonUdaf pythonUdaf, C context) {
+        return visitAggregateFunction(pythonUdaf, context);
+    }
 }

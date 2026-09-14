@@ -17,11 +17,17 @@
 
 package org.apache.doris.nereids.types;
 
+import org.apache.doris.catalog.ScalarType;
 import org.apache.doris.catalog.Type;
+import org.apache.doris.nereids.exceptions.AnalysisException;
+import org.apache.doris.nereids.trees.expressions.literal.StringLiteral;
+import org.apache.doris.nereids.trees.expressions.literal.TimeStampNsLiteral;
 import org.apache.doris.nereids.types.coercion.AnyDataType;
+import org.apache.doris.nereids.types.coercion.DateLikeType;
 import org.apache.doris.nereids.types.coercion.FractionalType;
 import org.apache.doris.nereids.types.coercion.IntegralType;
 import org.apache.doris.nereids.types.coercion.NumericType;
+import org.apache.doris.nereids.types.coercion.ScaleTimeType;
 
 import com.google.common.collect.ImmutableList;
 import org.junit.jupiter.api.Assertions;
@@ -71,6 +77,58 @@ public class DataTypeTest {
     @Test
     void testFromPrimitiveType() {
         Assertions.assertEquals(DataType.fromCatalogType(Type.STRING), StringType.INSTANCE);
+        Assertions.assertSame(TimeStampNsType.INSTANCE,
+                DataType.fromCatalogType(Type.TIMESTAMP_NS));
+        Assertions.assertSame(TimeStampNsType.INSTANCE,
+                DataType.legacyTypeToNereidsType().get(Type.TIMESTAMP_NS.getPrimitiveType()));
+    }
+
+    @Test
+    void testTimeStampNsValidation() {
+        DataType timestampNs = TimeStampNsType.INSTANCE;
+        Assertions.assertDoesNotThrow(timestampNs::validateDataType);
+        Assertions.assertInstanceOf(DateLikeType.class, timestampNs);
+        Assertions.assertInstanceOf(ScaleTimeType.class, timestampNs);
+        Assertions.assertTrue(timestampNs.isDateLikeType());
+        Assertions.assertTrue(timestampNs.isTimeStampNsType());
+        Assertions.assertFalse(timestampNs.isDateTimeV2Type());
+        Assertions.assertFalse(timestampNs.isTimeStampTzType());
+        Assertions.assertEquals(ScalarType.TIMESTAMP_NS_SCALE, TimeStampNsType.INSTANCE.getScale());
+        Assertions.assertEquals(8, timestampNs.width());
+        Assertions.assertEquals("timestamp_ns", timestampNs.toSql());
+        Assertions.assertSame(TimeStampNsType.INSTANCE,
+                TimeStampNsType.INSTANCE.scaleTypeForType(DateTimeV2Type.MAX));
+        Assertions.assertSame(TimeStampNsType.INSTANCE,
+                TimeStampNsType.INSTANCE.forTypeFromString(
+                        new StringLiteral("2024-01-02 03:04:05.123456789")));
+        Assertions.assertInstanceOf(TimeStampNsLiteral.class,
+                ((DateLikeType) timestampNs).fromString("2024-01-02 03:04:05.123456789"));
+        Assertions.assertEquals(86400, timestampNs.rangeLength(20240102000000D, 20240101000000D));
+        Assertions.assertEquals(DateTimeV2Type.of(4), DateTimeV2Type.forType(
+                DecimalV2Type.createDecimalV2Type(12, 4)));
+        Assertions.assertEquals(DateTimeV2Type.of(5), DateTimeV2Type.forType(
+                DecimalV3Type.createDecimalV3Type(12, 5)));
+    }
+
+    @Test
+    void testTimeV2PromotionKeepsMicrosecondPrecision() {
+        Assertions.assertEquals(
+                ImmutableList.of(DateTimeV2Type.MAX, StringType.INSTANCE),
+                TimeV2Type.of(6).getAllPromotions());
+    }
+
+    @Test
+    void testImplicitDateTimeV2PrecisionKeepsMicrosecondCompatibility() {
+        Assertions.assertEquals(DateTimeV2Type.MAX,
+                DateTimeV2Type.forType(StringType.INSTANCE));
+        Assertions.assertEquals(DateTimeV2Type.MAX,
+                DateTimeV2Type.forType(DecimalV3Type.createDecimalV3Type(18, 9)));
+        Assertions.assertEquals(DateTimeV2Type.MAX,
+                DateTimeV2Type.forTypeFromString("1st Jun 2007 09:45:30"));
+        Assertions.assertEquals(DateTimeV2Type.MAX,
+                DateTimeV2Type.forType(DateTimeV2Type.MAX));
+        Assertions.assertEquals(DateTimeV2Type.MAX,
+                DateTimeV2Type.forTypeFromString("2024-01-01 00:00:00.123456789"));
     }
 
     @Test
@@ -120,6 +178,19 @@ public class DataTypeTest {
 
         // datetimev2
         Assertions.assertEquals(DateTimeV2Type.of(3), DataType.convertFromString("datetimev2(3)"));
+        Assertions.assertSame(TimeStampNsType.INSTANCE, DataType.convertFromString("timestamp_ns"));
+        for (String datetimeType : ImmutableList.of("datetime", "datetimev2")) {
+            for (int invalidScale = 7; invalidScale <= 9; invalidScale++) {
+                int scale = invalidScale;
+                Assertions.assertThrows(AnalysisException.class,
+                        () -> DataType.convertFromString(datetimeType + "(" + scale + ")"));
+            }
+        }
+        for (int invalidScale : ImmutableList.of(0, 1, 6, 7, 8, 9)) {
+            int scale = invalidScale;
+            Assertions.assertThrows(AnalysisException.class,
+                    () -> DataType.convertFromString("timestamp_ns(" + scale + ")"));
+        }
         // hll
         Assertions.assertEquals(HllType.INSTANCE, DataType.convertFromString("hll"));
         // bitmap
@@ -130,11 +201,84 @@ public class DataTypeTest {
         Assertions.assertEquals(JsonType.INSTANCE, DataType.convertFromString("json"));
         // array
         Assertions.assertEquals(ArrayType.of(IntegerType.INSTANCE), DataType.convertFromString("array<int>"));
+        Assertions.assertEquals(ArrayType.of(TimeStampNsType.INSTANCE),
+                DataType.convertFromString("array<timestamp_ns>"));
         // map
         Assertions.assertEquals(MapType.of(IntegerType.INSTANCE, IntegerType.INSTANCE), DataType.convertFromString("map<int, int>"));
+        Assertions.assertEquals(MapType.of(TimeStampNsType.INSTANCE, TimeStampNsType.INSTANCE),
+                DataType.convertFromString("map<timestamp_ns, timestamp_ns>"));
         // struct
         Assertions.assertEquals(new StructType(ImmutableList.of(new StructField("a", IntegerType.INSTANCE, true, ""))), DataType.convertFromString("struct<a: int>"));
+        Assertions.assertEquals(
+                new StructType(ImmutableList.of(
+                        new StructField("ts", TimeStampNsType.INSTANCE, true, ""))),
+                DataType.convertFromString("struct<ts: timestamp_ns>"));
 
+    }
+
+    @Test
+    public void testIsInjectiveCastToForPrimitiveTypes() {
+        assertSafeCast(IntegerType.INSTANCE, IntegerType.INSTANCE);
+        assertSafeCast(IntegerType.INSTANCE, BigIntType.INSTANCE);
+        assertUnsafeCast(BigIntType.INSTANCE, IntegerType.INSTANCE);
+        assertSafeCast(IntegerType.INSTANCE, DecimalV3Type.createDecimalV3Type(10, 0));
+        assertUnsafeCast(IntegerType.INSTANCE, DecimalV3Type.createDecimalV3Type(9, 0));
+        assertUnsafeCast(LargeIntType.INSTANCE, DecimalV3Type.createDecimalV3Type(38, 0));
+
+        assertSafeCast(BooleanType.INSTANCE, DecimalV3Type.createDecimalV3Type(1, 0));
+        assertUnsafeCast(BooleanType.INSTANCE, DecimalV3Type.createDecimalV3Type(1, 1));
+
+        assertSafeCast(DecimalV3Type.createDecimalV3Type(6, 2), DecimalV3Type.createDecimalV3Type(8, 3));
+        assertUnsafeCast(DecimalV3Type.createDecimalV3Type(6, 2), DecimalV3Type.createDecimalV3Type(6, 1));
+        assertUnsafeCast(DecimalV3Type.createDecimalV3Type(6, 2), DecimalV3Type.createDecimalV3Type(5, 2));
+
+        assertSafeCast(DateTimeType.INSTANCE, DateTimeV2Type.of(0));
+        assertSafeCast(DateTimeV2Type.of(0), DateTimeType.INSTANCE);
+        assertSafeCast(DateTimeV2Type.of(3), DateTimeV2Type.of(6));
+        assertUnsafeCast(DateTimeV2Type.of(3), DateTimeType.INSTANCE);
+        assertUnsafeCast(DateTimeType.INSTANCE, DateType.INSTANCE);
+        assertSafeCast(TimeStampNsType.INSTANCE, TimeStampNsType.INSTANCE);
+        assertSafeCast(TimeStampNsType.INSTANCE, StringType.INSTANCE);
+        assertUnsafeCast(TimeStampNsType.INSTANCE, DateTimeV2Type.MAX);
+        assertUnsafeCast(DateTimeV2Type.MAX, TimeStampNsType.INSTANCE);
+
+        assertSafeCast(VarcharType.createVarcharType(10), VarcharType.createVarcharType(20));
+        assertSafeCast(VarcharType.createVarcharType(10), StringType.INSTANCE);
+        assertSafeCast(VarcharType.createVarcharType(20), VarcharType.createVarcharType(10));
+        assertSafeCast(StringType.INSTANCE, VarcharType.createVarcharType(10));
+
+        VariantType v1 = new VariantType(100);
+        VariantType anotherV1 = new VariantType(200);
+        assertSafeCast(v1, new VariantType(100));
+        assertSafeCast(v1, anotherV1);
+    }
+
+    @Test
+    public void testIsInjectiveCastToForComplexTypes() {
+        assertSafeCast(ArrayType.of(IntegerType.INSTANCE), ArrayType.of(BigIntType.INSTANCE));
+        assertUnsafeCast(ArrayType.of(BigIntType.INSTANCE), ArrayType.of(IntegerType.INSTANCE));
+
+        assertSafeCast(MapType.of(IntegerType.INSTANCE, VarcharType.createVarcharType(10)),
+                MapType.of(BigIntType.INSTANCE, StringType.INSTANCE));
+        assertUnsafeCast(MapType.of(BigIntType.INSTANCE, VarcharType.createVarcharType(10)),
+                MapType.of(IntegerType.INSTANCE, StringType.INSTANCE));
+
+        StructType intStringStruct = new StructType(ImmutableList.of(
+                new StructField("a", IntegerType.INSTANCE, true, ""),
+                new StructField("b", VarcharType.createVarcharType(10), true, "")));
+        StructType bigintStringStruct = new StructType(ImmutableList.of(
+                new StructField("a", BigIntType.INSTANCE, true, ""),
+                new StructField("b", StringType.INSTANCE, true, "")));
+        StructType intOnlyStruct = new StructType(ImmutableList.of(
+                new StructField("a", IntegerType.INSTANCE, true, "")));
+
+        assertSafeCast(intStringStruct, bigintStringStruct);
+        assertUnsafeCast(bigintStringStruct, intStringStruct);
+        assertUnsafeCast(intOnlyStruct, intStringStruct);
+
+        assertSafeCast(ArrayType.of(IntegerType.INSTANCE), StringType.INSTANCE);
+        assertSafeCast(MapType.of(IntegerType.INSTANCE, StringType.INSTANCE), StringType.INSTANCE);
+        assertSafeCast(intStringStruct, StringType.INSTANCE);
     }
 
     @Test
@@ -599,5 +743,68 @@ public class DataTypeTest {
         Assertions.assertEquals(StringType.INSTANCE, StringType.INSTANCE.defaultConcreteType());
         Assertions.assertEquals(DateType.INSTANCE, DateType.INSTANCE.defaultConcreteType());
         Assertions.assertEquals(DateTimeType.INSTANCE, DateTimeType.INSTANCE.defaultConcreteType());
+    }
+
+    // DORIS-25584: special aggregate/semi-structured types must be rejected as complex-type elements
+    // at any nesting depth, not only at depth 2.
+
+    @Test
+    public void testArrayMapBitmapKeyRejected() {
+        // ARRAY<MAP<BITMAP, INT>> — BITMAP as map key must be caught at depth 3
+        DataType type = ArrayType.of(MapType.of(BitmapType.INSTANCE, IntegerType.INSTANCE));
+        Assertions.assertThrows(AnalysisException.class, type::validateDataType);
+    }
+
+    @Test
+    public void testArrayMapBitmapValueRejected() {
+        // ARRAY<MAP<STRING, BITMAP>> — BITMAP as map value must be caught at depth 3
+        DataType type = ArrayType.of(MapType.of(VarcharType.SYSTEM_DEFAULT, BitmapType.INSTANCE));
+        Assertions.assertThrows(AnalysisException.class, type::validateDataType);
+    }
+
+    @Test
+    public void testStructArrayHllRejected() {
+        // STRUCT<a: ARRAY<HLL>> — HLL inside array inside struct must be caught
+        DataType type = new StructType(
+                ImmutableList.of(new StructField("a", ArrayType.of(HllType.INSTANCE), true, "")));
+        Assertions.assertThrows(AnalysisException.class, type::validateDataType);
+    }
+
+    @Test
+    public void testMapArrayJsonbRejected() {
+        // MAP<STRING, ARRAY<JSONB>> — JSONB inside array as map value must be caught
+        DataType type = MapType.of(VarcharType.SYSTEM_DEFAULT, ArrayType.of(JsonType.INSTANCE));
+        Assertions.assertThrows(AnalysisException.class, type::validateDataType);
+    }
+
+    @Test
+    public void testArrayBitmapDirectlyRejected() {
+        // ARRAY<BITMAP> at depth 2 — must still be caught (regression guard)
+        DataType type = ArrayType.of(BitmapType.INSTANCE);
+        Assertions.assertThrows(AnalysisException.class, type::validateDataType);
+    }
+
+    @Test
+    public void testMapHllValueDirectlyRejected() {
+        // MAP<INT, HLL> at depth 2 — must still be caught (regression guard)
+        DataType type = MapType.of(IntegerType.INSTANCE, HllType.INSTANCE);
+        Assertions.assertThrows(AnalysisException.class, type::validateDataType);
+    }
+
+    @Test
+    public void testDeepValidComplexNestingAccepted() {
+        // ARRAY<MAP<STRING, INT>> — valid 3-level nesting must still be accepted
+        DataType type = ArrayType.of(MapType.of(VarcharType.SYSTEM_DEFAULT, IntegerType.INSTANCE));
+        Assertions.assertDoesNotThrow(type::validateDataType);
+    }
+
+    private void assertSafeCast(DataType source, DataType target) {
+        Assertions.assertTrue(source.isInjectiveCastTo(target), source.toSql() + " should safely cast to "
+                + target.toSql());
+    }
+
+    private void assertUnsafeCast(DataType source, DataType target) {
+        Assertions.assertFalse(source.isInjectiveCastTo(target), source.toSql() + " should not safely cast to "
+                + target.toSql());
     }
 }

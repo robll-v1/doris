@@ -56,7 +56,7 @@ import org.apache.doris.nereids.trees.expressions.Cast;
 import org.apache.doris.nereids.types.DataType;
 import org.apache.doris.persist.gson.GsonPostProcessable;
 import org.apache.doris.persist.gson.GsonUtils;
-import org.apache.doris.statistics.AnalysisManager;
+import org.apache.doris.statistics.analysis.AnalysisManager;
 import org.apache.doris.task.AgentBatchTask;
 import org.apache.doris.task.AgentTask;
 import org.apache.doris.task.AgentTaskExecutor;
@@ -149,6 +149,8 @@ public class SchemaChangeJobV2 extends AlterJobV2 implements GsonPostProcessable
     protected boolean storeRowColumn = false;
     @SerializedName(value = "hasRowStoreChange")
     protected boolean hasRowStoreChange = false;
+    @SerializedName(value = "columnSeqMapping")
+    protected Map<String, List<String>> columnSeqMapping = Maps.newHashMap();
 
     // save all schema change tasks
     AgentBatchTask schemaChangeBatchTask = new AgentBatchTask();
@@ -212,6 +214,10 @@ public class SchemaChangeJobV2 extends AlterJobV2 implements GsonPostProcessable
         this.storageFormat = storageFormat;
     }
 
+    public void setColumnSeqMapping(Map<String, List<String>> columnSeqMapping) {
+        this.columnSeqMapping = columnSeqMapping;
+    }
+
     /**
      * clear some date structure in this job to save memory
      * these data structures must not used in getInfo method
@@ -225,10 +231,10 @@ public class SchemaChangeJobV2 extends AlterJobV2 implements GsonPostProcessable
     }
 
     protected boolean isShadowIndexOfBase(long shadowIdxId, OlapTable tbl) {
-        if (indexIdToName.get(shadowIdxId).startsWith(SchemaChangeHandler.SHADOW_NAME_PREFIX)) {
+        if (indexIdToName.get(shadowIdxId).startsWith(Column.SHADOW_NAME_PREFIX)) {
             String shadowIndexName = indexIdToName.get(shadowIdxId);
             String indexName = shadowIndexName
-                    .substring(SchemaChangeHandler.SHADOW_NAME_PREFIX.length());
+                    .substring(Column.SHADOW_NAME_PREFIX.length());
             long indexId = tbl.getIndexIdByName(indexName);
             LOG.info("shadow index id: {}, shadow index name: {}, pointer to index id: {}, index name: {}, "
                             + "base index id: {}, table_id: {}", shadowIdxId, shadowIndexName, indexId, indexName,
@@ -301,6 +307,7 @@ public class SchemaChangeJobV2 extends AlterJobV2 implements GsonPostProcessable
                             long backendId = shadowReplica.getBackendIdWithoutException();
                             long shadowReplicaId = shadowReplica.getId();
                             countDownLatch.addMark(backendId, shadowTabletId);
+
                             CreateReplicaTask createReplicaTask = new CreateReplicaTask(
                                     backendId, dbId, tableId, partitionId, shadowIdxId, shadowTabletId,
                                     shadowReplicaId, shadowShortKeyColumnCount, shadowSchemaHash,
@@ -313,7 +320,6 @@ public class SchemaChangeJobV2 extends AlterJobV2 implements GsonPostProcessable
                                     tbl.getCompressionType(),
                                     tbl.getEnableUniqueKeyMergeOnWrite(), tbl.getStoragePolicy(),
                                     tbl.disableAutoCompaction(),
-                                    tbl.enableSingleReplicaCompaction(),
                                     tbl.skipWriteIndexOnLoad(),
                                     tbl.getCompactionPolicy(),
                                     tbl.getTimeSeriesCompactionGoalSizeMbytes(),
@@ -328,7 +334,9 @@ public class SchemaChangeJobV2 extends AlterJobV2 implements GsonPostProcessable
                                     tbl.rowStorePageSize(),
                                     tbl.variantEnableFlattenNested(),
                                     tbl.storagePageSize(), tbl.getTDEAlgorithm(),
-                                    tbl.storageDictPageSize());
+                                    tbl.storageDictPageSize(),
+                                    columnSeqMapping,
+                                    tbl.getVerticalCompactionNumColumnsPerGroup());
 
                             createReplicaTask.setBaseTablet(partitionIndexTabletMap.get(partitionId, shadowIdxId)
                                     .get(shadowTabletId), originSchemaHash);
@@ -532,9 +540,9 @@ public class SchemaChangeJobV2 extends AlterJobV2 implements GsonPostProcessable
                         destSlotDesc.setColumn(column);
                         destSlotDesc.setIsNullable(column.isAllowNull());
 
-                        if (indexColumnMap.containsKey(SchemaChangeHandler.SHADOW_NAME_PREFIX + column.getName())) {
+                        if (indexColumnMap.containsKey(Column.SHADOW_NAME_PREFIX + column.getName())) {
                             Column newColumn = indexColumnMap.get(
-                                    SchemaChangeHandler.SHADOW_NAME_PREFIX + column.getName());
+                                    Column.SHADOW_NAME_PREFIX + column.getName());
                             if (!Objects.equals(newColumn.getType(), column.getType())) {
                                 DataType srcType = DataType.fromCatalogType(column.getType());
                                 DataType destType = DataType.fromCatalogType(newColumn.getType());
@@ -824,6 +832,7 @@ public class SchemaChangeJobV2 extends AlterJobV2 implements GsonPostProcessable
         if (storageFormat == TStorageFormat.V2) {
             tbl.setStorageFormat(storageFormat);
         }
+        tbl.setColumnSeqMapping(columnSeqMapping);
     }
 
     /*
@@ -894,8 +903,14 @@ public class SchemaChangeJobV2 extends AlterJobV2 implements GsonPostProcessable
         if (Config.enable_abort_txn_by_checking_conflict_txn) {
             List<TransactionState> failedTxns = GlobalTransactionMgr.checkFailedTxns(unFinishedTxns);
             for (TransactionState txn : failedTxns) {
-                Env.getCurrentGlobalTransactionMgr()
-                        .abortTransaction(txn.getDbId(), txn.getTransactionId(), "Cancel by schema change");
+                try {
+                    Env.getCurrentGlobalTransactionMgr()
+                            .abortTransaction(txn.getDbId(), txn.getTransactionId(), "Cancel by schema change");
+                } catch (UserException e) {
+                    LOG.warn("failed to abort previous load txn {}, wait next round. schema change job: {}",
+                            txn.getTransactionId(), jobId, e);
+                    return false;
+                }
             }
         }
         return unFinishedTxns.isEmpty();
@@ -920,8 +935,10 @@ public class SchemaChangeJobV2 extends AlterJobV2 implements GsonPostProcessable
                 TStorageMedium medium = olapTable.getPartitionInfo().getDataProperty(partitionId).getStorageMedium();
 
                 for (Tablet shadownTablet : shadowIndex.getTablets()) {
+                    // Full schema-change jobs cannot originate from a row-binlog table.
                     TabletMeta shadowTabletMeta = new TabletMeta(dbId, tableId, partitionId, shadowIndexId,
-                            indexSchemaVersionAndHashMap.get(shadowIndexId).schemaHash, medium);
+                            indexSchemaVersionAndHashMap.get(shadowIndexId).schemaHash, medium,
+                            false /* isRowBinlog */);
                     invertedIndex.addTablet(shadownTablet.getId(), shadowTabletMeta);
                     for (Replica shadowReplica : shadownTablet.getReplicas()) {
                         invertedIndex.addReplica(shadownTablet.getId(), shadowReplica);
@@ -1046,7 +1063,7 @@ public class SchemaChangeJobV2 extends AlterJobV2 implements GsonPostProcessable
             info.add(TimeUtils.longToTimeStringWithms(createTimeMs));
             info.add(TimeUtils.longToTimeStringWithms(finishedTimeMs));
             // only show the origin index name
-            info.add(indexIdToName.get(shadowIndexId).substring(SchemaChangeHandler.SHADOW_NAME_PREFIX.length()));
+            info.add(indexIdToName.get(shadowIndexId).substring(Column.SHADOW_NAME_PREFIX.length()));
             info.add(shadowIndexId);
             info.add(entry.getValue());
             info.add(indexSchemaVersionAndHashMap.get(shadowIndexId).toString());

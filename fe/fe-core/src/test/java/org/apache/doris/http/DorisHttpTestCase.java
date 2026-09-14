@@ -23,9 +23,10 @@ import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.DataProperty;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
-import org.apache.doris.catalog.EsResource;
-import org.apache.doris.catalog.EsTable;
 import org.apache.doris.catalog.KeysType;
+import org.apache.doris.catalog.LocalReplica;
+import org.apache.doris.catalog.LocalTablet;
+import org.apache.doris.catalog.LocalTabletInvertedIndex;
 import org.apache.doris.catalog.MaterializedIndex;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Partition;
@@ -58,29 +59,24 @@ import org.apache.doris.thrift.TStorageType;
 
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
-import junit.framework.AssertionFailedError;
-import mockit.Expectations;
-import mockit.Mock;
-import mockit.MockUp;
-import mockit.Mocked;
 import okhttp3.Credentials;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
-import org.junit.After;
-import org.junit.AfterClass;
-import org.junit.Before;
-import org.junit.BeforeClass;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.mockito.Mockito;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.net.ServerSocket;
 import java.nio.file.Files;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Function;
 
 public abstract class DorisHttpTestCase {
 
@@ -133,8 +129,9 @@ public abstract class DorisHttpTestCase {
         DORIS_HOME = dorisHome;
     }
 
-    @Mocked
-    private static EditLog editLog;
+    private static EditLog editLog = Mockito.mock(EditLog.class);
+
+    private Env originalEnvInstance;
 
     public static OlapTable newTable(String name) {
         Env.getCurrentInvertedIndex().clear();
@@ -144,20 +141,20 @@ public abstract class DorisHttpTestCase {
         columns.add(k1);
         columns.add(k2);
 
-        Replica replica1 = new Replica(testReplicaId1, testBackendId1, testStartVersion, testSchemaHash, 1024000L, 0, 2000L,
-                Replica.ReplicaState.NORMAL, -1, 0);
-        Replica replica2 = new Replica(testReplicaId2, testBackendId2, testStartVersion, testSchemaHash, 1024000L, 0, 2000L,
-                Replica.ReplicaState.NORMAL, -1, 0);
-        Replica replica3 = new Replica(testReplicaId3, testBackendId3, testStartVersion, testSchemaHash, 1024000L, 0, 2000L,
-                Replica.ReplicaState.NORMAL, -1, 0);
+        Replica replica1 = new LocalReplica(testReplicaId1, testBackendId1, testStartVersion, testSchemaHash, 1024000L,
+                0, 2000L, Replica.ReplicaState.NORMAL, -1, 0);
+        Replica replica2 = new LocalReplica(testReplicaId2, testBackendId2, testStartVersion, testSchemaHash, 1024000L,
+                0, 2000L, Replica.ReplicaState.NORMAL, -1, 0);
+        Replica replica3 = new LocalReplica(testReplicaId3, testBackendId3, testStartVersion, testSchemaHash, 1024000L,
+                0, 2000L, Replica.ReplicaState.NORMAL, -1, 0);
 
         // tablet
-        Tablet tablet = new Tablet(tabletId);
+        Tablet tablet = new LocalTablet(tabletId);
 
         // index
         MaterializedIndex baseIndex = new MaterializedIndex(testIndexId, MaterializedIndex.IndexState.NORMAL);
         TabletMeta tabletMeta = new TabletMeta(testDbId, testTableId, testPartitionId, testIndexId, testSchemaHash,
-                TStorageMedium.HDD);
+                TStorageMedium.HDD, false /* isRowBinlog */);
         baseIndex.addTablet(tablet, tabletMeta);
 
         tablet.addReplica(replica1);
@@ -183,120 +180,38 @@ public abstract class DorisHttpTestCase {
         return table;
     }
 
-    private static EsTable newEsTable(String name) {
-        Column k1 = new Column("k1", PrimitiveType.BIGINT);
-        Column k2 = new Column("k2", PrimitiveType.DOUBLE);
-        List<Column> columns = new ArrayList<>();
-        columns.add(k1);
-        columns.add(k2);
-        PartitionInfo partitionInfo = new SinglePartitionInfo();
-        partitionInfo.setDataProperty(testPartitionId + 100,
-                new DataProperty(DataProperty.DEFAULT_STORAGE_MEDIUM));
-        partitionInfo.setReplicaAllocation(testPartitionId + 100, ReplicaAllocation.DEFAULT_ALLOCATION);
-        EsTable table = null;
-        Map<String, String> props = new HashMap<>();
-        props.put(EsResource.HOSTS, "http://node-1:8080");
-        props.put(EsResource.USER, "root");
-        props.put(EsResource.PASSWORD, "root");
-        props.put(EsResource.INDEX, "test");
-        props.put(EsResource.TYPE, "doc");
-        try {
-            table = new EsTable(testTableId + 1, name, columns, props, partitionInfo);
-        } catch (DdlException e) {
-            e.printStackTrace();
-        }
-        return table;
-    }
-
     private static Env newDelegateCatalog() {
         try {
-            Env env = Deencapsulation.newInstance(Env.class);
+            Env env = Mockito.spy(Deencapsulation.newInstance(Env.class));
             Auth auth = new Auth();
             AccessControllerManager accessManager = new AccessControllerManager(auth);
-            //EasyMock.expect(catalog.getAuth()).andReturn(paloAuth).anyTimes();
             Database db = new Database(testDbId, "testDb");
             OlapTable table = newTable(TABLE_NAME);
             db.registerTable(table);
             OlapTable table1 = newTable(TABLE_NAME + 1);
             db.registerTable(table1);
-            EsTable esTable = newEsTable("es_table");
-            db.registerTable(esTable);
 
-            InternalCatalog internalCatalog = Deencapsulation.newInstance(InternalCatalog.class);
-            new Expectations(internalCatalog) {
-                {
-                    internalCatalog.getDbNullable(db.getId());
-                    minTimes = 0;
-                    result = db;
+            InternalCatalog internalCatalog = Mockito.spy(Deencapsulation.newInstance(InternalCatalog.class));
+            // anyString catch-all first, then specific overrides
+            Mockito.doReturn(new Database()).when(internalCatalog).getDbNullable(Mockito.anyString());
+            Mockito.doReturn(db).when(internalCatalog).getDbNullable("" + DB_NAME);
+            Mockito.doReturn(null).when(internalCatalog).getDbNullable("emptyDb");
+            Mockito.doReturn(db).when(internalCatalog).getDbNullable(db.getId());
+            Mockito.doReturn(Lists.newArrayList("testDb")).when(internalCatalog).getDbNames();
 
-                    internalCatalog.getDbNullable("" + DB_NAME);
-                    minTimes = 0;
-                    result = db;
+            CatalogMgr dsMgr = Mockito.spy(new CatalogMgr());
+            Mockito.doReturn(internalCatalog).when(dsMgr).getCatalog(Mockito.anyString());
+            Mockito.doReturn(internalCatalog).when(dsMgr).getCatalogOrException(Mockito.anyString(), Mockito.any());
+            Mockito.doReturn(internalCatalog).when(dsMgr).getCatalogOrAnalysisException(Mockito.anyString());
 
-                    internalCatalog.getDbNullable("emptyDb");
-                    minTimes = 0;
-                    result = null;
+            Mockito.doReturn(accessManager).when(env).getAccessManager();
+            Mockito.doReturn(true).when(env).isMaster();
+            Mockito.doReturn(editLog).when(env).getEditLog();
+            Mockito.doReturn(internalCatalog).when(env).getInternalCatalog();
+            Mockito.doReturn(internalCatalog).when(env).getCurrentCatalog();
+            Mockito.doNothing().when(env).changeDb(Mockito.nullable(ConnectContext.class), Mockito.anyString());
+            Mockito.doReturn(dsMgr).when(env).getCatalogMgr();
 
-                    internalCatalog.getDbNullable(anyString);
-                    minTimes = 0;
-                    result = new Database();
-
-                    internalCatalog.getDbNames();
-                    minTimes = 0;
-                    result = Lists.newArrayList("testDb");
-                }
-            };
-
-            CatalogMgr dsMgr = new CatalogMgr();
-            new Expectations(dsMgr) {
-                {
-                    dsMgr.getCatalog((String) any);
-                    minTimes = 0;
-                    result = internalCatalog;
-
-                    dsMgr.getCatalogOrException((String) any, (Function) any);
-                    minTimes = 0;
-                    result = internalCatalog;
-
-                    dsMgr.getCatalogOrAnalysisException((String) any);
-                    minTimes = 0;
-                    result = internalCatalog;
-                }
-            };
-
-            new Expectations(env) {
-                {
-                    env.getAccessManager();
-                    minTimes = 0;
-                    result = accessManager;
-
-                    env.isMaster();
-                    minTimes = 0;
-                    result = true;
-
-                    env.getEditLog();
-                    minTimes = 0;
-                    result = editLog;
-
-                    env.getInternalCatalog();
-                    minTimes = 0;
-                    result = internalCatalog;
-
-                    env.getCurrentCatalog();
-                    minTimes = 0;
-                    result = internalCatalog;
-
-                    env.changeDb((ConnectContext) any, "blockDb");
-                    minTimes = 0;
-
-                    env.changeDb((ConnectContext) any, anyString);
-                    minTimes = 0;
-
-                    env.getCatalogMgr();
-                    minTimes = 0;
-                    result = dsMgr;
-                }
-            };
             return env;
         } catch (DdlException e) {
             return null;
@@ -320,7 +235,7 @@ public abstract class DorisHttpTestCase {
         Env.getCurrentSystemInfo().addBackend(backend3);
     }
 
-    @BeforeClass
+    @BeforeAll
     public static void initHttpServer() throws IllegalArgException, InterruptedException {
         ServerSocket socket = null;
         try {
@@ -351,52 +266,69 @@ public abstract class DorisHttpTestCase {
         httpServer.start();
     }
 
-    @AfterClass
+    @AfterAll
     public static void afterClass() {
         File file = new File(DORIS_HOME);
         file.delete();
     }
 
-
-    @Before
+    @BeforeEach
     public void setUp() {
         Env env = newDelegateCatalog();
         SystemInfoService systemInfoService = new SystemInfoService();
-        TabletInvertedIndex tabletInvertedIndex = new TabletInvertedIndex();
-        new MockUp<Env>() {
-            @Mock
-            SchemaChangeHandler getSchemaChangeHandler() {
-                return new SchemaChangeHandler();
-            }
+        TabletInvertedIndex tabletInvertedIndex = new LocalTabletInvertedIndex();
 
-            @Mock
-            MaterializedViewHandler getMaterializedViewHandler() {
-                return new MaterializedViewHandler();
-            }
+        Mockito.doReturn(new SchemaChangeHandler()).when(env).getSchemaChangeHandler();
+        Mockito.doReturn(new MaterializedViewHandler()).when(env).getMaterializedViewHandler();
+        Mockito.doReturn(systemInfoService).when(env).getClusterInfo();
+        Mockito.doReturn(tabletInvertedIndex).when(env).getTabletInvertedIndex();
 
-            @Mock
-            Env getCurrentEnv() {
-                return env;
-            }
+        // Replace SingletonHolder.INSTANCE with our spy for cross-thread visibility.
+        // Mockito.mockStatic is thread-local and invisible to HTTP handler threads.
+        try {
+            originalEnvInstance = replaceEnvSingleton(env);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to set SingletonHolder.INSTANCE", e);
+        }
 
-            @Mock
-            SystemInfoService getCurrentSystemInfo() {
-                return systemInfoService;
-            }
-
-            @Mock
-            TabletInvertedIndex getCurrentInvertedIndex() {
-                return tabletInvertedIndex;
-            }
-        };
         assignBackends();
         doSetUp();
     }
 
-    @After
+    @AfterEach
     public void tearDown() {
+        if (originalEnvInstance != null) {
+            try {
+                replaceEnvSingleton(originalEnvInstance);
+                originalEnvInstance = null;
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to restore SingletonHolder.INSTANCE", e);
+            }
+        }
     }
 
+    /**
+     * Replace Env.SingletonHolder.INSTANCE using sun.misc.Unsafe via reflection.
+     * Returns the previous INSTANCE value. This is needed because mockStatic is
+     * thread-local and HTTP handler threads cannot see it.
+     */
+    private static Env replaceEnvSingleton(Env newInstance) throws Exception {
+        Class<?> unsafeClass = Class.forName("sun.misc.Unsafe");
+        Field unsafeField = unsafeClass.getDeclaredField("theUnsafe");
+        unsafeField.setAccessible(true);
+        Object unsafe = unsafeField.get(null);
+        Class<?> singletonHolder = Class.forName("org.apache.doris.catalog.Env$SingletonHolder");
+        Field instanceField = singletonHolder.getDeclaredField("INSTANCE");
+        Method staticFieldOffset = unsafeClass.getMethod("staticFieldOffset", Field.class);
+        Method staticFieldBase = unsafeClass.getMethod("staticFieldBase", Field.class);
+        Method getObject = unsafeClass.getMethod("getObject", Object.class, long.class);
+        Method putObject = unsafeClass.getMethod("putObject", Object.class, long.class, Object.class);
+        long offset = (long) staticFieldOffset.invoke(unsafe, instanceField);
+        Object base = staticFieldBase.invoke(unsafe, instanceField);
+        Env old = (Env) getObject.invoke(unsafe, base, offset);
+        putObject.invoke(unsafe, base, offset, newInstance);
+        return old;
+    }
 
     public void doSetUp() {
 
@@ -406,7 +338,7 @@ public abstract class DorisHttpTestCase {
         try {
             runnable.run();
         } catch (Throwable e) {
-            throw new AssertionFailedError(e.getMessage());
+            throw new AssertionError(e.getMessage());
         }
     }
 
@@ -427,10 +359,10 @@ public abstract class DorisHttpTestCase {
             if (expectedType.isInstance(e)) {
                 return expectedType.cast(e);
             }
-            AssertionFailedError assertion = new AssertionFailedError("Unexpected exception type, expected " + expectedType.getSimpleName() + " but got " + e);
+            AssertionError assertion = new AssertionError("Unexpected exception type, expected " + expectedType.getSimpleName() + " but got " + e);
             assertion.initCause(e);
             throw assertion;
         }
-        throw new AssertionFailedError(noExceptionMessage);
+        throw new AssertionError(noExceptionMessage);
     }
 }

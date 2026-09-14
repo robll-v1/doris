@@ -23,6 +23,7 @@ import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.trees.expressions.literal.DateTimeLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.StringLikeLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.format.DateTimeChecker;
+import org.apache.doris.nereids.types.coercion.CharacterType;
 import org.apache.doris.nereids.types.coercion.DateLikeType;
 import org.apache.doris.nereids.types.coercion.IntegralType;
 import org.apache.doris.nereids.types.coercion.ScaleTimeType;
@@ -76,6 +77,9 @@ public class DateTimeV2Type extends DateLikeType implements ScaleTimeType {
         if (dataType instanceof DateTimeV2Type) {
             return (DateTimeV2Type) dataType;
         }
+        if (dataType instanceof TimeStampTzType) {
+            return DateTimeV2Type.of(((TimeStampTzType) dataType).getScale());
+        }
         if (dataType instanceof IntegralType || dataType instanceof BooleanType || dataType instanceof NullType
                 || dataType instanceof DateTimeType || dataType instanceof DateType || dataType instanceof DateV2Type) {
             return SYSTEM_DEFAULT;
@@ -126,6 +130,18 @@ public class DateTimeV2Type extends DateLikeType implements ScaleTimeType {
     }
 
     @Override
+    public boolean isInjectiveCastTo(DataType target) {
+        if (target instanceof DateTimeV2Type) {
+            DateTimeV2Type t2 = (DateTimeV2Type) target;
+            return this.scale <= t2.scale;
+        }
+        if (target instanceof DateTimeType) {
+            return this.scale == 0;
+        }
+        return target instanceof CharacterType;
+    }
+
+    @Override
     public Type toCatalogDataType() {
         return ScalarType.createDatetimeV2Type(scale);
     }
@@ -147,7 +163,7 @@ public class DateTimeV2Type extends DateLikeType implements ScaleTimeType {
 
     @Override
     public boolean acceptsType(DataType other) {
-        return other instanceof DateTimeV2Type;
+        return other.equals(this);
     }
 
     @Override

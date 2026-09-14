@@ -24,6 +24,7 @@ import org.apache.doris.catalog.AccessPrivilege;
 import org.apache.doris.catalog.AccessPrivilegeWithCols;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
+import org.apache.doris.catalog.LocalTablet;
 import org.apache.doris.catalog.MaterializedIndex;
 import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.Replica;
@@ -40,7 +41,7 @@ import org.apache.doris.utframe.TestWithFeService;
 import com.google.common.collect.Lists;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.junit.Assert;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
 import java.util.LinkedList;
@@ -55,7 +56,7 @@ public class CooldownConfHandlerTest extends TestWithFeService {
     private long indexId = 103L;
     private long tabletId = 104;
 
-    private Tablet tablet = null;
+    private LocalTablet tablet = null;
 
     @Override
     protected void runBeforeAll() throws Exception {
@@ -95,7 +96,7 @@ public class CooldownConfHandlerTest extends TestWithFeService {
         indexId = index.getId();
         List<Tablet> tablets = index.getTablets();
         assert tablets.size() > 0;
-        tablet = tablets.get(0);
+        tablet = (LocalTablet) tablets.get(0);
         tablet.setCooldownConf(-1, 100);
         tabletId = tablet.getId();
         LOG.info("create table: db: {}, tbl: {}, partition: {}, index: {}, tablet: {}", dbId, tableId, partitionId,
@@ -120,7 +121,7 @@ public class CooldownConfHandlerTest extends TestWithFeService {
                 break;
             }
         }
-        Assert.assertTrue(matched);
-        Assert.assertEquals(101, cooldownTerm);
+        Assertions.assertTrue(matched);
+        Assertions.assertEquals(101, cooldownTerm);
     }
 }

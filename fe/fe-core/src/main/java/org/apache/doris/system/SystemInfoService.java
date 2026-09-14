@@ -17,9 +17,14 @@
 
 package org.apache.doris.system;
 
+import org.apache.doris.catalog.ColocateTableIndex.GroupId;
 import org.apache.doris.catalog.DiskInfo;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.ReplicaAllocation;
+import org.apache.doris.cloud.qe.ComputeGroupException;
+import org.apache.doris.cluster.ClusterGuard;
+import org.apache.doris.cluster.ClusterGuardException;
+import org.apache.doris.cluster.ClusterGuardFactory;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
@@ -83,13 +88,17 @@ public class SystemInfoService {
 
     public static final ImmutableSet<String> NEED_REPLAN_ERRORS = ImmutableSet.of(
             NO_SCAN_NODE_BACKEND_AVAILABLE_MSG,
-            ERROR_E230
+            ERROR_E230,
+            ComputeGroupException.FailedTypeEnum.COMPUTE_GROUPS_NO_ALIVE_BE.toString()
     );
 
     protected volatile ImmutableMap<Long, Backend> idToBackendRef = ImmutableMap.of();
     protected volatile ImmutableMap<Long, AtomicLong> idToReportVersionRef = ImmutableMap.of();
 
     private volatile ImmutableMap<Long, DiskInfo> pathHashToDiskInfoRef = ImmutableMap.of();
+
+    public void invalidateCloudColocatePlacement(GroupId groupId) {
+    }
 
     public static class HostInfo implements Comparable<HostInfo> {
         public String host;
@@ -190,6 +199,16 @@ public class SystemInfoService {
             }
         }
 
+        // check cluster guard policy: time validity and node limit
+        ClusterGuard clusterGuard = ClusterGuardFactory.getGuard();
+        try {
+            clusterGuard.checkTimeValidity();
+            int currentCount = getAllClusterBackendsNoException().size();
+            clusterGuard.checkNodeLimit(currentCount + hostInfos.size());
+        } catch (ClusterGuardException e) {
+            throw new DdlException("Cluster guard restriction: " + e.getMessage());
+        }
+
         for (HostInfo hostInfo : hostInfos) {
             addBackend(hostInfo.getHost(), hostInfo.getPort(), tagMap);
         }
@@ -230,6 +249,13 @@ public class SystemInfoService {
     }
 
     public void dropBackends(List<HostInfo> hostInfos) throws DdlException {
+        // check cluster guard time validity
+        try {
+            ClusterGuardFactory.getGuard().checkTimeValidity();
+        } catch (ClusterGuardException e) {
+            throw new DdlException("Cluster guard restriction: " + e.getMessage());
+        }
+
         for (HostInfo hostInfo : hostInfos) {
             // check is already exist
             if (getBackendWithHeartbeatPort(hostInfo.getHost(), hostInfo.getPort()) == null) {
@@ -306,6 +332,10 @@ public class SystemInfoService {
     }
 
     public Backend getBackend(long backendId) {
+        return getAllClusterBackendsNoException().get(backendId);
+    }
+
+    public Backend getBackendByIdWithBoxedId(Long backendId) {
         return getAllClusterBackendsNoException().get(backendId);
     }
 
@@ -456,7 +486,7 @@ public class SystemInfoService {
 
     class BeIdComparator implements Comparator<Backend> {
         public int compare(Backend a, Backend b) {
-            return (int) (a.getId() - b.getId());
+            return Long.compare(a.getId(), b.getId());
         }
     }
 
@@ -1077,7 +1107,9 @@ public class SystemInfoService {
         return idToBackendRef;
     }
 
-    public int getMinPipelineExecutorSize() {
+    // CloudSystemInfoService override.
+    // Non-cloud ignores clusterName and calculates from all backends.
+    public int getMinPipelineExecutorSize(String clusterName) {
         List<Backend> currentBackends = null;
         try {
             currentBackends = getAllBackendsByAllCluster().values().asList();
@@ -1109,6 +1141,7 @@ public class SystemInfoService {
             return false;
         }
         for (String keyword : NEED_REPLAN_ERRORS) {
+            LOG.debug("key {}, errorMsg {}", keyword, errorMsg);
             if (errorMsg.contains(keyword)) {
                 return true;
             }

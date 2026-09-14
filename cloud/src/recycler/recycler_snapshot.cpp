@@ -40,22 +40,26 @@
 namespace doris::cloud {
 
 int InstanceRecycler::recycle_cluster_snapshots() {
+    if (instance_info_.recycle_state() == INSTANCE_RECYCLE_STATE_METADATA_CLEANUP_PENDING ||
+        instance_info_.recycle_state() == INSTANCE_RECYCLE_STATE_CLEANUP_COMPLETED) {
+        return 0;
+    }
     return snapshot_manager_->recycle_snapshots(this);
 }
 
-int InstanceRecycler::recycle_snapshot_meta_and_data(const std::string& resource_id,
+int InstanceRecycler::recycle_snapshot_meta_and_data(const std::string& instance_id,
+                                                     const std::string& resource_id,
                                                      Versionstamp snapshot_version,
                                                      const SnapshotPB& snapshot_pb) {
     auto it = accessor_map_.find(resource_id);
     if (it == accessor_map_.end()) {
         LOG(WARNING) << "no accessor for resource, cannot recycle snapshot data"
-                     << ", instance_id=" << instance_id_
-                     << ", resource_id=" << instance_info_.resource_ids(0);
+                     << ", instance_id=" << instance_id << ", resource_id=" << resource_id;
         return -1;
     }
 
     return snapshot_manager_->recycle_snapshot_meta_and_data(
-            instance_id_, resource_id, it->second.get(), snapshot_version, snapshot_pb);
+            instance_id, resource_id, it->second.get(), snapshot_version, snapshot_pb);
 }
 
 int InstanceRecycler::has_cluster_snapshots(bool* any) {

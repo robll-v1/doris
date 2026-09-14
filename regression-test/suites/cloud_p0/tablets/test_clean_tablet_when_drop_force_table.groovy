@@ -22,6 +22,11 @@ suite('test_clean_tablet_when_drop_force_table', 'docker') {
     if (!isCloudMode()) {
         return;
     }
+
+    // Randomly enable or disable packed_file to test both scenarios
+    def enablePackedFile = new Random().nextBoolean()
+    logger.info("Running test with enable_packed_file=${enablePackedFile}")
+
     def options = new ClusterOptions()
     options.feConfigs += [
         'cloud_cluster_check_interval_second=1',
@@ -34,7 +39,17 @@ suite('test_clean_tablet_when_drop_force_table', 'docker') {
         'report_tablet_interval_seconds=1',
         'write_buffer_size=10240',
         'write_buffer_size_for_agg=10240',
-        'sys_log_verbose_modules=task_worker_pool'
+        'sys_log_verbose_modules=task_worker_pool',
+        'file_cache_background_gc_interval_ms=10',
+        'file_cache_remove_block_qps_limit=10000',
+        "enable_packed_file=${enablePackedFile}",
+        'enable_packed_file=false',
+        'disable_auto_compaction=true',
+    ]
+    options.recycleConfigs += [
+        'recycler_sleep_before_scheduling_seconds=0',
+        'recycle_interval_seconds=1',
+        'retention_seconds=0',
     ]
     options.setFeNum(3)
     options.setBeNum(3)
@@ -51,6 +66,74 @@ suite('test_clean_tablet_when_drop_force_table', 'docker') {
         assertTrue(queueZeroLine != null,
                 "Expected to find log line with queue_size=0 in ${beLogPath}, but none matched.")
         log.info("found queue_size=0 log line: {}", queueZeroLine)
+    }
+
+    def waitForTabletCacheState = { Collection tabletIds, boolean expectPresent, long timeoutMs = 60000L, long intervalMs = 2000L ->
+        long start = System.currentTimeMillis()
+        while (System.currentTimeMillis() - start < timeoutMs) {
+            boolean conditionMet = tabletIds.every { def tabletId ->
+                def rows = sql "select tablet_id from information_schema.file_cache_info where tablet_id = ${tabletId}"
+                expectPresent ? !rows.isEmpty() : rows.isEmpty()
+            }
+            if (conditionMet) {
+                return
+            }
+            sleep(intervalMs)
+        }
+        def stillPresent = tabletIds.findAll { def tabletId -> !(sql "select tablet_id from information_schema.file_cache_info where tablet_id = ${tabletId}").isEmpty() }
+        if (expectPresent) {
+            assertTrue(false, "Tablet cache info never appeared for tablet ids ${stillPresent}")
+        } else {
+            assertTrue(false, "Tablet cache info still exists for tablet ids ${stillPresent}")
+        }
+    }
+
+    def collectCacheSubDirs = { File dir ->
+        def subDirs = []
+        def collectDirs
+        collectDirs = { File currentDir ->
+            if (currentDir.exists()) {
+                currentDir.eachDir { subDir ->
+                    subDirs << subDir.name
+                    collectDirs(subDir)
+                }
+            }
+        }
+        collectDirs(dir)
+        subDirs
+    }
+
+    def getRemainingCacheDirs = { Map beforeGetFromFe, Map mergedCacheDir ->
+        def remaining = []
+        beforeGetFromFe.each {
+            def backendId = it.Value[0]
+            def backendHost = it.Value[1]
+            def be = cluster.getBeByBackendId(backendId.toLong())
+            def dataPath = new File("${be.path}/storage/file_cache")
+            def subDirs = collectCacheSubDirs.call(dataPath)
+            def cacheDir = mergedCacheDir[backendHost] ?: []
+            def matched = cacheDir.findAll { hashFile ->
+                subDirs.any { subDir -> subDir.startsWith(hashFile) }
+            }
+            if (!matched.isEmpty()) {
+                remaining << [backendHost: backendHost, hashFiles: matched, subDirs: subDirs]
+            }
+            logger.info("BE {} file_cache subdirs: {}", backendHost, subDirs)
+        }
+        remaining
+    }
+
+    def waitForCacheDirsCleaned = { Map beforeGetFromFe, Map mergedCacheDir, long timeoutMs = 90000L, long intervalMs = 1000L ->
+        long start = System.currentTimeMillis()
+        def remaining = []
+        while (System.currentTimeMillis() - start < timeoutMs) {
+            remaining = getRemainingCacheDirs.call(beforeGetFromFe, mergedCacheDir)
+            if (remaining.isEmpty()) {
+                return
+            }
+            sleep(intervalMs)
+        }
+        assertTrue(false, "File cache directories were not cleaned before timeout: ${remaining}")
     }
     
     def testCase = { tableName, waitTime, useDp=false-> 
@@ -143,10 +226,13 @@ suite('test_clean_tablet_when_drop_force_table', 'docker') {
             assertTrue(beforeGetFromBe.containsKey(it.Key))
             assertEquals(beforeGetFromBe[it.Key], it.Value[1])
         }
+        def tabletIds = beforeGetFromFe.keySet()
+        waitForTabletCacheState.call(tabletIds, true, 90000L)
         if (useDp) {
             GetDebugPoint().enableDebugPointForAllBEs("WorkPoolCloudDropTablet.drop_tablet_callback.failed")
         }
         // after drop table force
+        sql """select * from $tableName limit 10"""
 
         sql """
             DROP TABLE $tableName FORCE
@@ -171,41 +257,13 @@ suite('test_clean_tablet_when_drop_force_table', 'docker') {
             futrue.get()
         }
 
-        sleep(25 * 1000)
-
-        // check cache file has been deleted
-        beforeGetFromFe.each {
-            def tabletId = it.Key
-            def backendId = it.Value[0]
-            def backendHost = it.Value[1]
-            def be = cluster.getBeByBackendId(backendId.toLong())
-            def dataPath = new File("${be.path}/storage/file_cache")
-            def subDirs = []
-            
-            def collectDirs
-            collectDirs = { File dir ->
-                if (dir.exists()) {
-                    dir.eachDir { subDir ->
-                        subDirs << subDir.name
-                        collectDirs(subDir) 
-                    }
-                }
-            }
-            
-            collectDirs(dataPath)
-            logger.info("BE {} file_cache subdirs: {}", backendHost, subDirs)
-            def cacheDir = mergedCacheDir[backendHost]
-
-            // add check
-            cacheDir.each { hashFile ->
-                assertFalse(subDirs.any { subDir -> subDir.startsWith(hashFile) }, 
-                "Found unexpected cache file pattern ${hashFile} in BE ${backendHost}'s file_cache directory. " + 
-                "Matching subdir found in: ${subDirs}")
-            }
-        }
+        // Wait until async file-cache GC removes the physical cache directories.
+        waitForCacheDirsCleaned.call(beforeGetFromFe, mergedCacheDir, 90000L, 1000L)
 
         String beLogPath = cluster.getBeByIndex(1).getLogFilePath()
         checkBeLog(beLogPath)
+
+        waitForTabletCacheState.call(tabletIds, false, 90000L)
     }
 
     docker(options) {

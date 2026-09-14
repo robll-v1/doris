@@ -18,8 +18,15 @@
 package org.apache.doris.planner;
 
 import org.apache.doris.analysis.Expr;
+import org.apache.doris.analysis.ExprToSqlVisitor;
+import org.apache.doris.analysis.ExprToThriftVisitor;
 import org.apache.doris.analysis.SlotId;
+import org.apache.doris.analysis.ToSqlParams;
 import org.apache.doris.analysis.TupleId;
+import org.apache.doris.common.Pair;
+import org.apache.doris.nereids.glue.translator.PlanTranslatorContext;
+import org.apache.doris.planner.LocalExchangeNode.LocalExchangeType;
+import org.apache.doris.planner.LocalExchangeNode.LocalExchangeTypeRequire;
 import org.apache.doris.thrift.TExplainLevel;
 import org.apache.doris.thrift.TPlanNode;
 import org.apache.doris.thrift.TPlanNodeType;
@@ -37,9 +44,10 @@ public class TableFunctionNode extends PlanNode {
     // The output slot ids of TableFunctionNode
     // Only the slot whose id is in this list will be output by TableFunctionNode
     private List<SlotId> outputSlotIds = Lists.newArrayList();
+    private List<Expr> expandConjuncts;
 
     public TableFunctionNode(PlanNodeId id, PlanNode inputNode, TupleId lateralViewTupleId,
-            ArrayList<Expr> fnCallExprList, List<SlotId> outputSlotIds) {
+            ArrayList<Expr> fnCallExprList, List<SlotId> outputSlotIds, List<Expr> expandConjuncts) {
         super(id, "TABLE FUNCTION NODE");
         if (inputNode.outputTupleDesc != null) {
             tupleIds.add(inputNode.outputTupleDesc.getId());
@@ -56,10 +64,15 @@ public class TableFunctionNode extends PlanNode {
         this.fnCallExprList = fnCallExprList;
         this.outputSlotIds = outputSlotIds;
         this.children.add(inputNode);
+        this.expandConjuncts = expandConjuncts;
     }
 
     public void setOutputSlotIds(List<SlotId> outputSlotIds) {
         this.outputSlotIds = outputSlotIds;
+    }
+
+    public List<Expr> getExpandConjuncts() {
+        return expandConjuncts;
     }
 
     @Override
@@ -67,7 +80,7 @@ public class TableFunctionNode extends PlanNode {
         StringBuilder output = new StringBuilder();
         output.append(prefix).append("table function: ");
         for (Expr fnExpr : fnCallExprList) {
-            output.append(fnExpr.toSql()).append(" ");
+            output.append(fnExpr.accept(ExprToSqlVisitor.INSTANCE, ToSqlParams.WITH_TABLE)).append(" ");
         }
         output.append("\n");
 
@@ -88,6 +101,11 @@ public class TableFunctionNode extends PlanNode {
         }
         output.append("\n");
 
+        if (!expandConjuncts.isEmpty()) {
+            output.append(prefix).append("expand conjuncts: ").append(
+                    getExplainString(expandConjuncts)).append("\n");
+        }
+
         if (!conjuncts.isEmpty()) {
             output.append(prefix).append("PREDICATES: ").append(
                     getExplainString(conjuncts)).append("\n");
@@ -100,9 +118,30 @@ public class TableFunctionNode extends PlanNode {
     protected void toThrift(TPlanNode msg) {
         msg.node_type = TPlanNodeType.TABLE_FUNCTION_NODE;
         msg.table_function_node = new TTableFunctionNode();
-        msg.table_function_node.setFnCallExprList(Expr.treesToThrift(fnCallExprList));
+        msg.table_function_node.setFnCallExprList(ExprToThriftVisitor.treesToThrift(fnCallExprList));
+        msg.table_function_node.setExpandConjuncts(ExprToThriftVisitor.treesToThrift(expandConjuncts));
         for (SlotId slotId : outputSlotIds) {
             msg.table_function_node.addToOutputSlotIds(slotId.asInt());
         }
+    }
+
+    @Override
+    public Pair<PlanNode, LocalExchangeType> enforceAndDeriveLocalExchange(
+            PlanTranslatorContext translatorContext, PlanNode parent, LocalExchangeTypeRequire parentRequire) {
+        // Mirrors BE TableFunctionOperatorX::required_data_distribution() which always
+        // returns PASSTHROUGH, regardless of child's serial status.
+        //
+        // Conceptual model: TableFunction requires PASSTHROUGH input but outputs
+        // "unknown distribution" (NOOP). This means downstream operators (e.g. Sort)
+        // must independently evaluate their own requirements against NOOP, naturally
+        // triggering exchange insertion when they require PASSTHROUGH.
+        //
+        // In BE, need_to_local_exchange() Step 4 treats non-hash exchanges (PASSTHROUGH)
+        // as always needing insertion, so "PASSTHROUGH doesn't satisfy PASSTHROUGH" —
+        // which is equivalent to our FE model of require=PASSTHROUGH, output=NOOP.
+        Pair<PlanNode, LocalExchangeType> enforceResult = enforceRequire(
+                translatorContext, children.get(0), 0, LocalExchangeTypeRequire.requirePassthrough());
+        children = Lists.newArrayList(enforceResult.first);
+        return Pair.of(this, LocalExchangeType.NOOP);
     }
 }

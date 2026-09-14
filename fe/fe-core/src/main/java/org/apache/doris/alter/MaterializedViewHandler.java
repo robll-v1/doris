@@ -47,7 +47,7 @@ import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.MetaNotFoundException;
-import org.apache.doris.common.util.IdGeneratorUtil;
+import org.apache.doris.common.util.BufferSizeUtil;
 import org.apache.doris.common.util.ListComparator;
 import org.apache.doris.common.util.PropertyAnalyzer;
 import org.apache.doris.common.util.Util;
@@ -202,6 +202,9 @@ public class MaterializedViewHandler extends AlterHandler {
             if (olapTable.existTempPartitions()) {
                 throw new DdlException("Can not alter table when there are temp partitions in table");
             }
+            if (olapTable.hasColumnSeqMapping()) {
+                throw new DdlException("Can not add materialized view when table use column sequence mapping");
+            }
             // check no duplicate column name in full schema
             Set<String> allColumnNames = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
             for (Column column : olapTable.getFullSchema()) {
@@ -238,7 +241,7 @@ public class MaterializedViewHandler extends AlterHandler {
             // Step2: create mv job
             RollupJobV2 rollupJobV2 =
                     createMaterializedViewJob(null, mvIndexName, baseIndexName, mvColumns,
-                            createMvCommand.getWhereClauseItemColumn(olapTable),
+                            createMvCommand.getWhereClauseItemColumn(),
                             createMvCommand.getProperties(), olapTable, db, baseIndexId,
                             createMvCommand.getMVKeysType(), createMvCommand.getOriginStatement(),
                             sessionVariables);
@@ -287,6 +290,9 @@ public class MaterializedViewHandler extends AlterHandler {
             olapTable.checkNormalStateForAlter();
             if (olapTable.existTempPartitions()) {
                 throw new DdlException("Can not alter table when there are temp partitions in table");
+            }
+            if  (olapTable.hasColumnSeqMapping()) {
+                throw new DdlException("Can not add rollup when table use column sequence mapping");
             }
 
             // 1 check and make rollup job
@@ -408,7 +414,7 @@ public class MaterializedViewHandler extends AlterHandler {
         long tableId = olapTable.getId();
         int baseSchemaHash = olapTable.getSchemaHashByIndexId(baseIndexId);
         Env env = Env.getCurrentEnv();
-        long bufferSize = IdGeneratorUtil.getBufferSizeForAlterTable(olapTable, Sets.newHashSet(baseIndexId));
+        long bufferSize = BufferSizeUtil.getBufferSizeForAlterTable(olapTable, Sets.newHashSet(baseIndexId));
         IdGeneratorBuffer idGeneratorBuffer = env.getIdGeneratorBuffer(bufferSize);
         long jobId = idGeneratorBuffer.getNextId();
         long mvIndexId = idGeneratorBuffer.getNextId();
@@ -437,14 +443,22 @@ public class MaterializedViewHandler extends AlterHandler {
             MaterializedIndex mvIndex = new MaterializedIndex(mvIndexId, IndexState.SHADOW);
             MaterializedIndex baseIndex = partition.getIndex(baseIndexId);
             short replicationNum = olapTable.getPartitionInfo().getReplicaAllocation(partitionId).getTotalReplicaNum();
+            // All MV tablets of the same (partition, mv index) share the same TabletMeta;
+            // build it once and bulk-publish to MaterializedIndex.tablets after the per-tablet
+            // loop to keep copy-on-write O(n). TabletInvertedIndex registration stays
+            // per-iteration because Tablet.addReplica(...) below needs the tablet present
+            // in the inverted index.
+            TabletMeta mvTabletMeta = new TabletMeta(
+                    dbId, tableId, partitionId, mvIndexId, mvSchemaHash, medium, false /* isRowBinlog */);
+            List<Tablet> mvTabletsForPartition = Lists.newArrayListWithCapacity(baseIndex.getTablets().size());
+            TabletInvertedIndex invertedIndex = Env.getCurrentInvertedIndex();
             for (Tablet baseTablet : baseIndex.getTablets()) {
-                TabletMeta mvTabletMeta = new TabletMeta(
-                        dbId, tableId, partitionId, mvIndexId, mvSchemaHash, medium);
                 long baseTabletId = baseTablet.getId();
                 long mvTabletId = idGeneratorBuffer.getNextId();
 
                 Tablet newTablet = EnvFactory.getInstance().createTablet(mvTabletId);
-                mvIndex.addTablet(newTablet, mvTabletMeta);
+                invertedIndex.addTablet(mvTabletId, mvTabletMeta);
+                mvTabletsForPartition.add(newTablet);
                 addedTablets.add(newTablet);
 
                 mvJob.addTabletIdMap(partitionId, mvTabletId, baseTabletId);
@@ -498,6 +512,9 @@ public class MaterializedViewHandler extends AlterHandler {
                     throw new DdlException("tablet " + baseTabletId + " has few healthy replica: " + healthyReplicaNum);
                 }
             } // end for baseTablets
+
+            // Bulk-publish all MV tablets for this partition in one copy-on-write.
+            mvIndex.appendTablets(mvTabletsForPartition);
 
             mvJob.addMVIndex(partitionId, mvIndex);
 
@@ -588,7 +605,7 @@ public class MaterializedViewHandler extends AlterHandler {
                                 "The mvItem[" + mvColumnItem.getName() + "] require slot because it is value column");
                     }
                 }
-                newMVColumns.add(mvColumnItem.toMVColumn(olapTable, sessionVariables));
+                newMVColumns.add(mvColumnItem.toMVColumn(sessionVariables));
             }
         } else {
             for (MVColumnItem mvColumnItem : mvColumnItemList) {
@@ -597,7 +614,7 @@ public class MaterializedViewHandler extends AlterHandler {
                     throw new DdlException("Base columns is null");
                 }
 
-                newMVColumns.add(mvColumnItem.toMVColumn(olapTable, sessionVariables));
+                newMVColumns.add(mvColumnItem.toMVColumn(sessionVariables));
             }
         }
 
@@ -1336,7 +1353,7 @@ public class MaterializedViewHandler extends AlterHandler {
             }
 
             // find from new alter jobs first
-            if (command.getAlterJobIdList() != null) {
+            if (command.getAlterJobIdList() != null && !command.getAlterJobIdList().isEmpty()) {
                 for (Long jobId : command.getAlterJobIdList()) {
                     AlterJobV2 alterJobV2 = getUnfinishedAlterJobV2ByJobId(jobId);
                     if (alterJobV2 == null) {

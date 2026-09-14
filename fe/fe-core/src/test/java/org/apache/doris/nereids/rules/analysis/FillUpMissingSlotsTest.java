@@ -32,11 +32,13 @@ import org.apache.doris.nereids.trees.expressions.SlotReference;
 import org.apache.doris.nereids.trees.expressions.functions.agg.Count;
 import org.apache.doris.nereids.trees.expressions.functions.agg.Min;
 import org.apache.doris.nereids.trees.expressions.functions.agg.Sum;
+import org.apache.doris.nereids.trees.expressions.functions.combinator.CombineCombinator;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.Abs;
 import org.apache.doris.nereids.trees.expressions.literal.BigIntLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.IntegerLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.Literal;
 import org.apache.doris.nereids.trees.expressions.literal.TinyIntLiteral;
+import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.types.BigIntType;
 import org.apache.doris.nereids.types.IntegerType;
 import org.apache.doris.nereids.types.SmallIntType;
@@ -44,11 +46,15 @@ import org.apache.doris.nereids.types.TinyIntType;
 import org.apache.doris.nereids.util.FieldChecker;
 import org.apache.doris.nereids.util.MemoPatternMatchSupported;
 import org.apache.doris.nereids.util.PlanChecker;
+import org.apache.doris.nereids.util.TestHelper;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+
+import java.util.List;
 
 public class FillUpMissingSlotsTest extends AnalyzeCheckTestBase implements MemoPatternMatchSupported {
 
@@ -71,6 +77,16 @@ public class FillUpMissingSlotsTest extends AnalyzeCheckTestBase implements Memo
                         + "    pk TINYINT,\n"
                         + "    b1 TINYINT,\n"
                         + "    b2 TINYINT\n"
+                        + ")\n"
+                        + "DUPLICATE KEY (pk)\n"
+                        + "DISTRIBUTED BY HASH (pk)\n"
+                        + "PROPERTIES(\n"
+                        + "    'replication_num' = '1'\n"
+                        + ");",
+                "CREATE TABLE t3 (\n"
+                        + "    pk BIGINT,\n"
+                        + "    c1 BIGINT,\n"
+                        + "    c2 BIGINT\n"
                         + ")\n"
                         + "DUPLICATE KEY (pk)\n"
                         + "DISTRIBUTED BY HASH (pk)\n"
@@ -152,6 +168,24 @@ public class FillUpMissingSlotsTest extends AnalyzeCheckTestBase implements Memo
                                             ).when(FieldChecker.check("outputExpressions", Lists.newArrayList(a1, sumA2)))
                                 ).when(FieldChecker.check("conjuncts", ImmutableSet.of(new GreaterThan(a1, new TinyIntLiteral((byte) 0)))))
                         ).when(FieldChecker.check("projects", Lists.newArrayList(sumA2.toSlot()))));
+    }
+
+    @Test
+    public void testCombineCombinatorBindsArgumentsInAggregateInputScope() {
+        String sql = "SELECT pk, sum(a1 + 1) AS a1 FROM t1 GROUP BY pk "
+                + "HAVING avg_combine(a1) IS NOT NULL "
+                + "ORDER BY avg_combine(a1) IS NULL";
+        Plan plan = PlanChecker.from(connectContext).analyze(sql).getPlan();
+        List<CombineCombinator> combineFunctions = plan.<Plan>collectToList(node -> true).stream()
+                .flatMap(node -> node.getExpressions().stream())
+                .flatMap(expression -> expression.<CombineCombinator>collectToList(
+                        CombineCombinator.class::isInstance).stream())
+                .collect(ImmutableList.toImmutableList());
+        Assertions.assertFalse(combineFunctions.isEmpty());
+        for (CombineCombinator combineFunction : combineFunctions) {
+            Assertions.assertInstanceOf(SlotReference.class, combineFunction.child(0));
+            Assertions.assertEquals(new ExprId(1), ((SlotReference) combineFunction.child(0)).getExprId());
+        }
     }
 
     @Test
@@ -286,6 +320,24 @@ public class FillUpMissingSlotsTest extends AnalyzeCheckTestBase implements Memo
     }
 
     @Test
+    void testHavingAggregateFunctionDoesNotLeakHelperOutput() {
+        Plan plan = PlanChecker.from(connectContext)
+                .analyze("SELECT 1 FROM t1 HAVING SUM(a1) > 0")
+                .getPlan();
+        Assertions.assertEquals(1, plan.getOutput().size());
+
+        PlanChecker.from(connectContext)
+                .analyze("SELECT (SELECT 1 FROM t1 HAVING SUM(a1) > 0)");
+
+        ExceptionChecker.expectThrowsWithMsg(
+                AnalysisException.class,
+                "Multiple columns returned by subquery are not yet supported. Found 2",
+                () -> PlanChecker.from(connectContext).analyze(
+                        "SELECT (SELECT 1, 2 FROM t1 HAVING SUM(a1) > 0)"
+                ));
+    }
+
+    @Test
     void testJoinWithHaving() {
         String sql = "SELECT a1, sum(a2) FROM t1, t2 WHERE t1.pk = t2.pk GROUP BY a1 HAVING a1 > sum(b1)";
         SlotReference a1 = new SlotReference(
@@ -322,26 +374,47 @@ public class FillUpMissingSlotsTest extends AnalyzeCheckTestBase implements Memo
     }
 
     @Test
+    void testHavingLambdaLocalSlots() {
+        String mapSql = "SELECT a1, COUNT(*) AS n FROM t1 GROUP BY a1 "
+                + "HAVING map_exists((k, v) -> v > 1, map(1, COUNT(*)))";
+        Assertions.assertNotNull(PlanChecker.from(connectContext).analyze(mapSql).getPlan());
+
+        String arraySql = "SELECT a1, COUNT(*) AS n FROM t1 GROUP BY a1 "
+                + "HAVING array_match_any(array_map(x -> x > 1, array(COUNT(*))))";
+        Assertions.assertNotNull(PlanChecker.from(connectContext).analyze(arraySql).getPlan());
+
+        ExceptionChecker.expectThrowsWithMsg(
+                AnalysisException.class,
+                "HAVING expression 'a2' must appear in the GROUP BY clause"
+                        + " or be used in an aggregate function.",
+                () -> PlanChecker.from(connectContext).analyze(
+                        "SELECT a1, COUNT(*) AS n FROM t1 GROUP BY a1 "
+                                + "HAVING array_match_any(array_map(x -> x > 1, "
+                                + "array(COUNT(*) + a2)))"
+                ));
+    }
+
+    @Test
     void testInvalidHaving() {
         ExceptionChecker.expectThrowsWithMsg(
                 AnalysisException.class,
-                "a2 should be grouped by.",
+                "HAVING expression 'a2' must appear in the GROUP BY clause"
+                    + " or be used in an aggregate function.",
                 () -> PlanChecker.from(connectContext).analyze(
                         "SELECT a1 FROM t1 GROUP BY a1 HAVING a2 > 0"
                 ));
 
         ExceptionChecker.expectThrowsWithMsg(
                 AnalysisException.class,
-                "Aggregate functions in having clause can't be nested:"
-                        + " sum((cast(a1 as DOUBLE) + avg(a2))).",
+                "HAVING aggregate functions can't be nested: sum((cast(a1 as DOUBLE) + avg(a2))).",
                 () -> PlanChecker.from(connectContext).analyze(
                         "SELECT a1 FROM t1 GROUP BY a1 HAVING sum(a1 + AVG(a2)) > 0"
                 ));
 
         ExceptionChecker.expectThrowsWithMsg(
                 AnalysisException.class,
-                "Aggregate functions in having clause can't be nested:"
-                        + " sum((cast((cast(a1 as SMALLINT) + cast(a2 as SMALLINT)) as DOUBLE) + avg(a2))).",
+                "HAVING aggregate functions can't be nested: sum((cast((cast(a1 as SMALLINT) + "
+                    + "cast(a2 as SMALLINT)) as DOUBLE) + avg(a2))).",
                 () -> PlanChecker.from(connectContext).analyze(
                         "SELECT a1 FROM t1 GROUP BY a1 HAVING sum(a1 + a2 + AVG(a2)) > 0"
                 ));
@@ -612,6 +685,56 @@ public class FillUpMissingSlotsTest extends AnalyzeCheckTestBase implements Memo
         String sql = "SELECT (pk + 1) as c FROM t1 HAVING c  > 1 ORDER BY a1 + pk";
         PlanChecker.from(connectContext).analyze(sql)
                 .applyBottomUp(new CheckAfterRewrite());
+    }
+
+    @Test
+    void testSortHavingProject() {
+        // no agg
+        String sql = "select c1 from t3 order by c1, c2, c1 + c2";
+        PlanChecker.from(connectContext).analyze(sql).matches(
+                logicalSort(
+                        logicalProject().when(
+                                project -> TestHelper.toStringList(project.getProjects()).equals(ImmutableList.of("c1#1", "c2#2")))
+                ).when(
+                        sort -> TestHelper.toStringList(sort.getExpressions()).equals(ImmutableList.of("c1#1", "c2#2", "(c1#1 + c2#2)"))
+                )
+        );
+
+        // no agg
+        sql = "select c1 from t3 order by sum(c1) over(partition by c2)";
+        PlanChecker.from(connectContext).analyze(sql).matches(
+                logicalSort(
+                        logicalProject().when(
+                                project -> TestHelper.toStringList(project.getProjects()).equals(ImmutableList.of("c1#1", "c2#2")))
+                ).when(
+                        sort -> TestHelper.toStringList(sort.getExpressions()).equals(ImmutableList.of("WindowExpression(sum(c1#1) spec(PARTITION BY c2#2 ))"))
+                )
+        );
+
+        sql = "select 1 as b from t3 order by sum(c1)";
+        PlanChecker.from(connectContext).analyze(sql).matches(
+                logicalSort(
+                        logicalProject(
+                                logicalProject(
+                                        logicalAggregate(
+                                        ).when(agg -> agg.getGroupByExpressions().isEmpty() && TestHelper.toStringList(agg.getOutputExpressions()).equals(ImmutableList.of("sum(c1#2) AS `sum(c1)`#4")))
+                                ).when(project -> TestHelper.toStringList(project.getProjects()).equals(ImmutableList.of("sum(c1)#4")))
+                        ).when(project -> TestHelper.toStringList(project.getProjects()).equals(ImmutableList.of("1 AS `b`#0", "sum(c1)#4")))
+                ).when(sort -> TestHelper.toStringList(sort.getExpressions()).equals(ImmutableList.of("sum(c1)#4")))
+        );
+
+        sql = "select /*+ SET_VAR(sql_mode='') */ c1, c1 + c2 from t3 order by c1, sum(c1) + c2";
+        PlanChecker.from(connectContext).analyze(sql).matches(
+                logicalSort(
+                        logicalProject(
+                                logicalAggregate(
+                                        logicalProject(
+                                        ).when(project -> TestHelper.toStringList(project.getProjects()).equals(ImmutableList.of("c1#1", "c2#2")))
+                                ).when(agg -> agg.getGroupByExpressions().isEmpty() && TestHelper.toStringList(agg.getOutputExpressions()).equals(
+                                        ImmutableList.of("any_value(c1#1) AS `c1`#4", "sum(c1#1) AS `sum(c1)`#5", "any_value(c2#2) AS `c2`#6")))
+                        ).when(project -> TestHelper.toStringList(project.getProjects()).equals(ImmutableList.of("c1#4", "(c1#4 + c2#6) AS `c1 + c2`#3", "sum(c1)#5", "c2#6")))
+                ).when(sort -> TestHelper.toStringList(sort.getExpressions()).equals(ImmutableList.of("c1#4", "(sum(c1)#5 + c2#6)")))
+        );
     }
 
     @Test

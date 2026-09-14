@@ -24,11 +24,13 @@ import org.apache.doris.nereids.properties.PhysicalProperties;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
 import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.expressions.SlotReference;
+import org.apache.doris.nereids.trees.plans.AbstractPlan;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.PlanType;
+import org.apache.doris.nereids.trees.plans.algebra.Except;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
 import org.apache.doris.nereids.util.Utils;
-import org.apache.doris.statistics.Statistics;
+import org.apache.doris.statistics.model.Statistics;
 
 import com.google.common.collect.ImmutableSet;
 
@@ -36,11 +38,12 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 /**
  * Physical Except.
  */
-public class PhysicalExcept extends PhysicalSetOperation {
+public class PhysicalExcept extends PhysicalSetOperation implements Except {
 
     public PhysicalExcept(Qualifier qualifier,
             List<NamedExpression> outputs,
@@ -77,37 +80,43 @@ public class PhysicalExcept extends PhysicalSetOperation {
 
     @Override
     public String toString() {
+        StringBuilder sb = new StringBuilder();
+        if (!runtimeFilters.isEmpty()) {
+            sb.append(runtimeFilters.stream().map(rf -> rf.toString() + " ").collect(Collectors.joining(" ")));
+        }
         return Utils.toSqlString("PhysicalExcept",
                 "qualifier", qualifier,
                 "outputs", outputs,
                 "regularChildrenOutputs", regularChildrenOutputs,
-                "stats", statistics);
+                "stats", statistics,
+                "RFs", sb.toString());
     }
 
     @Override
     public PhysicalExcept withChildren(List<Plan> children) {
-        return new PhysicalExcept(qualifier, outputs, regularChildrenOutputs, getLogicalProperties(), children);
+        return AbstractPlan.copyWithSameId(this, () -> new PhysicalExcept(qualifier, outputs,
+                regularChildrenOutputs, getLogicalProperties(), children));
     }
 
     @Override
     public PhysicalExcept withGroupExpression(
             Optional<GroupExpression> groupExpression) {
-        return new PhysicalExcept(qualifier, outputs, regularChildrenOutputs,
-                groupExpression, getLogicalProperties(), children);
+        return AbstractPlan.copyWithSameId(this, () -> new PhysicalExcept(qualifier, outputs, regularChildrenOutputs,
+                groupExpression, getLogicalProperties(), children));
     }
 
     @Override
     public Plan withGroupExprLogicalPropChildren(Optional<GroupExpression> groupExpression,
             Optional<LogicalProperties> logicalProperties, List<Plan> children) {
-        return new PhysicalExcept(qualifier, outputs, regularChildrenOutputs,
-                groupExpression, logicalProperties.get(), children);
+        return AbstractPlan.copyWithSameId(this, () -> new PhysicalExcept(qualifier, outputs, regularChildrenOutputs,
+                groupExpression, logicalProperties.get(), children));
     }
 
     @Override
     public PhysicalExcept withPhysicalPropertiesAndStats(
             PhysicalProperties physicalProperties, Statistics statistics) {
-        return new PhysicalExcept(qualifier, outputs, regularChildrenOutputs, Optional.empty(),
-                getLogicalProperties(), physicalProperties, statistics, children);
+        return AbstractPlan.copyWithSameId(this, () -> new PhysicalExcept(qualifier, outputs, regularChildrenOutputs,
+                Optional.empty(), getLogicalProperties(), physicalProperties, statistics, children));
     }
 
     @Override

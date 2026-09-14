@@ -24,98 +24,51 @@ import org.apache.doris.persist.EditLog;
 import org.apache.doris.system.Backend;
 import org.apache.doris.system.SystemInfoService;
 
-import mockit.Expectations;
-import mockit.Mocked;
-import org.junit.After;
-import org.junit.Assert;
-import org.junit.Before;
-import org.junit.Test;
+import com.google.common.collect.Lists;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.MockedStatic;
+import org.mockito.Mockito;
+
+import java.util.List;
 
 public class BackendsProcDirTest {
     private Backend b1;
     private Backend b2;
 
-    @Mocked
-    private SystemInfoService systemInfoService;
-    @Mocked
-    private TabletInvertedIndex tabletInvertedIndex;
-    @Mocked
-    private Env env;
-    @Mocked
-    private EditLog editLog;
+    private SystemInfoService systemInfoService = Mockito.mock(SystemInfoService.class);
+    private TabletInvertedIndex tabletInvertedIndex = Mockito.mock(TabletInvertedIndex.class);
+    private Env env = Mockito.mock(Env.class);
+    private EditLog editLog = Mockito.mock(EditLog.class);
+    private MockedStatic<Env> mockedEnvStatic;
 
-    @Before
+    @BeforeEach
     public void setUp() {
         b1 = new Backend(1000, "host1", 10000);
         b1.updateOnce(10001, 10003, 10005);
         b2 = new Backend(1001, "host2", 20000);
         b2.updateOnce(20001, 20003, 20005);
 
-        new Expectations() {
-            {
-                editLog.logAddBackend((Backend) any);
-                minTimes = 0;
+        Mockito.when(env.getNextId()).thenReturn(10000L);
+        Mockito.when(env.getEditLog()).thenReturn(editLog);
+        Mockito.when(systemInfoService.getBackend(1000)).thenReturn(b1);
+        Mockito.when(systemInfoService.getBackend(1001)).thenReturn(b2);
+        Mockito.when(systemInfoService.getBackend(1002)).thenReturn(null);
+        Mockito.when(tabletInvertedIndex.getTabletNumByBackendId(Mockito.anyLong())).thenReturn(2);
 
-                editLog.logDropBackend((Backend) any);
-                minTimes = 0;
-
-                editLog.logBackendStateChange((Backend) any);
-                minTimes = 0;
-
-                env.getNextId();
-                minTimes = 0;
-                result = 10000L;
-
-                env.getEditLog();
-                minTimes = 0;
-                result = editLog;
-
-                env.clear();
-                minTimes = 0;
-
-                systemInfoService.getBackend(1000);
-                minTimes = 0;
-                result = b1;
-
-                systemInfoService.getBackend(1001);
-                minTimes = 0;
-                result = b2;
-
-                systemInfoService.getBackend(1002);
-                minTimes = 0;
-                result = null;
-
-                tabletInvertedIndex.getTabletNumByBackendId(anyLong);
-                minTimes = 0;
-                result = 2;
-            }
-        };
-
-        new Expectations(env) {
-            {
-                Env.getCurrentEnv();
-                minTimes = 0;
-                result = env;
-
-                Env.getCurrentEnv();
-                minTimes = 0;
-                result = env;
-
-                Env.getCurrentInvertedIndex();
-                minTimes = 0;
-                result = tabletInvertedIndex;
-
-                Env.getCurrentSystemInfo();
-                minTimes = 0;
-                result = systemInfoService;
-            }
-        };
-
+        mockedEnvStatic = Mockito.mockStatic(Env.class);
+        mockedEnvStatic.when(Env::getCurrentEnv).thenReturn(env);
+        mockedEnvStatic.when(Env::getCurrentInvertedIndex).thenReturn(tabletInvertedIndex);
+        mockedEnvStatic.when(Env::getCurrentSystemInfo).thenReturn(systemInfoService);
     }
 
-    @After
+    @AfterEach
     public void tearDown() {
-        // systemInfoService = null;
+        if (mockedEnvStatic != null) {
+            mockedEnvStatic.close();
+        }
     }
 
     @Test
@@ -123,36 +76,38 @@ public class BackendsProcDirTest {
         BackendsProcDir dir;
 
         dir = new BackendsProcDir(systemInfoService);
-        Assert.assertFalse(dir.register("100000", new BaseProcDir()));
+        Assertions.assertFalse(dir.register("100000", new BaseProcDir()));
     }
 
-    @Test(expected = AnalysisException.class)
+    @Test
     public void testLookupNormal() throws AnalysisException {
-        BackendsProcDir dir;
-        ProcNodeInterface node;
+        Assertions.assertThrows(AnalysisException.class, () -> {
+            BackendsProcDir dir;
+            ProcNodeInterface node;
 
-        dir = new BackendsProcDir(systemInfoService);
-        try {
-            node = dir.lookup("1000");
-            Assert.assertNotNull(node);
-            Assert.assertTrue(node instanceof BackendProcNode);
-        } catch (AnalysisException e) {
-            e.printStackTrace();
-            Assert.fail();
-        }
+            dir = new BackendsProcDir(systemInfoService);
+            try {
+                node = dir.lookup("1000");
+                Assertions.assertNotNull(node);
+                Assertions.assertTrue(node instanceof BackendProcNode);
+            } catch (AnalysisException e) {
+                e.printStackTrace();
+                Assertions.fail();
+            }
 
-        dir = new BackendsProcDir(systemInfoService);
-        try {
-            node = dir.lookup("1001");
-            Assert.assertNotNull(node);
-            Assert.assertTrue(node instanceof BackendProcNode);
-        } catch (AnalysisException e) {
-            Assert.fail();
-        }
+            dir = new BackendsProcDir(systemInfoService);
+            try {
+                node = dir.lookup("1001");
+                Assertions.assertNotNull(node);
+                Assertions.assertTrue(node instanceof BackendProcNode);
+            } catch (AnalysisException e) {
+                Assertions.fail();
+            }
 
-        dir = new BackendsProcDir(systemInfoService);
-        node = dir.lookup("1002");
-        Assert.fail();
+            dir = new BackendsProcDir(systemInfoService);
+            node = dir.lookup("1002");
+            Assertions.fail();
+        });
     }
 
     @Test
@@ -180,7 +135,33 @@ public class BackendsProcDirTest {
 
         dir = new BackendsProcDir(systemInfoService);
         result = dir.fetchResult();
-        Assert.assertNotNull(result);
-        Assert.assertTrue(result instanceof BaseProcResult);
+        Assertions.assertNotNull(result);
+        Assertions.assertTrue(result instanceof BaseProcResult);
+    }
+
+    @Test
+    public void testBackendInfoFieldOrder() throws AnalysisException {
+        b1.setCpuCores(192);
+        b1.setLastUpdateMs(System.currentTimeMillis());
+        b1.setRunningTasks(10L);
+
+        Mockito.when(systemInfoService.getAllBackendIds(false)).thenReturn(Lists.newArrayList(1000L));
+        Mockito.when(systemInfoService.getTabletNumByBackendId(1000L)).thenReturn(10);
+
+        BackendsProcDir dir = new BackendsProcDir(systemInfoService);
+        ProcResult result = dir.fetchResult();
+
+        List<String> columnNames = result.getColumnNames();
+
+        int cpuCoresIdx = columnNames.indexOf("CpuCores");
+        int memoryIdx = columnNames.indexOf("Memory");
+        int liveSinceIdx = columnNames.indexOf("LiveSince");
+        int runningTasksIdx = columnNames.indexOf("RunningTasks");
+        int nodeRoleIdx = columnNames.indexOf("NodeRole");
+
+        Assertions.assertTrue(cpuCoresIdx < memoryIdx, "CpuCores should be before Memory");
+        Assertions.assertTrue(memoryIdx < liveSinceIdx, "Memory should be before LiveSince");
+        Assertions.assertTrue(liveSinceIdx < runningTasksIdx, "LiveSince should be before RunningTasks");
+        Assertions.assertTrue(runningTasksIdx < nodeRoleIdx, "RunningTasks should be before NodeRole");
     }
 }

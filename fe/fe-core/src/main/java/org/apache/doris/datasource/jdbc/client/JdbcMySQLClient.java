@@ -36,9 +36,11 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.function.Consumer;
 
 public class JdbcMySQLClient extends JdbcClient {
@@ -58,7 +60,7 @@ public class JdbcMySQLClient extends JdbcClient {
             rs = stmt.executeQuery("SHOW VARIABLES LIKE 'version_comment'");
             if (rs.next()) {
                 String versionComment = rs.getString("Value");
-                isDoris = versionComment.toLowerCase().contains("doris");
+                isDoris = isDorisCompatibleVersionComment(versionComment);
             }
         } catch (SQLException | JdbcClientException e) {
             closeClient();
@@ -72,6 +74,18 @@ public class JdbcMySQLClient extends JdbcClient {
         super(jdbcClientConfig);
         convertDateToNull = isConvertDatetimeToNull(jdbcClientConfig);
         this.dbType = dbType;
+    }
+
+    static boolean isDorisCompatibleVersionComment(String versionComment) {
+        if (Strings.isNullOrEmpty(versionComment)) {
+            return false;
+        }
+        String lowerVersionComment = versionComment.toLowerCase(Locale.ROOT);
+        return lowerVersionComment.contains("doris")
+                || lowerVersionComment.contains("selectdb")
+                || lowerVersionComment.contains("velodb")
+                || (lowerVersionComment.contains("enterprise version")
+                    && lowerVersionComment.contains("cloud mode"));
     }
 
     @Override
@@ -185,6 +199,28 @@ public class JdbcMySQLClient extends JdbcClient {
         return tableSchema;
     }
 
+    @Override
+    public List<String> getPrimaryKeys(String remoteDbName, String remoteTableName) {
+        Connection conn = getConnection();
+        ResultSet rs = null;
+        // getPrimaryKeys orders rows by COLUMN_NAME, not KEY_SEQ; reorder by the 1-based KEY_SEQ
+        // to keep the real composite-PK column order.
+        TreeMap<Short, String> primaryKeys = new TreeMap<>();
+        try {
+            DatabaseMetaData databaseMetaData = conn.getMetaData();
+            rs = databaseMetaData.getPrimaryKeys(remoteDbName, null, remoteTableName);
+            while (rs.next()) {
+                primaryKeys.put(rs.getShort("KEY_SEQ"), rs.getString("COLUMN_NAME"));
+            }
+        } catch (SQLException e) {
+            throw new JdbcClientException("failed to get jdbc primary key info for remote table `%s.%s`: %s",
+                    remoteDbName, remoteTableName, Util.getRootCauseMessage(e));
+        } finally {
+            close(rs, conn);
+        }
+        return Lists.newArrayList(primaryKeys.values());
+    }
+
     protected String getCatalogName(Connection conn) throws SQLException {
         return null;
     }
@@ -256,7 +292,18 @@ public class JdbcMySQLClient extends JdbcClient {
                     fieldSchema.setAllowNull(true);
                 }
                 return ScalarType.createDateV2Type();
-            case "TIMESTAMP":
+            case "TIMESTAMP": {
+                int columnSize = fieldSchema.requiredColumnSize();
+                int scale = columnSize > 19 ? columnSize - 20 : 0;
+                if (scale > 6) {
+                    scale = 6;
+                }
+                if (convertDateToNull) {
+                    fieldSchema.setAllowNull(true);
+                }
+                return enableMappingTimestampTz ? ScalarType.createTimeStampTzType(scale)
+                        : ScalarType.createDatetimeV2Type(scale);
+            }
             case "DATETIME": {
                 // mysql can support microsecond
                 // use columnSize to calculate the precision of timestamp/datetime
@@ -401,7 +448,7 @@ public class JdbcMySQLClient extends JdbcClient {
                 return ScalarType.createDateV2Type();
             case "DATETIME":
             case "DATETIMEV2": {
-                int scale = (openParen == -1) ? 6
+                int scale = (openParen == -1) ? 0
                         : Integer.parseInt(upperType.substring(openParen + 1, upperType.length() - 1));
                 if (scale > 6) {
                     scale = 6;
@@ -422,6 +469,8 @@ public class JdbcMySQLClient extends JdbcClient {
                 return ScalarType.createHllType();
             case "BITMAP":
                 return Type.BITMAP;
+            case "QUANTILE_STATE":
+                return Type.QUANTILE_STATE;
             case "VARBINARY":
                 return ScalarType.createVarbinaryType(fieldSchema.requiredColumnSize());
             default:

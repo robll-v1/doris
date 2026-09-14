@@ -19,15 +19,14 @@ package org.apache.doris.nereids.parser;
 
 import org.apache.doris.common.Pair;
 import org.apache.doris.nereids.DorisParser;
-import org.apache.doris.nereids.DorisParser.AggClauseContext;
 import org.apache.doris.nereids.DorisParser.AliasQueryContext;
 import org.apache.doris.nereids.DorisParser.ColumnReferenceContext;
 import org.apache.doris.nereids.DorisParser.DereferenceContext;
-import org.apache.doris.nereids.DorisParser.GroupingElementContext;
 import org.apache.doris.nereids.DorisParser.IdentifierContext;
 import org.apache.doris.nereids.DorisParser.LateralViewContext;
 import org.apache.doris.nereids.DorisParser.MultipartIdentifierContext;
 import org.apache.doris.nereids.DorisParser.NamedExpressionContext;
+import org.apache.doris.nereids.DorisParser.PrimaryExpressionContext;
 import org.apache.doris.nereids.DorisParser.StarContext;
 import org.apache.doris.nereids.DorisParser.TableAliasContext;
 import org.apache.doris.nereids.DorisParser.TableNameContext;
@@ -147,9 +146,11 @@ public class LogicalPlanBuilderForCreateView extends LogicalPlanBuilder {
     }
 
     @Override
-    public Expression visitDereference(DereferenceContext ctx) {
-        UnboundSlot slot = (UnboundSlot) super.visitDereference(ctx);
-        return slot.withIndexInSql(Pair.of(ctx.start.getStartIndex(), ctx.stop.getStopIndex()));
+    protected Expression buildDereference(
+            Expression base, DereferenceContext ctx, PrimaryExpressionContext originContext) {
+        UnboundSlot slot = (UnboundSlot) super.buildDereference(base, ctx, originContext);
+        return slot.withIndexInSql(Pair.of(
+                originContext.start.getStartIndex(), ctx.stop.getStopIndex()));
     }
 
     @Override
@@ -159,9 +160,4 @@ public class LogicalPlanBuilderForCreateView extends LogicalPlanBuilder {
         return slot.withIndexInSql(Pair.of(ctx.start.getStartIndex(), ctx.stop.getStopIndex()));
     }
 
-    private boolean isRepeat(AggClauseContext ctx) {
-        GroupingElementContext groupingElementContext = ctx.groupingElement();
-        return groupingElementContext.GROUPING() != null || groupingElementContext.CUBE() != null
-                || groupingElementContext.ROLLUP() != null;
-    }
 }

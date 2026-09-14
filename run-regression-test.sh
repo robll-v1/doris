@@ -23,6 +23,63 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 
 DORIS_HOME="${ROOT}"
 
+java_major_version() {
+    local java_cmd="$1"
+    local spec_version
+
+    spec_version="$("${java_cmd}" -XshowSettings:properties -version 2>&1 \
+        | awk -F'= ' '/java.specification.version =/ {print $2; exit}')"
+    # Cygwin's Java properties output uses CRLF line endings.
+    spec_version="${spec_version//$'\r'/}"
+    if [[ "${spec_version}" == 1.* ]]; then
+        spec_version="${spec_version#1.}"
+    fi
+    echo "${spec_version%%.*}"
+}
+
+is_jdk17_home() {
+    local java_home="$1"
+    [[ -n "${java_home}" ]] && [[ -x "${java_home}/bin/java" ]] \
+        && [[ -x "${java_home}/bin/javac" ]] \
+        && [[ "$(java_major_version "${java_home}/bin/java")" == "17" ]]
+}
+
+find_jdk17_home() {
+    local candidate
+
+    for candidate in "${JAVA_HOME:-}" "${JDK_17:-}"; do
+        if is_jdk17_home "${candidate}"; then
+            echo "${candidate}"
+            return 0
+        fi
+    done
+
+    if [[ "$(uname -s)" == "Darwin" ]] && [[ -x /usr/libexec/java_home ]]; then
+        candidate="$(/usr/libexec/java_home -v 17 2>/dev/null || true)"
+        if is_jdk17_home "${candidate}"; then
+            echo "${candidate}"
+            return 0
+        fi
+    elif [[ -d /usr/lib/jvm ]]; then
+        while IFS= read -r candidate; do
+            if is_jdk17_home "${candidate}"; then
+                echo "${candidate}"
+                return 0
+            fi
+        done < <(find /usr/lib/jvm -mindepth 1 -maxdepth 1 \( -type d -o -type l \) 2>/dev/null | sort)
+    fi
+
+    echo "Error: JDK 17 is required. Set JAVA_HOME or JDK_17, or install JDK 17." >&2
+    return 1
+}
+
+JAVA_HOME="$(find_jdk17_home)"
+export JAVA_HOME
+export PATH="${JAVA_HOME}/bin:${PATH}"
+export JAVA="${JAVA_HOME}/bin/java"
+JAVA_MAJOR_VERSION="$(java_major_version "${JAVA}")"
+echo "Using JDK ${JAVA_MAJOR_VERSION}: ${JAVA_HOME}"
+
 # Check args
 usage() {
     echo "
@@ -172,40 +229,81 @@ fi
 if ! test -f ${RUN_JAR:+${RUN_JAR}}; then
     echo "===== Build Regression Test Framework ====="
 
-    # echo "Build generated code"
-    cd "${DORIS_HOME}/gensrc/thrift"
-    make
+    # Configure Maven for better network resilience
+    export MAVEN_OPTS="${MAVEN_OPTS:-} -Dmaven.wagon.http.retryHandler.count=3 -Dmaven.wagon.httpconnectionManager.ttlSeconds=25 -Dmaven.wagon.http.retryHandler.class=standard"
 
-    cp -rf "${DORIS_HOME}/gensrc/build/gen_java/org/apache/doris/thrift" "${FRAMEWORK_APACHE_DIR}/doris/"
+    # Function to execute Maven command with retry logic
+    execute_maven_with_retry() {
+        local cmd="$1"
+        local max_attempts=3
+        local attempt=1
+        
+        while [[ ${attempt} -le ${max_attempts} ]]; do
+            echo "Attempt ${attempt}/${max_attempts}: ${cmd}"
+            if eval "${cmd}"; then
+                echo "Command succeeded on attempt ${attempt}"
+                return 0
+            else
+                echo "Command failed on attempt ${attempt}"
+                if [[ ${attempt} -lt ${max_attempts} ]]; then
+                    sleep $((attempt * 5))  # Linear backoff
+                fi
+                ((attempt++))
+            fi
+        done
+        
+        echo "Command failed after ${max_attempts} attempts"
+        return 1
+    }
 
-    cd "${DORIS_HOME}/regression-test/framework"
-    "${MVN_CMD}" package
-    cd "${DORIS_HOME}"
+    # Navigate to framework directory and build with retry
+    cd "${DORIS_HOME}/regression-test/framework" || { echo "Failed to change directory"; exit 1; }
+    
+    # First try to download dependencies only
+    echo "Downloading dependencies..."
+    dep_output_file="$(mktemp -t doris-dependencies-XXXXXX.txt)" || { echo "Failed to create temporary file for dependency output"; exit 1; }
+    execute_maven_with_retry "${MVN_CMD} dependency:resolve -B -DskipTests=true -Dmdep.prependGroupId=true -DoutputFile=${dep_output_file}" || {
+        echo "Failed to download dependencies"
+        exit 1
+    }
+    
+    # Then package with retry
+    echo "Building package..."
+    # Keep framework unit tests in the standard compile path so pipeline builds enforce framework regressions.
+    execute_maven_with_retry "${MVN_CMD} clean package -B -Dmaven.javadoc.skip=true" || {
+        echo "Failed to build package"
+        exit 1
+    }
+    
+    cd "${DORIS_HOME}" || { echo "Failed to return to DORIS_HOME"; exit 1; }
 
     mkdir -p "${OUTPUT_DIR}"/{lib,log}
     cp -r "${REGRESSION_TEST_BUILD_DIR}"/regression-test-*.jar "${OUTPUT_DIR}/lib"
 
     echo "===== BUILD JAVA_UDF_SRC TO GENERATE JAR ====="
     mkdir -p "${DORIS_HOME}"/regression-test/suites/javaudf_p0/jars
-    cd "${DORIS_HOME}"/regression-test/java-udf-src
-    "${MVN_CMD}" package
+    cd "${DORIS_HOME}"/regression-test/java-udf-src || { echo "Failed to change directory to java-udf-src"; exit 1; }
+
+    # Build the UDF test jar with the same JDK 17 used by the regression framework.
+    if ! execute_maven_with_retry "${MVN_CMD} clean package -B -DskipTests=true -Dmaven.javadoc.skip=true"; then
+        echo "Failed to build UDF package"
+        exit 1
+    fi
+
     cp target/java-udf-case-jar-with-dependencies.jar "${DORIS_HOME}"/regression-test/suites/javaudf_p0/jars/
     # be and fe dir is compiled output
     mkdir -p "${DORIS_HOME}"/output/fe/custom_lib/
     mkdir -p "${DORIS_HOME}"/output/be/custom_lib/
     cp target/java-udf-case-jar-with-dependencies.jar "${DORIS_HOME}"/output/fe/custom_lib/
     cp target/java-udf-case-jar-with-dependencies.jar "${DORIS_HOME}"/output/be/custom_lib/
-    cd "${DORIS_HOME}"
+    cd "${DORIS_HOME}" || { echo "Failed to return to DORIS_HOME"; exit 1; }
 fi
 
-# check java home
-if [[ -z "${JAVA_HOME}" ]]; then
-    echo "Error: JAVA_HOME is not set"
-    exit 1
+# Arrow Flight SQL JDBC needs java.nio opened when the regression framework runs on JDK 17+.
+if [[ -n "${JAVA_MAJOR_VERSION}" ]] && [[ "${JAVA_MAJOR_VERSION}" -ge 17 ]] \
+    && [[ " ${JAVA_OPTS:-} " != *"--add-opens=java.base/java.nio="* ]]; then
+    JAVA_OPTS="${JAVA_OPTS:+${JAVA_OPTS} }--add-opens=java.base/java.nio=ALL-UNNAMED"
 fi
-
-# check java version
-export JAVA="${JAVA_HOME}/bin/java"
 
 REGRESSION_OPTIONS_PREFIX=''
 
@@ -261,7 +359,6 @@ fi
 
 echo "===== Run Regression Test ====="
 
-# if use jdk17, add java option "--add-opens=java.base/java.nio=ALL-UNNAMED"
 if [[ "${TEAMCITY}" -eq 1 ]]; then
     JAVA_OPTS="${JAVA_OPTS} -DstdoutAppenderType=teamcity -Xmx2048m"
 fi

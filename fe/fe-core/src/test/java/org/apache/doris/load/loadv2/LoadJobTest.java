@@ -18,38 +18,28 @@
 package org.apache.doris.load.loadv2;
 
 import org.apache.doris.catalog.Env;
-import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.DdlException;
-import org.apache.doris.common.DuplicatedRequestException;
-import org.apache.doris.common.LabelAlreadyUsedException;
 import org.apache.doris.common.LoadException;
-import org.apache.doris.common.MetaNotFoundException;
-import org.apache.doris.common.QuotaExceedException;
 import org.apache.doris.common.jmockit.Deencapsulation;
-import org.apache.doris.metric.LongCounterMetric;
 import org.apache.doris.metric.MetricRepo;
 import org.apache.doris.nereids.trees.plans.commands.LoadCommand;
 import org.apache.doris.persist.EditLog;
 import org.apache.doris.task.MasterTaskExecutor;
-import org.apache.doris.thrift.TUniqueId;
-import org.apache.doris.transaction.BeginTransactionException;
-import org.apache.doris.transaction.GlobalTransactionMgr;
-import org.apache.doris.transaction.TransactionState;
+import org.apache.doris.transaction.GlobalTransactionMgrIface;
+import org.apache.doris.transaction.TxnStateCallbackFactory;
 
-import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import mockit.Expectations;
-import mockit.Injectable;
-import mockit.Mocked;
-import org.junit.Assert;
-import org.junit.BeforeClass;
-import org.junit.Test;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+import org.mockito.MockedStatic;
+import org.mockito.Mockito;
 
 import java.util.Map;
 
 public class LoadJobTest {
 
-    @BeforeClass
+    @BeforeAll
     public static void start() {
         MetricRepo.init();
     }
@@ -61,7 +51,7 @@ public class LoadJobTest {
         LoadJob loadJob = new BrokerLoadJob();
         try {
             loadJob.setJobProperties(jobProperties);
-            Assert.fail();
+            Assertions.fail();
         } catch (DdlException e) {
             // CHECKSTYLE IGNORE THIS LINE
         }
@@ -78,37 +68,34 @@ public class LoadJobTest {
         LoadJob loadJob = new BrokerLoadJob();
         try {
             loadJob.setJobProperties(jobProperties);
-            Assert.assertEquals(1000, loadJob.getTimeout());
-            Assert.assertEquals(0.1, loadJob.getMaxFilterRatio(), 0);
-            Assert.assertEquals(1024, loadJob.getExecMemLimit());
-            Assert.assertTrue(loadJob.isStrictMode());
+            Assertions.assertEquals(1000, loadJob.getTimeout());
+            Assertions.assertEquals(0.1, loadJob.getMaxFilterRatio(), 0);
+            Assertions.assertEquals(1024, loadJob.getExecMemLimit());
+            Assertions.assertTrue(loadJob.isStrictMode());
         } catch (DdlException e) {
-            Assert.fail(e.getMessage());
+            Assertions.fail(e.getMessage());
         }
     }
 
     @Test
-    public void testExecute(@Mocked GlobalTransactionMgr globalTransactionMgr,
-                            @Mocked MasterTaskExecutor masterTaskExecutor)
-            throws LabelAlreadyUsedException, BeginTransactionException, AnalysisException, DuplicatedRequestException,
-            QuotaExceedException, MetaNotFoundException, InterruptedException {
-        LoadJob loadJob = new BrokerLoadJob();
-        new Expectations() {
-            {
-                globalTransactionMgr.beginTransaction(anyLong, Lists.newArrayList(), anyString, (TUniqueId) any,
-                        (TransactionState.TxnCoordinator) any,
-                        (TransactionState.LoadJobSourceType) any, anyLong, anyLong);
-                minTimes = 0;
-                result = 1;
-            }
-        };
+    public void testExecute() {
+        try (MockedStatic<Env> envMockedStatic = Mockito.mockStatic(Env.class)) {
+            Env env = Mockito.mock(Env.class);
+            MasterTaskExecutor taskScheduler = Mockito.mock(MasterTaskExecutor.class);
+            GlobalTransactionMgrIface txnMgr = Mockito.mock(GlobalTransactionMgrIface.class);
 
-        try {
-            loadJob.execute();
-        } catch (LoadException e) {
-            Assert.fail(e.getMessage());
+            envMockedStatic.when(Env::getCurrentEnv).thenReturn(env);
+            envMockedStatic.when(Env::getCurrentGlobalTransactionMgr).thenReturn(txnMgr);
+            Mockito.when(env.getPendingLoadTaskScheduler()).thenReturn(taskScheduler);
+
+            LoadJob loadJob = new BrokerLoadJob();
+            try {
+                loadJob.execute();
+            } catch (LoadException e) {
+                Assertions.fail(e.getMessage());
+            }
+            Assertions.assertEquals(JobState.PENDING, loadJob.getState());
         }
-        Assert.assertEquals(JobState.PENDING, loadJob.getState());
     }
 
     @Test
@@ -117,7 +104,7 @@ public class LoadJobTest {
         Deencapsulation.setField(loadJob, "state", JobState.FINISHED);
 
         loadJob.processTimeout();
-        Assert.assertEquals(JobState.FINISHED, loadJob.getState());
+        Assertions.assertEquals(JobState.FINISHED, loadJob.getState());
     }
 
     @Test
@@ -127,7 +114,7 @@ public class LoadJobTest {
         Deencapsulation.setField(loadJob, "state", JobState.LOADING);
 
         loadJob.processTimeout();
-        Assert.assertEquals(JobState.LOADING, loadJob.getState());
+        Assertions.assertEquals(JobState.LOADING, loadJob.getState());
     }
 
     @Test
@@ -135,49 +122,69 @@ public class LoadJobTest {
         LoadJob loadJob = new BrokerLoadJob();
         loadJob.setTimeout(1000L);
         loadJob.processTimeout();
-        Assert.assertEquals(JobState.PENDING, loadJob.getState());
+        Assertions.assertEquals(JobState.PENDING, loadJob.getState());
     }
 
     @Test
-    public void testProcessTimeout(@Mocked Env env, @Mocked EditLog editLog) {
-        LoadJob loadJob = new BrokerLoadJob();
-        loadJob.setTimeout(0);
-        new Expectations() {
-            {
-                env.getEditLog();
-                minTimes = 0;
-                result = editLog;
-            }
-        };
+    public void testProcessTimeout() {
+        try (MockedStatic<Env> envMockedStatic = Mockito.mockStatic(Env.class)) {
+            Env env = Mockito.mock(Env.class);
+            EditLog editLog = Mockito.mock(EditLog.class);
+            GlobalTransactionMgrIface txnMgr = Mockito.mock(GlobalTransactionMgrIface.class);
+            TxnStateCallbackFactory callbackFactory = Mockito.mock(TxnStateCallbackFactory.class);
 
-        loadJob.processTimeout();
-        Assert.assertEquals(JobState.CANCELLED, loadJob.getState());
+            envMockedStatic.when(Env::getCurrentEnv).thenReturn(env);
+            envMockedStatic.when(Env::getCurrentGlobalTransactionMgr).thenReturn(txnMgr);
+            Mockito.when(env.getEditLog()).thenReturn(editLog);
+            Mockito.when(txnMgr.getCallbackFactory()).thenReturn(callbackFactory);
+
+            LoadJob loadJob = new BrokerLoadJob();
+            loadJob.setTimeout(0);
+            Deencapsulation.setField(loadJob, "createTimestamp", 0L);
+
+            loadJob.processTimeout();
+            Assertions.assertEquals(JobState.CANCELLED, loadJob.getState());
+        }
     }
 
     @Test
     public void testUpdateStateToLoading() {
         LoadJob loadJob = new BrokerLoadJob();
         loadJob.updateState(JobState.LOADING);
-        Assert.assertEquals(JobState.LOADING, loadJob.getState());
-        Assert.assertNotEquals(-1, (long) Deencapsulation.getField(loadJob, "loadStartTimestamp"));
+        Assertions.assertEquals(JobState.LOADING, loadJob.getState());
+        Assertions.assertNotEquals(-1, (long) Deencapsulation.getField(loadJob, "loadStartTimestamp"));
     }
 
     @Test
-    public void testUpdateStateToFinished(@Mocked MetricRepo metricRepo,
-                                          @Injectable LoadTask loadTask1,
-                                          @Mocked LongCounterMetric longCounterMetric) {
+    public void testRetryStateCannotReturnToLoading() {
         LoadJob loadJob = new BrokerLoadJob();
-        loadJob.idToTasks.put(1L, loadTask1);
+        Deencapsulation.setField(loadJob, "state", JobState.RETRY);
 
-        // TxnStateCallbackFactory factory = Catalog.getCurrentEnv().getGlobalTransactionMgr().getCallbackFactory();
-        Env env = Env.getCurrentEnv();
-        GlobalTransactionMgr mgr = new GlobalTransactionMgr(env);
-        Deencapsulation.setField(env, "globalTransactionMgr", mgr);
-        Assert.assertEquals(1, loadJob.idToTasks.size());
-        loadJob.updateState(JobState.FINISHED);
-        Assert.assertEquals(JobState.FINISHED, loadJob.getState());
-        Assert.assertNotEquals(-1, (long) Deencapsulation.getField(loadJob, "finishTimestamp"));
-        Assert.assertEquals(100, (int) Deencapsulation.getField(loadJob, "progress"));
-        Assert.assertEquals(0, loadJob.idToTasks.size());
+        Assertions.assertFalse(loadJob.updateState(JobState.LOADING));
+        Assertions.assertEquals(JobState.RETRY, loadJob.getState());
+    }
+
+    @Test
+    public void testUpdateStateToFinished() {
+        try (MockedStatic<Env> envMockedStatic = Mockito.mockStatic(Env.class)) {
+            Env env = Mockito.mock(Env.class);
+            GlobalTransactionMgrIface txnMgr = Mockito.mock(GlobalTransactionMgrIface.class);
+            TxnStateCallbackFactory callbackFactory = Mockito.mock(TxnStateCallbackFactory.class);
+            LoadTask loadTask1 = Mockito.mock(LoadTask.class);
+
+            envMockedStatic.when(Env::getCurrentEnv).thenReturn(env);
+            envMockedStatic.when(Env::getCurrentGlobalTransactionMgr).thenReturn(txnMgr);
+            Mockito.when(txnMgr.getCallbackFactory()).thenReturn(callbackFactory);
+
+            LoadJob loadJob = new BrokerLoadJob();
+            loadJob.idToTasks.put(1L, loadTask1);
+
+            Assertions.assertEquals(1, loadJob.idToTasks.size());
+            loadJob.updateState(JobState.FINISHED);
+            Assertions.assertEquals(JobState.FINISHED, loadJob.getState());
+            Assertions.assertNotEquals(-1, (long) Deencapsulation.getField(loadJob, "finishTimestamp"));
+            Assertions.assertEquals(100, (int) Deencapsulation.getField(loadJob, "progress"));
+            Assertions.assertEquals(0, loadJob.idToTasks.size());
+        }
     }
 }

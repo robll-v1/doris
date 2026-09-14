@@ -23,9 +23,9 @@ import org.apache.doris.nereids.properties.OrderKey;
 import org.apache.doris.nereids.rules.Rule;
 import org.apache.doris.nereids.rules.RuleType;
 import org.apache.doris.nereids.trees.expressions.Alias;
+import org.apache.doris.nereids.trees.expressions.Cast;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.Match;
-import org.apache.doris.nereids.trees.expressions.NamedExpression;
 import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.expressions.SlotNotFromChildren;
 import org.apache.doris.nereids.trees.expressions.SubqueryExpr;
@@ -38,7 +38,6 @@ import org.apache.doris.nereids.trees.expressions.functions.window.WindowFunctio
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.algebra.Generate;
 import org.apache.doris.nereids.trees.plans.logical.LogicalAggregate;
-import org.apache.doris.nereids.trees.plans.logical.LogicalDeferMaterializeOlapScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalFilter;
 import org.apache.doris.nereids.trees.plans.logical.LogicalJoin;
 import org.apache.doris.nereids.trees.plans.logical.LogicalOlapScan;
@@ -127,8 +126,11 @@ public class CheckAfterRewrite extends OneAnalysisRuleFactory {
         notFromChildren = removeValidSlotsNotFromChildren(notFromChildren, childrenOutput);
         if (!notFromChildren.isEmpty()) {
             if (plan.arity() != 0 && plan.child(0) instanceof LogicalAggregate) {
-                throw new AnalysisException(String.format("%s not in aggregate's output", notFromChildren
-                        .stream().map(NamedExpression::getName).collect(Collectors.joining(", "))));
+                throw new AnalysisException(String.format(plan.getClass().getSimpleName() + " expression %s must"
+                        + " appear in the GROUP BY clause or be used in an aggregate function",
+                        notFromChildren.stream()
+                                .map(slot -> "'" + slot.getName() + "'")
+                                .collect(Collectors.joining(", "))));
             } else {
                 throw new AnalysisException(String.format(
                         "Input slot(s) not in child's output: %s in plan: %s\nchild output is: %s\nplan tree:\n%s",
@@ -155,7 +157,7 @@ public class CheckAfterRewrite extends OneAnalysisRuleFactory {
         if (plan instanceof LogicalAggregate) {
             LogicalAggregate<?> agg = (LogicalAggregate<?>) plan;
             for (Expression groupBy : agg.getGroupByExpressions()) {
-                if (groupBy.getDataType().isObjectOrVariantType() || groupBy.getDataType().isVarBinaryType()) {
+                if (groupBy.getDataType().isObjectType() || groupBy.getDataType().isVarBinaryType()) {
                     throw new AnalysisException(Type.OnlyMetricTypeErrorMsg);
                 }
             }
@@ -191,15 +193,16 @@ public class CheckAfterRewrite extends OneAnalysisRuleFactory {
         } else if (plan instanceof LogicalJoin) {
             LogicalJoin<?, ?> join = (LogicalJoin<?, ?>) plan;
             for (Expression conjunct : join.getHashJoinConjuncts()) {
-                if (conjunct.anyMatch(e -> ((Expression) e).getDataType().isVariantType())) {
-                    throw new AnalysisException("variant type could not in join equal conditions: " + conjunct.toSql());
+                if (containsVariantTypeOutsideCast(conjunct)) {
+                    throw new AnalysisException("variant type could not in join equal conditions: "
+                            + conjunct.toSql());
                 } else if (conjunct.anyMatch(e -> ((Expression) e).getDataType().isVarBinaryType())) {
                     throw new AnalysisException(
                             "varbinary type could not in join equal conditions: " + conjunct.toSql());
                 }
             }
             for (Expression conjunct : join.getMarkJoinConjuncts()) {
-                if (conjunct.anyMatch(e -> ((Expression) e).getDataType().isVariantType())) {
+                if (containsVariantTypeOutsideCast(conjunct)) {
                     throw new AnalysisException("variant type could not in join equal conditions: " + conjunct.toSql());
                 } else if (conjunct.anyMatch(e -> ((Expression) e).getDataType().isVarBinaryType())) {
                     throw new AnalysisException(
@@ -209,11 +212,27 @@ public class CheckAfterRewrite extends OneAnalysisRuleFactory {
         }
     }
 
+    private boolean containsVariantTypeOutsideCast(Expression expr) {
+        return containsVariantTypeOutsideCast(expr, false);
+    }
+
+    private boolean containsVariantTypeOutsideCast(Expression expr, boolean underCast) {
+        boolean nextUnderCast = underCast || (expr instanceof Cast && !expr.getDataType().isVariantType());
+        if (!nextUnderCast && expr.getDataType().isVariantType()) {
+            return true;
+        }
+        for (Expression child : expr.children()) {
+            if (containsVariantTypeOutsideCast(child, nextUnderCast)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private void checkMatchIsUsedCorrectly(Plan plan) {
         for (Expression expression : plan.getExpressions()) {
             if (expression instanceof Match) {
-                if (plan instanceof LogicalFilter && (plan.child(0) instanceof LogicalOlapScan
-                        || plan.child(0) instanceof LogicalDeferMaterializeOlapScan)) {
+                if (plan instanceof LogicalFilter && plan.child(0) instanceof LogicalOlapScan) {
                     return;
                 } else {
                     throw new AnalysisException(String.format(

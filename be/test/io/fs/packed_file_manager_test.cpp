@@ -55,24 +55,20 @@ public:
     void set_start_close_status(Status st) { _start_close_status = std::move(st); }
     void complete_async_close() {
         if (_state == State::ASYNC_CLOSING) {
-            _state = State::CLOSED;
+            _async_close_ready = true;
         }
     }
 
+    size_t close_calls() const { return _close_calls; }
+    size_t try_finish_close_calls() const { return _try_finish_close_calls; }
     size_t append_calls() const { return _append_calls; }
     bool closed() const { return _state == State::CLOSED; }
     size_t bytes_appended() const override { return _bytes_appended; }
     const std::string& written_data() const { return _written; }
 
     Status close(bool non_block = false) override {
+        ++_close_calls;
         if (_state == State::CLOSED) {
-            if (non_block) {
-                if (_close_status.ok()) {
-                    return Status::Error<ErrorCode::ALREADY_CLOSED>(
-                            "MockFileWriter already closed: {}", _path.native());
-                }
-                return _close_status;
-            }
             return Status::Error<ErrorCode::ALREADY_CLOSED>("MockFileWriter already closed: {}",
                                                             _path.native());
         }
@@ -82,15 +78,35 @@ public:
         }
 
         if (_state == State::ASYNC_CLOSING) {
-            return Status::InternalError("Don't submit async close multi times");
+            if (non_block) {
+                return Status::InternalError("Don't submit async close multi times");
+            }
+            _async_close_ready = true;
+            _async_close_consumed = true;
+            _state = State::CLOSED;
+            return _close_status;
         }
 
         if (non_block) {
             _state = State::ASYNC_CLOSING;
+            _async_close_ready = false;
             return Status::OK();
         }
 
         _state = State::CLOSED;
+        return _close_status;
+    }
+
+    Status try_finish_close() override {
+        ++_try_finish_close_calls;
+        if (_state == State::CLOSED) {
+            return _async_close_consumed ? _close_status : Status::OK();
+        }
+        if (_state != State::ASYNC_CLOSING || !_async_close_ready) {
+            return Status::NeedSendAgain("async close is not finished");
+        }
+        _state = State::CLOSED;
+        _async_close_consumed = true;
         return _close_status;
     }
 
@@ -114,10 +130,14 @@ private:
     Path _path;
     size_t _bytes_appended = 0;
     size_t _append_calls = 0;
+    size_t _close_calls = 0;
+    size_t _try_finish_close_calls = 0;
     std::string _written;
     Status _start_close_status = Status::OK();
     Status _append_status = Status::OK();
     Status _close_status = Status::OK();
+    bool _async_close_ready = false;
+    bool _async_close_consumed = false;
     State _state = State::OPENED;
 };
 
@@ -205,6 +225,9 @@ protected:
         _old_small_file_count_threshold = config::packed_file_small_file_count_threshold;
         _old_deploy_mode = config::deploy_mode;
         _old_cloud_id = config::cloud_unique_id;
+        _old_enable_file_cache = config::enable_file_cache;
+        _old_enable_file_cache_write_from_s3_file_writer =
+                config::enable_file_cache_write_from_s3_file_writer;
 
         config::packed_file_size_threshold_bytes = 1024;
         config::small_file_threshold_bytes = 1024;
@@ -213,6 +236,7 @@ protected:
         config::packed_file_small_file_count_threshold = 100;
         config::deploy_mode.clear();
         config::cloud_unique_id.clear();
+        config::enable_file_cache_write_from_s3_file_writer = true;
 
         file_system = std::make_shared<MockFileSystem>();
         manager = std::make_unique<PackedFileManager>();
@@ -235,6 +259,9 @@ protected:
         config::packed_file_small_file_count_threshold = _old_small_file_count_threshold;
         config::deploy_mode = _old_deploy_mode;
         config::cloud_unique_id = _old_cloud_id;
+        config::enable_file_cache = _old_enable_file_cache;
+        config::enable_file_cache_write_from_s3_file_writer =
+                _old_enable_file_cache_write_from_s3_file_writer;
     }
 
     PackedAppendContext default_append_info() const {
@@ -257,6 +284,8 @@ private:
     int64_t _old_small_file_count_threshold = 0;
     std::string _old_deploy_mode;
     std::string _old_cloud_id;
+    bool _old_enable_file_cache = false;
+    bool _old_enable_file_cache_write_from_s3_file_writer = true;
     std::string _resource_id = "test_resource";
     int64_t _tablet_id = 12345;
     std::string _rowset_id = "rowset_1";
@@ -292,6 +321,22 @@ TEST_F(PackedFileManagerTest, AppendSmallFileSuccess) {
     EXPECT_EQ(it->second.rowset_id, info.rowset_id);
     EXPECT_EQ(it->second.resource_id, info.resource_id);
     EXPECT_EQ(it->second.txn_id, info.txn_id);
+}
+
+TEST_F(PackedFileManagerTest, DisableFileCacheWriteFromS3FileWriter) {
+    config::enable_file_cache = true;
+    config::enable_file_cache_write_from_s3_file_writer = false;
+
+    auto writer = file_system->last_writer();
+    ASSERT_NE(writer, nullptr);
+    std::string payload = "abc";
+    Slice slice(payload);
+
+    auto info = default_append_info();
+    ASSERT_TRUE(info.write_file_cache);
+    EXPECT_TRUE(manager->append_small_file("s/no_cache", slice, info).ok());
+    EXPECT_EQ(writer->append_calls(), 1);
+    EXPECT_EQ(writer->bytes_appended(), payload.size());
 }
 
 TEST_F(PackedFileManagerTest, AppendFailsWithoutTxnId) {
@@ -581,6 +626,40 @@ TEST_F(PackedFileManagerTest, ProcessUploadingFilesSetsFailedWhenAsyncCloseFails
     EXPECT_NE(failed->last_error.find("async close fail"), std::string::npos);
 }
 
+TEST_F(PackedFileManagerTest, ProcessUploadingFilesPollsAsyncCloseWithoutBlocking) {
+    std::string payload = "abc";
+    Slice slice(payload);
+    auto info = default_append_info();
+    ASSERT_TRUE(manager->append_small_file("async_poll_fail", slice, info).ok());
+    ASSERT_TRUE(manager->mark_current_packed_file_for_upload(_resource_id).ok());
+    ASSERT_EQ(manager->uploading_packed_files_for_test().size(), 1);
+
+    auto uploading = manager->uploading_packed_files_for_test().begin()->second;
+    auto* writer = dynamic_cast<MockFileWriter*>(uploading->writer.get());
+    ASSERT_NE(writer, nullptr);
+    uploading->state = PackedFileManager::PackedFileState::UPLOADING;
+    writer->set_close_status(Status::IOError("async close poll fail"));
+    ASSERT_TRUE(writer->close(true).ok());
+    ASSERT_EQ(writer->close_calls(), 1);
+
+    manager->process_uploading_packed_files();
+    EXPECT_EQ(uploading->state.load(), PackedFileManager::PackedFileState::UPLOADING);
+    EXPECT_EQ(manager->uploading_packed_files_for_test().size(), 1);
+    EXPECT_EQ(manager->uploaded_packed_files_for_test().size(), 0);
+    EXPECT_EQ(writer->close_calls(), 1);
+    EXPECT_EQ(writer->try_finish_close_calls(), 1);
+
+    writer->complete_async_close();
+    manager->process_uploading_packed_files();
+    EXPECT_EQ(writer->close_calls(), 1);
+    EXPECT_EQ(writer->try_finish_close_calls(), 2);
+    EXPECT_EQ(manager->uploading_packed_files_for_test().size(), 0);
+    ASSERT_EQ(manager->uploaded_packed_files_for_test().size(), 1);
+    auto failed = manager->uploaded_packed_files_for_test().begin()->second;
+    EXPECT_EQ(failed->state.load(), PackedFileManager::PackedFileState::FAILED);
+    EXPECT_NE(failed->last_error.find("async close poll fail"), std::string::npos);
+}
+
 TEST_F(PackedFileManagerTest, AppendPackedFileInfoToFileTail) {
     std::string payload = "abc";
     Slice slice(payload);
@@ -608,14 +687,14 @@ TEST_F(PackedFileManagerTest, AppendPackedFileInfoToFileTail) {
     ASSERT_NE(writer, nullptr);
 
     const auto& data = writer->written_data();
-    cloud::PackedFileDebugInfoPB parsed_debug;
+    cloud::PackedFileFooterPB parsed_footer;
     uint32_t version = 0;
-    auto st = parse_packed_file_trailer(data, &parsed_debug, &version);
+    auto st = parse_packed_file_trailer(data, &parsed_footer, &version);
     ASSERT_TRUE(st.ok()) << st;
     ASSERT_EQ(version, kPackedFileTrailerVersion);
-    ASSERT_TRUE(parsed_debug.has_packed_file_info());
+    ASSERT_TRUE(parsed_footer.has_packed_file_info());
 
-    const auto& parsed_info = parsed_debug.packed_file_info();
+    const auto& parsed_info = parsed_footer.packed_file_info();
     ASSERT_EQ(parsed_info.slices_size(), 1);
     EXPECT_EQ(parsed_info.slices(0).path(), "trailer_path");
     EXPECT_EQ(parsed_info.slices(0).offset(), 0);

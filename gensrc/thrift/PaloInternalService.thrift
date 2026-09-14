@@ -146,7 +146,7 @@ struct TQueryOptions {
   // if set, this will overwrite the BE config.
   30: optional i32 max_pushdown_conditions_per_column
   // whether enable spilling to disk
-  31: optional bool enable_spilling = false;
+  // 31: optional bool enable_spilling = false;
   // whether enable parallel merge in exchange node
   32: optional bool enable_enable_exchange_node_parallel_merge = false; // deprecated
 
@@ -178,7 +178,7 @@ struct TQueryOptions {
   // For debug purpose, skip delete predicates when reading data
   50: optional bool skip_delete_predicate = false
 
-  51: optional bool enable_new_shuffle_hash_method // deprecated
+  51: optional bool enable_new_shuffle_hash_method
 
   52: optional i32 be_exec_version = 0
 
@@ -209,7 +209,7 @@ struct TQueryOptions {
 
   64: optional bool dry_run_query = false
 
-  65: optional bool enable_common_expr_pushdown = false;
+  65: optional bool enable_common_expr_pushdown = false; // deprecated
 
   66: optional i32 parallel_instance = 1
   // Indicate where useServerPrepStmts enabled
@@ -299,7 +299,7 @@ struct TQueryOptions {
   // max rows of each sub-queue in DataQueue.
   106: optional i64 data_queue_max_blocks = 0;
   
-  // expr pushdown for index filter rows
+  // deprecated
   107: optional bool enable_common_expr_pushdown_for_inverted_index = false;
   108: optional i64 local_exchange_free_blocks_limit;
 
@@ -352,7 +352,7 @@ struct TQueryOptions {
 
   135: optional bool enable_parallel_outfile = false;
 
-  136: optional bool enable_phrase_query_sequential_opt = true;
+  136: optional bool enable_phrase_query_sequential_opt = true; // deprecated
   
   137: optional bool enable_auto_create_when_overwrite = false;
 
@@ -374,6 +374,8 @@ struct TQueryOptions {
 
   148: optional i32 min_scanners_concurrency = 1;
   149: optional i32 min_scan_scheduler_concurrency = 0; //deprecated
+  // Controls runtime-filter partition pruning for readers that honor this option.
+  // FileScannerV2 always enables safe partition pruning.
   150: optional bool enable_runtime_filter_partition_prune = true;
 
   // The minimum memory that an operator required to run.
@@ -418,14 +420,120 @@ struct TQueryOptions {
   179: optional bool enable_parquet_filter_by_bloom_filter = true;
   180: optional i32 max_file_scanners_concurrency = 0;
   181: optional i32 min_file_scanners_concurrency = 0;
+  182: optional i32 ivf_nprobe = 32;
+  // Enable hybrid sorting: dynamically selects between PdqSort and TimSort based on 
+  // runtime profiling to choose the most efficient algorithm for the data pattern
+  183: optional bool enable_use_hybrid_sort = false;
+  184: optional i32 cte_max_recursion_depth;
 
+  185: optional bool enable_parquet_file_page_cache = true;
 
-  182: optional i32 ivf_nprobe = 1;
+  186: optional bool enable_streaming_agg_hash_join_force_passthrough;
 
+  187: optional bool enable_distinct_streaming_agg_force_passthrough;
+
+  188: optional bool enable_broadcast_join_force_passthrough;
+
+  189: optional bool enable_aggregate_function_null_v2 = false;
+
+  195: optional bool enable_left_semi_direct_return_opt;
+
+  200: optional bool enable_adjust_conjunct_order_by_cost;
+  // Deprecated: the paimon-cpp reader has been removed. Retained for wire compatibility.
+  201: optional bool enable_paimon_cpp_reader = false;
+
+  // Whether all fragments of this query are assigned to a single backend.
+  // When true, the streaming aggregation operator can use more aggressive
+  // hash table expansion thresholds since all data is local.
+  202: optional bool single_backend_query = false;
+
+  203: optional bool enable_inverted_index_wand_query = true;
+
+  // Per-read/per-write buffer size used during spill I/O, in bytes. Controls the
+  // I/O batch size for spill write and merge read. This value can be overridden
+  // per-query by setting the session variable `spill_buffer_size_bytes` in FE.
+  // Default is 8MB.
+  204: optional i64 spill_buffer_size_bytes = 8388608
+
+  // Per-sink memory limit after spill is triggered. When a sink operator's revocable
+  // memory exceeds the corresponding threshold, it proactively spills to disk.
+  // Default is 64MB for all three.
+  205: optional i64 spill_join_build_sink_mem_limit_bytes = 67108864
+  206: optional i64 spill_aggregation_sink_mem_limit_bytes = 67108864
+  207: optional i64 spill_sort_sink_mem_limit_bytes = 67108864
+
+  // Total memory budget for the sort merge phase after spill. Divided by
+  // spill_buffer_size_bytes gives the number of files merged in parallel.
+  // Default is 64MB.
+  208: optional i64 spill_sort_merge_mem_limit_bytes = 67108864
+
+  // Maximum depth for repartitioning recursion. Controls how many recursive
+  // repartition rounds are allowed before giving up and treating a partition
+  // as terminal. This value can be overridden per-query by setting the
+  // session variable `spill_repartition_max_depth` in FE. Default is 8.
+  209: optional i32 spill_repartition_max_depth = 8
+
+  210: optional double max_scan_mem_ratio = 0.3;
+  211: optional bool enable_adaptive_scan = false;
+
+  212: optional bool enable_local_exchange_before_agg = true;
+
+  213: optional i64 file_presigned_url_ttl_seconds = 3600;
+  214: optional i32 embed_max_batch_size = 5;
+  215: optional i64 ai_context_window_size = 131072;
+
+  // Use Rust-based Lance reader for FORMAT_LANCE scan ranges
+  216: optional bool enable_rust_lance_reader = false; // deprecated
+  217: optional bool new_version_percentile = false
+
+  // Adaptive batch size: target output block size in bytes. Valid range [1MB, 512MB].
+  // Default 8MB. Sent by FE session variable preferred_block_size_bytes.
+  218: optional i64 preferred_block_size_bytes = 8388608
+
+  // Push LIMIT into SegmentIterator when safe.
+  219: optional bool enable_segment_limit_pushdown = true
+
+  220: optional bool enable_ann_index_result_cache = true
+  // ANN search falls back to exact vector distance evaluation when candidate rows
+  // before ANN search are less than this value. 0 disables the absolute threshold.
+  221: optional i64 ann_index_candidate_rows_threshold = 0
+  // Candidate row ratio threshold against segment rows. Existing default is 0.3.
+  222: optional double ann_index_candidate_rows_percent_threshold = 0.3
+
+  // enable plan local exchange node in fe
+  223: optional bool enable_local_shuffle_planner;
+
+  // Controls expression-based ZoneMap pruning for readers that honor this option.
+  // FileScannerV2 always enables safe expression ZoneMap pruning.
+  224: optional bool enable_expr_zonemap_filter = true
+
+  225: optional i64 runtime_filter_tree_publish_max_send_bytes = 268435456
+
+  226: optional bool enable_prune_nested_column = false;
+  227: optional bool new_version_bitmap_op_count = false;
+  228: optional bool enable_local_exchange_before_streaming_agg = false;
+  // FE is the receiver of fragment reports, so BE must also honor its message limit.
+  229: optional i32 coordinator_thrift_max_message_size;
+  // FE can explicitly and idempotently acknowledge external-file commit reports.
+  230: optional bool supports_external_file_report_ack = false;
+  // Fall back to RE2 when Hyperscan cannot compile a regular expression.
+  231: optional bool enable_hyperscan_fallback = true;
+  232: optional bool enable_runtime_filter_bucket_prune = true;
   // For cloud, to control if the content would be written into file cache
   // In write path, to control if the content would be written into file cache.
   // In read path, read from file cache or remote storage when execute query.
   1000: optional bool disable_file_cache = false
+  1001: optional i32 file_cache_query_limit_percent = -1
+  1002: optional bool enable_file_scanner_v2 = false
+  1003: optional bool enable_topn_lazy_mat_phase2_no_write_file_cache = false
+  1004: optional i64 file_cache_query_limit_bytes = -1
+  // SNII inverted index query reads take the REMOTE_ONLY_ON_MISS file-cache
+  // policy: cache hits are served, but a miss reads remote directly and writes
+  // nothing back into the file cache. Data (.dat) and segment-meta reads keep
+  // the normal read-through-and-write-back path, and so do CLucene (V1/V2/V3)
+  // index reads -- the two formats amplify write-back differently, so each
+  // needs its own switch.
+  1005: optional bool inverted_index_snii_read_no_write_file_cache = false
 }
 
 
@@ -433,13 +541,6 @@ struct TQueryOptions {
 struct TScanRangeParams {
   1: required PlanNodes.TScanRange scan_range
   2: optional i32 volume_id = -1
-}
-
-// deprecated
-struct TRuntimeFilterTargetParams {
-  1: required Types.TUniqueId target_fragment_instance_id
-  // The address of the instance where the fragment is expected to run
-  2: required Types.TNetworkAddress target_fragment_instance_addr
 }
 
 struct TRuntimeFilterTargetParamsV2 {
@@ -452,10 +553,6 @@ struct TRuntimeFilterTargetParamsV2 {
 struct TRuntimeFilterParams {
   // Runtime filter merge instance address. Used if this filter has a remote target
   1: optional Types.TNetworkAddress runtime_filter_merge_addr
-
-  // keep 2/3/4/5 unset if BE is not used for merge 
-  // deprecated
-  2: optional map<i32, list<TRuntimeFilterTargetParams>> rid_to_target_param
 
   // Runtime filter ID to the runtime filter desc
   // Used if this filter has a remote target
@@ -558,6 +655,7 @@ struct TFoldConstantParams {
 struct TTabletWithPartition {
     1: required i64 partition_id
     2: required i64 tablet_id
+    3: optional i64 binlog_tablet_id
 }
 
 struct TFetchDataResult {
@@ -668,9 +766,11 @@ struct TPipelineFragmentParams {
   // Used by 2.1
   44: optional list<i32> topn_filter_source_node_ids
   45: optional map<string, TAIResource> ai_resources
+  46: optional bool need_notify_close
 
   // For cloud
   1000: optional bool is_mow_table;
+  1001: optional bool enable_tso;
 }
 
 // pull up runtime filter info from instance level to BE level

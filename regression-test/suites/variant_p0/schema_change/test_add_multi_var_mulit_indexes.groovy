@@ -19,6 +19,7 @@
 suite("regression_test_variant_add_multi_var_mulit_indexes", "variant_type"){
 
 
+    def variantV2Function = "parse_to_variant"
     def timeout = 60000
     def delta_time = 1000
     def alter_res = "null"
@@ -39,6 +40,7 @@ suite("regression_test_variant_add_multi_var_mulit_indexes", "variant_type"){
     }
     def table_name = "variant_add_multi_var_mulit_indexes"
     sql "set default_variant_enable_typed_paths_to_sparse = false"
+    sql "set default_variant_enable_doc_mode = false"
     sql "DROP TABLE IF EXISTS ${table_name}"
     sql """
         CREATE TABLE IF NOT EXISTS ${table_name} (
@@ -49,15 +51,15 @@ suite("regression_test_variant_add_multi_var_mulit_indexes", "variant_type"){
         DISTRIBUTED BY HASH(k) BUCKETS 1
         properties("replication_num" = "1", "disable_auto_compaction" = "true");
     """
-    sql """insert into  ${table_name} values (0, '{"a" : 12345,"b" : 2}')"""
-    
+    sql """insert into  ${table_name} values (0, ${variantV2Function}('{"a" : 12345,"b" : 2}'))"""
+
     sql """ alter table  ${table_name} add column v2 variant<'a': string, 'b': string> NULL"""
 
-    sql """insert into  ${table_name} values (1, '{"a" : 12345,"b" : 2}', '{"a" : 12345,"b" : 3}')"""
+    sql """insert into  ${table_name} values (1, ${variantV2Function}('{"a" : 12345,"b" : 2}'), ${variantV2Function}('{"a" : 12345,"b" : 3}'))"""
 
     sql """alter table  ${table_name} add column v3 variant NULL"""
 
-    sql """insert into  ${table_name} values (2, '{"a" : 12345,"b" : 2}', '{"a" : 56789,"b" : 3}', '{"a" : 12345,"b" : 2}')"""
+    sql """insert into  ${table_name} values (2, ${variantV2Function}('{"a" : 12345,"b" : 2}'), ${variantV2Function}('{"a" : 56789,"b" : 3}'), ${variantV2Function}('{"a" : 12345,"b" : 2}'))"""
 
     sql """alter table ${table_name} add index idx_v2(v2) using inverted"""
     wait_for_latest_op_on_table_finish(table_name, timeout)
@@ -71,22 +73,21 @@ suite("regression_test_variant_add_multi_var_mulit_indexes", "variant_type"){
     sql """alter table  ${table_name} add index idx_v5(v3) using inverted properties("parser" = "unicode", "support_phrase" = "true")"""
     wait_for_latest_op_on_table_finish(table_name, timeout)
 
-    sql """insert into  ${table_name} values (3, '{"a" : 12345,"b" : 2}', '{"a" : 12345,"b" : 2}', '{"a" : 56789,"b" : 2}')"""
+    sql """insert into  ${table_name} values (3, ${variantV2Function}('{"a" : 12345,"b" : 2}'), ${variantV2Function}('{"a" : 12345,"b" : 2}'), ${variantV2Function}('{"a" : 56789,"b" : 2}'))"""
 
-    sql """insert into  ${table_name} values (4, '{"a" : 12345,"b" : 2}', '{"a" : 56789,"b" : 2}', '{"a" : 12345,"b" : 3}')"""
+    sql """insert into  ${table_name} values (4, ${variantV2Function}('{"a" : 12345,"b" : 2}'), ${variantV2Function}('{"a" : 56789,"b" : 2}'), ${variantV2Function}('{"a" : 12345,"b" : 3}'))"""
 
-    trigger_and_wait_compaction("${table_name}", "full")
+    trigger_and_wait_compaction("${table_name}", "full", 1800)
 
     qt_sql "select * from  ${table_name} order by k"
 
     sql """ set enable_match_without_inverted_index = false"""
     sql """ set enable_inverted_index_query = true"""
-    sql """ set enable_common_expr_pushdown = true"""
-    sql """ set enable_common_expr_pushdown_for_inverted_index = true"""
-    
+    sql """ set enable_segment_limit_pushdown = true"""
+
     qt_sql "select * from  ${table_name} where cast(v2['a'] as string) match '12345' order by k"
     qt_sql "select * from  ${table_name} where cast(v2['b'] as string) match '2' order by k"
     qt_sql "select * from  ${table_name} where cast(v3['b'] as int) = 2 order by k"
-    
-    
+
+
 }

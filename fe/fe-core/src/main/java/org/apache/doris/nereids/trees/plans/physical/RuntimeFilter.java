@@ -23,11 +23,14 @@ import org.apache.doris.planner.RuntimeFilterId;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.thrift.TMinMaxRuntimeFilterType;
 import org.apache.doris.thrift.TRuntimeFilterType;
+import org.apache.doris.thrift.TTargetExprMonotonicity;
 
-import com.google.common.collect.Lists;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 
 import java.util.List;
-import java.util.stream.Collectors;
+import java.util.Map;
 
 /**
  * runtime filter
@@ -37,65 +40,66 @@ public class RuntimeFilter {
     private final RuntimeFilterId id;
     private final TRuntimeFilterType type;
     private final Expression srcSlot;
-    //bitmap filter support target expression like  k1+1, abs(k1)
-    //targetExpression is an expression on targetSlot, in which there is only one non-const slot
-    private final List<Expression> targetExpressions;
-    private final List<Slot> targetSlots;
+    // targetExpression is an expression on targetSlot, in which there is only one non-const slot.
+    private final Expression targetExpression;
+    private final Slot targetSlot;
     private final int exprOrder;
-    private final AbstractPhysicalJoin builderNode;
-
-    private final boolean bitmapFilterNotIn;
+    private final AbstractPhysicalPlan builderNode;
 
     private final long buildSideNdv;
     // use for min-max filter only. specify if the min or max side is valid
     private final TMinMaxRuntimeFilterType tMinMaxType;
 
-    private final List<PhysicalRelation> targetScans = Lists.newArrayList();
+    private final PhysicalRelation targetScan;
 
     private final boolean bloomFilterSizeCalculatedByNdv;
 
-    /**
-     * constructor
-     */
-    public RuntimeFilter(RuntimeFilterId id, Expression src, List<Slot> targets, List<Expression> targetExpressions,
-                         TRuntimeFilterType type, int exprOrder, AbstractPhysicalJoin builderNode, long buildSideNdv,
-                         boolean bloomFilterSizeCalculatedByNdv, TMinMaxRuntimeFilterType tMinMaxType,
-                         PhysicalRelation scan) {
-        this(id, src, targets, targetExpressions, type, exprOrder,
-                builderNode, false, buildSideNdv, bloomFilterSizeCalculatedByNdv,
-                tMinMaxType, scan);
-    }
+    private boolean nonBlocking;
 
-    public RuntimeFilter(RuntimeFilterId id, Expression src, List<Slot> targets, List<Expression> targetExpressions,
-                         TRuntimeFilterType type, int exprOrder, AbstractPhysicalJoin builderNode,
-                         boolean bitmapFilterNotIn, long buildSideNdv, boolean bloomFilterSizeCalculatedByNdv,
-                         PhysicalRelation scan) {
-        this(id, src, targets, targetExpressions, type, exprOrder,
-                builderNode, bitmapFilterNotIn, buildSideNdv, bloomFilterSizeCalculatedByNdv,
-                TMinMaxRuntimeFilterType.MIN_MAX, scan);
-    }
+    // Generated once with the runtime filter at its final target scan. Translation only
+    // maps this target-scoped metadata to the legacy scan node id.
+    private boolean canPruneBuckets;
+    private Map<Long, TTargetExprMonotonicity> partitionMonotonicity = ImmutableMap.of();
 
     /**
      * constructor
      */
-    public RuntimeFilter(RuntimeFilterId id, Expression src, List<Slot> targets, List<Expression> targetExpressions,
-                         TRuntimeFilterType type, int exprOrder, AbstractPhysicalJoin builderNode,
-                         boolean bitmapFilterNotIn, long buildSideNdv, boolean bloomFilterSizeCalculatedByNdv,
-                         TMinMaxRuntimeFilterType tMinMaxType,
-                         PhysicalRelation scan) {
+    public RuntimeFilter(RuntimeFilterId id, Expression src, Slot targetSlot, Expression targetExpression,
+                         TRuntimeFilterType type, int exprOrder, AbstractPhysicalPlan builderNode, long buildSideNdv,
+                           boolean bloomFilterSizeCalculatedByNdv, TMinMaxRuntimeFilterType tMinMaxType,
+                           PhysicalRelation scan) {
         this.id = id;
         this.srcSlot = src;
-        this.targetSlots = Lists.newArrayList(targets);
-        this.targetExpressions = Lists.newArrayList(targetExpressions);
+        this.targetSlot = targetSlot;
+        this.targetExpression = targetExpression;
         this.type = type;
         this.exprOrder = exprOrder;
         this.builderNode = builderNode;
-        this.bitmapFilterNotIn = bitmapFilterNotIn;
         this.bloomFilterSizeCalculatedByNdv = bloomFilterSizeCalculatedByNdv;
         this.buildSideNdv = buildSideNdv <= 0 ? -1L : buildSideNdv;
         this.tMinMaxType = tMinMaxType;
         builderNode.addRuntimeFilter(this);
-        this.targetScans.add(scan);
+        this.targetScan = scan;
+    }
+
+    // Keep old list-based overloads for binary compatibility with stale incremental-build classes.
+    public RuntimeFilter(RuntimeFilterId id, Expression src, List<Slot> targets, List<Expression> targetExpressions,
+                         TRuntimeFilterType type, int exprOrder, AbstractPhysicalPlan builderNode, long buildSideNdv,
+                         boolean bloomFilterSizeCalculatedByNdv, TMinMaxRuntimeFilterType tMinMaxType,
+                         PhysicalRelation scan) {
+        this(id, src, extractSingleTargetSlot(targets), extractSingleTargetExpression(targetExpressions),
+                type, exprOrder, builderNode, buildSideNdv, bloomFilterSizeCalculatedByNdv, tMinMaxType, scan);
+    }
+
+    private static Slot extractSingleTargetSlot(List<Slot> targets) {
+        Preconditions.checkArgument(targets.size() == 1, "runtime filter expects exactly one target slot");
+        return targets.get(0);
+    }
+
+    private static Expression extractSingleTargetExpression(List<Expression> targetExpressions) {
+        Preconditions.checkArgument(targetExpressions.size() == 1,
+                "runtime filter expects exactly one target expression");
+        return targetExpressions.get(0);
     }
 
     public TMinMaxRuntimeFilterType gettMinMaxType() {
@@ -118,38 +122,40 @@ public class RuntimeFilter {
         return exprOrder;
     }
 
-    public AbstractPhysicalJoin getBuilderNode() {
+    public AbstractPhysicalPlan getBuilderNode() {
         return builderNode;
     }
 
-    public boolean isBitmapFilterNotIn() {
-        return bitmapFilterNotIn;
-    }
-
-    public List<Expression> getTargetExpressions() {
-        return targetExpressions;
+    public Expression getTargetExpression() {
+        return targetExpression;
     }
 
     public long getBuildSideNdv() {
         return buildSideNdv;
     }
 
-    public void addTargetSlot(Slot target, Expression targetExpression, PhysicalRelation scan) {
-        targetExpressions.add(targetExpression);
-        targetSlots.add(target);
-        targetScans.add(scan);
+    public Slot getTargetSlot() {
+        return targetSlot;
     }
 
     public List<Slot> getTargetSlots() {
-        return targetSlots;
+        return ImmutableList.of(targetSlot);
+    }
+
+    public PhysicalRelation getTargetScan() {
+        return targetScan;
     }
 
     public List<PhysicalRelation> getTargetScans() {
-        return targetScans;
+        return ImmutableList.of(targetScan);
+    }
+
+    public List<Expression> getTargetExpressions() {
+        return ImmutableList.of(targetExpression);
     }
 
     public boolean hasTargetScan(PhysicalRelation scan) {
-        return targetScans.contains(scan);
+        return targetScan.equals(scan);
     }
 
     @Override
@@ -161,8 +167,8 @@ public class RuntimeFilter {
             ignore = "(ignored)";
         }
         StringBuilder sb = new StringBuilder();
-        sb.append(ignore).append("RF").append(id.asInt())
-                .append("[").append(getSrcExpr()).append("->").append(targetExpressions)
+        sb.append(ignore).append("RF").append(id.asInt()).append(" ")
+                .append(getSrcExpr()).append("->").append(targetExpression)
                 .append("(ndv/size = ").append(buildSideNdv).append("/")
                 .append(org.apache.doris.planner.RuntimeFilter.expectRuntimeFilterSize(buildSideNdv))
                 .append(")");
@@ -182,14 +188,37 @@ public class RuntimeFilter {
         }
         StringBuilder sb = new StringBuilder();
         sb.append(ignore).append("RF").append(id.asInt())
-                .append(" ").append(getSrcExpr().toSql()).append("->[").append(
-                        targetExpressions.stream().map(expr -> expr.toSql())
-                                .sorted().collect(Collectors.joining(",")))
-                .append("]");
+                .append(" ").append(getSrcExpr().toSql()).append("->").append(targetExpression.toSql());
         return sb.toString();
+    }
+
+    public boolean isNonBlocking() {
+        return nonBlocking;
+    }
+
+    public void setNonBlocking(boolean nonBlocking) {
+        this.nonBlocking = nonBlocking;
     }
 
     public boolean isBloomFilterSizeCalculatedByNdv() {
         return bloomFilterSizeCalculatedByNdv;
+    }
+
+    public void setPruningMetadata(boolean canPruneBuckets,
+            Map<Long, TTargetExprMonotonicity> partitionMonotonicity) {
+        this.canPruneBuckets = canPruneBuckets;
+        this.partitionMonotonicity = ImmutableMap.copyOf(partitionMonotonicity);
+    }
+
+    public boolean canPruneBuckets() {
+        return canPruneBuckets;
+    }
+
+    public boolean canPrunePartitions() {
+        return !partitionMonotonicity.isEmpty();
+    }
+
+    public Map<Long, TTargetExprMonotonicity> getPartitionMonotonicity() {
+        return partitionMonotonicity;
     }
 }

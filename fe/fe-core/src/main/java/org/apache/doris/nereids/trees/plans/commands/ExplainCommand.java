@@ -27,11 +27,15 @@ import org.apache.doris.nereids.trees.plans.Explainable;
 import org.apache.doris.nereids.trees.plans.PlanType;
 import org.apache.doris.nereids.trees.plans.commands.insert.InsertIntoTableCommand;
 import org.apache.doris.nereids.trees.plans.commands.insert.InsertOverwriteTableCommand;
+import org.apache.doris.nereids.trees.plans.logical.LogicalExternalRowLevelDeleteSink;
+import org.apache.doris.nereids.trees.plans.logical.LogicalExternalRowLevelMergeSink;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
 import org.apache.doris.planner.ScanNode;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.StmtExecutor;
+
+import java.util.Optional;
 
 /**
  * explain command.
@@ -77,41 +81,75 @@ public class ExplainCommand extends Command implements NoForward {
 
     @Override
     public void run(ConnectContext ctx, StmtExecutor executor) throws Exception {
-        LogicalPlan explainPlan;
         if (!(logicalPlan instanceof Explainable)) {
             throw new AnalysisException(logicalPlan.getClass().getSimpleName() + " cannot be explained");
         }
+        ConnectContext previousCtx = ConnectContext.get();
         Explainable explainable = (Explainable) logicalPlan;
-        if (explainable instanceof InsertIntoTableCommand
-                || explainable instanceof InsertOverwriteTableCommand
-                || explainable instanceof UpdateCommand) {
-            ctx.getStatementContext().setIsInsert(true);
-        }
-        if (explainable instanceof DeleteFromCommand) {
-            ctx.getStatementContext().setSkipPrunePredicate(true);
-        }
-        explainPlan = ((LogicalPlan) explainable.getExplainPlan(ctx));
-        NereidsPlanner planner = explainable.getExplainPlanner(explainPlan, ctx.getStatementContext()).orElseGet(() ->
-            new NereidsPlanner(ctx.getStatementContext())
-        );
+        ConnectContext explainCtx = null;
+        long previousTargetTableId = -1;
+        boolean resetTargetTableId = false;
+        try {
+            explainCtx = explainable.getExplainConnectContext(ctx);
+            if (explainable instanceof InsertIntoTableCommand
+                    || explainable instanceof InsertOverwriteTableCommand
+                    || explainable instanceof UpdateCommand) {
+                explainCtx.getStatementContext().setIsInsert(true);
+            }
+            if (explainable instanceof DeleteFromCommand) {
+                explainCtx.getStatementContext().setIsDelete(true);
+            }
+            LogicalPlan explainPlan = ((LogicalPlan) explainable.getExplainPlan(explainCtx));
+            Optional<NereidsPlanner> explainPlanner =
+                    explainable.getExplainPlanner(explainPlan, explainCtx.getStatementContext());
+            NereidsPlanner planner = explainPlanner.isPresent()
+                    ? explainPlanner.get()
+                    : new NereidsPlanner(explainCtx.getStatementContext());
 
-        LogicalPlanAdapter logicalPlanAdapter = new LogicalPlanAdapter(explainPlan, ctx.getStatementContext());
-        ExplainOptions explainOptions = new ExplainOptions(level, showPlanProcess);
-        logicalPlanAdapter.setIsExplain(explainOptions);
-        executor.setParsedStmt(logicalPlanAdapter);
-        if (ctx.getSessionVariable().isEnableMaterializedViewRewrite()) {
-            ctx.getStatementContext().addPlannerHook(InitMaterializationContextHook.INSTANCE);
-        }
-        planner.plan(logicalPlanAdapter, ctx.getSessionVariable().toThrift());
-        executor.setPlanner(planner);
-        executor.checkBlockRules();
-        if (showPlanProcess) {
-            executor.handleExplainPlanProcessStmt(planner.getCascadesContext().getPlanProcesses());
-        } else {
-            executor.handleExplainStmt(planner.getExplainString(explainOptions), true);
-        }
-        for (ScanNode scanNode : planner.getScanNodes()) {
-            scanNode.stop();
+            previousTargetTableId = explainCtx.getSyntheticWriteColTargetTableId();
+            if (explainPlan instanceof LogicalExternalRowLevelDeleteSink) {
+                if (previousTargetTableId < 0) {
+                    explainCtx.setSyntheticWriteColTargetTableId(
+                            ((LogicalExternalRowLevelDeleteSink<?>) explainPlan).getTargetTable().getId());
+                    resetTargetTableId = true;
+                }
+            } else if (explainPlan instanceof LogicalExternalRowLevelMergeSink) {
+                if (previousTargetTableId < 0) {
+                    explainCtx.setSyntheticWriteColTargetTableId(
+                            ((LogicalExternalRowLevelMergeSink<?>) explainPlan).getTargetTable().getId());
+                    resetTargetTableId = true;
+                }
+            }
+            LogicalPlanAdapter logicalPlanAdapter =
+                    new LogicalPlanAdapter(explainPlan, explainCtx.getStatementContext());
+            ExplainOptions explainOptions = new ExplainOptions(level, showPlanProcess);
+            logicalPlanAdapter.setIsExplain(explainOptions);
+            executor.setParsedStmt(logicalPlanAdapter);
+            if (explainCtx.getSessionVariable().isEnableMaterializedViewRewrite()) {
+                explainCtx.getStatementContext().addPlannerHook(InitMaterializationContextHook.INSTANCE);
+            }
+            planner.plan(logicalPlanAdapter, explainCtx.getSessionVariable().toThrift());
+            executor.setPlanner(planner);
+            // Skip SQL block rules check for EXPLAIN statements since they only show
+            // the execution plan without actually executing the query
+            if (showPlanProcess) {
+                executor.handleExplainPlanProcessStmt(planner.getCascadesContext().getPlanProcesses());
+            } else {
+                executor.handleExplainStmt(planner.getExplainString(explainOptions), true);
+            }
+            for (ScanNode scanNode : planner.getScanNodes()) {
+                scanNode.stop();
+            }
+        } finally {
+            if (resetTargetTableId) {
+                explainCtx.setSyntheticWriteColTargetTableId(previousTargetTableId);
+            }
+            if (ConnectContext.get() != previousCtx) {
+                ConnectContext.remove();
+                if (previousCtx != null) {
+                    previousCtx.setThreadLocalInfo();
+                }
+            }
         }
     }
 

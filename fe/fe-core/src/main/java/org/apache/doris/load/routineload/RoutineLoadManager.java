@@ -38,6 +38,8 @@ import org.apache.doris.common.io.Writable;
 import org.apache.doris.common.util.LogBuilder;
 import org.apache.doris.common.util.LogKey;
 import org.apache.doris.datasource.InternalCatalog;
+import org.apache.doris.load.routineload.kafka.KafkaRoutineLoadJob;
+import org.apache.doris.load.routineload.kinesis.KinesisRoutineLoadJob;
 import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.nereids.trees.plans.commands.AlterRoutineLoadCommand;
 import org.apache.doris.nereids.trees.plans.commands.info.CreateRoutineLoadInfo;
@@ -144,8 +146,13 @@ public class RoutineLoadManager implements Writable {
     }
 
     public void updateBeIdToMaxConcurrentTasks() {
-        beIdToMaxConcurrentTasks = Env.getCurrentSystemInfo().getAllBackendIds(true).stream().collect(
-                Collectors.toMap(beId -> beId, beId -> Config.max_routine_load_task_num_per_be));
+        beIdToMaxConcurrentTasks = Env.getCurrentSystemInfo().getAllBackendIds(true).stream()
+                .filter(beId -> {
+                    Backend backend = Env.getCurrentSystemInfo().getBackend(beId);
+                    return backend != null && backend.isLoadAvailable()
+                            && !backend.isDecommissioned() && !backend.isDecommissioning();
+                })
+                .collect(Collectors.toMap(beId -> beId, beId -> Config.max_routine_load_task_num_per_be));
     }
 
     // this is not real-time number
@@ -174,15 +181,30 @@ public class RoutineLoadManager implements Writable {
     public void createRoutineLoadJob(CreateRoutineLoadInfo info, ConnectContext ctx)
             throws UserException {
         // check load auth
-        if (!Env.getCurrentEnv().getAccessManager().checkTblPriv(ConnectContext.get(),
+        if (info.isMultiTable()) {
+            // A multi table job names no table at all, so LOAD has to be held on the database or above.
+            // This is the same rule the job is checked against later on, in checkPrivAndGetJob().
+            if (!Env.getCurrentEnv().getAccessManager().checkDbPriv(ConnectContext.get(),
+                    InternalCatalog.INTERNAL_CATALOG_NAME,
+                    info.getDBName(),
+                    PrivPredicate.LOAD)) {
+                // A database-scoped code for a database-scoped refusal: the table one renders the database
+                // name as "for table 'mydb'".
+                ErrorReport.reportAnalysisException(ErrorCode.ERR_DBACCESS_DENIED_ERROR,
+                        ConnectContext.get().getQualifiedUser(),
+                        info.getDBName());
+            }
+        } else if (!Env.getCurrentEnv().getAccessManager().checkTblPriv(ConnectContext.get(),
                 InternalCatalog.INTERNAL_CATALOG_NAME,
                 info.getDBName(),
                 info.getTableName(),
                 PrivPredicate.LOAD)) {
+            // Four arguments for the four placeholders this code has: a fifth would be dropped, and it would
+            // be the one naming the table - leaving "for table 'mydb'", the very defect the comment above
+            // describes.
             ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLEACCESS_DENIED_ERROR, "LOAD",
                     ConnectContext.get().getQualifiedUser(),
                     ConnectContext.get().getRemoteIP(),
-                    info.getDBName(),
                     info.getDBName() + ": " + info.getTableName());
         }
 
@@ -191,6 +213,9 @@ public class RoutineLoadManager implements Writable {
         switch (type) {
             case KAFKA:
                 routineLoadJob = KafkaRoutineLoadJob.fromCreateInfo(info, ctx);
+                break;
+            case KINESIS:
+                routineLoadJob = KinesisRoutineLoadJob.fromCreateInfo(info, ctx);
                 break;
             default:
                 throw new UserException("Unknown data source type: " + type);
@@ -275,10 +300,9 @@ public class RoutineLoadManager implements Writable {
                     InternalCatalog.INTERNAL_CATALOG_NAME,
                     dbFullName,
                     PrivPredicate.LOAD)) {
-                // todo add new error code
-                ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLEACCESS_DENIED_ERROR, "LOAD",
+                // As above: a database-scoped refusal gets the database-scoped code.
+                ErrorReport.reportAnalysisException(ErrorCode.ERR_DBACCESS_DENIED_ERROR,
                         ConnectContext.get().getQualifiedUser(),
-                        ConnectContext.get().getRemoteIP(),
                         dbFullName);
             }
             return routineLoadJob;
@@ -313,9 +337,17 @@ public class RoutineLoadManager implements Writable {
             for (RoutineLoadJob job : jobs) {
                 if (!job.getState().isFinalState()) {
                     String tableName = job.getTableName();
-                    if (!job.isMultiTable() && !Env.getCurrentEnv().getAccessManager()
-                            .checkTblPriv(ConnectContext.get(), InternalCatalog.INTERNAL_CATALOG_NAME, dbName,
-                                    tableName, PrivPredicate.LOAD)) {
+                    // A multi table job names no table, so LOAD has to be held on the database or above -
+                    // the same rule checkPrivAndGetJob() applies to a single job. Without it the && below
+                    // short-circuits and a multi table job is returned to PAUSE/RESUME ALL ROUTINE LOAD
+                    // without any check at all.
+                    boolean allowed = job.isMultiTable()
+                            ? Env.getCurrentEnv().getAccessManager().checkDbPriv(ConnectContext.get(),
+                                    InternalCatalog.INTERNAL_CATALOG_NAME, dbName, PrivPredicate.LOAD)
+                            : Env.getCurrentEnv().getAccessManager().checkTblPriv(ConnectContext.get(),
+                                    InternalCatalog.INTERNAL_CATALOG_NAME, dbName, tableName,
+                                    PrivPredicate.LOAD);
+                    if (!allowed) {
                         continue;
                     }
                     result.add(job);
@@ -500,7 +532,7 @@ public class RoutineLoadManager implements Writable {
         if (availableBeIds.isEmpty()) {
             RoutineLoadJob job = getJob(jobId);
             if (job != null) {
-                String msg = "no available BE found for job " + jobId
+                String msg = "no available BE found for job " + jobId + ", cluster Name {}, " + job.getCloudCluster()
                         + "please check the BE status and user's cluster or tags";
                 job.updateState(RoutineLoadJob.JobState.PAUSED,
                         new ErrorReason(InternalErrorCode.INTERNAL_ERR, msg), false /* not replay */);
@@ -514,6 +546,7 @@ public class RoutineLoadManager implements Writable {
             updateBeIdToMaxConcurrentTasks();
             Map<Long, Integer> beIdToConcurrentTasks = getBeCurrentTasksNumMap();
             int previousBeIdleTaskNum = 0;
+            boolean previousBeAvailable = false;
 
             // 1. Find if the given BE id has more than half of available slots
             if (previousBeId != -1L && availableBeIds.contains(previousBeId)) {
@@ -521,6 +554,7 @@ public class RoutineLoadManager implements Writable {
                 Backend previousBackend = Env.getCurrentSystemInfo().getBackend(previousBeId);
                 // check previousBackend is not null && load available
                 if (previousBackend != null && previousBackend.isLoadAvailable()) {
+                    previousBeAvailable = true;
                     if (!beIdToMaxConcurrentTasks.containsKey(previousBeId)) {
                         previousBeIdleTaskNum = 0;
                     } else if (beIdToConcurrentTasks.containsKey(previousBeId)) {
@@ -529,7 +563,8 @@ public class RoutineLoadManager implements Writable {
                     } else {
                         previousBeIdleTaskNum = beIdToMaxConcurrentTasks.get(previousBeId);
                     }
-                    if (previousBeIdleTaskNum == Config.max_routine_load_task_num_per_be) {
+                    if (previousBeIdleTaskNum > 0
+                            && previousBeIdleTaskNum == Config.max_routine_load_task_num_per_be) {
                         return previousBeId;
                     }
                 }
@@ -558,7 +593,7 @@ public class RoutineLoadManager implements Writable {
             }
             // 4. on the basis of selecting the maximum idle slot be,
             //    try to reuse the object cache as much as possible
-            if (previousBeIdleTaskNum == maxIdleSlotNum) {
+            if (previousBeAvailable && previousBeIdleTaskNum > 0 && previousBeIdleTaskNum == maxIdleSlotNum) {
                 return previousBeId;
             }
             return resultBeId;
@@ -870,6 +905,20 @@ public class RoutineLoadManager implements Writable {
         }
     }
 
+    public void updateRoutineLoadJobLag() {
+        for (RoutineLoadJob routineLoadJob : idToRoutineLoadJob.values()) {
+            if (!routineLoadJob.state.isFinalState()) {
+                try {
+                    routineLoadJob.updateLag();
+                } catch (UserException e) {
+                    LOG.warn(new LogBuilder(LogKey.ROUTINE_LOAD_JOB, routineLoadJob.getId())
+                            .add("msg", "failed to update routine load lag")
+                            .build(), e);
+                }
+            }
+        }
+    }
+
     public void replayCreateRoutineLoadJob(RoutineLoadJob routineLoadJob) {
         unprotectedAddJob(routineLoadJob);
         LOG.info(new LogBuilder(LogKey.ROUTINE_LOAD_JOB, routineLoadJob.getId())
@@ -952,6 +1001,9 @@ public class RoutineLoadManager implements Writable {
             jobs.add(routineLoadJob);
             if (!routineLoadJob.getState().isFinalState()) {
                 Env.getCurrentGlobalTransactionMgr().getCallbackFactory().addCallback(routineLoadJob);
+            }
+            if (Config.isCloudMode()) {
+                routineLoadJob.setCloudCluster();
             }
         }
     }

@@ -19,11 +19,12 @@ package org.apache.doris.load.loadv2;
 
 import org.apache.doris.analysis.DataDescription;
 import org.apache.doris.analysis.Expr;
+import org.apache.doris.analysis.ExprToSqlVisitor;
 import org.apache.doris.analysis.SetVar;
 import org.apache.doris.analysis.StringLiteral;
+import org.apache.doris.analysis.ToSqlParams;
 import org.apache.doris.analysis.UserIdentity;
 import org.apache.doris.catalog.Env;
-import org.apache.doris.cluster.ClusterNamespace;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.CustomThreadFactory;
 import org.apache.doris.common.LoadException;
@@ -44,6 +45,7 @@ import org.apache.doris.nereids.trees.plans.commands.load.MysqlLoadCommand;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.SessionVariable;
 import org.apache.doris.qe.VariableMgr;
+import org.apache.doris.resource.BackendSelectionManager;
 import org.apache.doris.system.Backend;
 import org.apache.doris.system.BeSelectionPolicy;
 import org.apache.doris.system.SystemInfoService;
@@ -170,7 +172,7 @@ public class MysqlLoadManager {
             throws IOException, UserException {
         LoadJobRowResult loadResult = new LoadJobRowResult();
         List<String> filePaths = dataDesc.getFilePaths();
-        String database = ClusterNamespace.getNameFromFullName(dataDesc.getDbName());
+        String database = dataDesc.getDbName();
         String table = dataDesc.getTableName();
         int oldTimeout = context.getExecTimeoutS();
         int newTimeOut = extractTimeOut(dataDesc);
@@ -189,7 +191,7 @@ public class MysqlLoadManager {
         try (final CloseableHttpClient httpclient = HttpUtils.getHttpClient()) {
             for (String file : filePaths) {
                 InputStreamEntity entity = getInputStreamEntity(context, clientLocal, file, loadId);
-                HttpPut request = generateRequestForMySqlLoadV2(entity, dataDesc, database, table, token);
+                HttpPut request = generateRequestForMySqlLoadV2(context, entity, dataDesc, database, table, token);
                 loadContext.setRequest(request);
                 try (final CloseableHttpResponse response = httpclient.execute(request)) {
                     String body = EntityUtils.toString(response.getEntity());
@@ -237,7 +239,7 @@ public class MysqlLoadManager {
                                                                String loadId) throws IOException, UserException {
         LoadJobRowResult loadResult = new LoadJobRowResult();
         List<String> filePaths = dataDesc.getFilePaths();
-        String database = ClusterNamespace.getNameFromFullName(dataDesc.getDbName());
+        String database = dataDesc.getDbName();
         String table = dataDesc.getTableName();
         int oldTimeout = context.getExecTimeoutS();
         int newTimeOut = extractTimeOut(dataDesc);
@@ -256,7 +258,7 @@ public class MysqlLoadManager {
         try (final CloseableHttpClient httpclient = HttpClients.createDefault()) {
             for (String file : filePaths) {
                 InputStreamEntity entity = getInputStreamEntity(context, clientLocal, file, loadId);
-                HttpPut request = generateRequestForMySqlLoad(entity, dataDesc, database, table, token);
+                HttpPut request = generateRequestForMySqlLoad(context, entity, dataDesc, database, table, token);
                 loadContext.setRequest(request);
                 try (final CloseableHttpResponse response = httpclient.execute(request)) {
                     String body = EntityUtils.toString(response.getEntity());
@@ -394,7 +396,7 @@ public class MysqlLoadManager {
                 fieldString.append(",");
                 List<String> mappings = new ArrayList<>();
                 for (Expr expr : desc.getColumnMappingList()) {
-                    mappings.add(expr.toSql().replaceAll("`", ""));
+                    mappings.add(expr.accept(ExprToSqlVisitor.INSTANCE, ToSqlParams.WITH_TABLE).replaceAll("`", ""));
                 }
                 fieldString.append(Joiner.on(",").join(mappings));
             }
@@ -452,19 +454,19 @@ public class MysqlLoadManager {
         });
     }
 
-    private HttpPut generateRequestForMySqlLoad(
+    private HttpPut generateRequestForMySqlLoad(ConnectContext context,
             InputStreamEntity entity,
             NereidsDataDescription desc,
             String database,
             String table,
             String token) throws LoadException {
-        final HttpPut httpPut = new HttpPut(selectBackendForMySqlLoad(database, table));
+        final HttpPut httpPut = new HttpPut(selectBackendForMySqlLoad(context, database, table));
 
         httpPut.addHeader("Expect", "100-continue");
         httpPut.addHeader("Content-Type", "text/plain");
         httpPut.addHeader("token", token);
 
-        UserIdentity uid = ConnectContext.get().getCurrentUserIdentity();
+        UserIdentity uid = context.getCurrentUserIdentity();
         if (uid == null || StringUtils.isEmpty(uid.getQualifiedUser())) {
             throw new LoadException("user is null");
         }
@@ -544,7 +546,7 @@ public class MysqlLoadManager {
         if (Config.isCloudMode()) {
             String clusterName = "";
             try {
-                clusterName = ConnectContext.get().getCloudCluster();
+                clusterName = context.getCloudCluster();
             } catch (Exception e) {
                 LOG.warn("failed to get compute group: " + e.getMessage());
                 throw new LoadException("failed to get compute group: " + e.getMessage());
@@ -559,19 +561,19 @@ public class MysqlLoadManager {
         return httpPut;
     }
 
-    private HttpPut generateRequestForMySqlLoadV2(
+    private HttpPut generateRequestForMySqlLoadV2(ConnectContext context,
             InputStreamEntity entity,
             MysqlDataDescription desc,
             String database,
             String table,
             String token) throws LoadException {
-        final HttpPut httpPut = new HttpPut(selectBackendForMySqlLoad(database, table));
+        final HttpPut httpPut = new HttpPut(selectBackendForMySqlLoad(context, database, table));
 
         httpPut.addHeader("Expect", "100-continue");
         httpPut.addHeader("Content-Type", "text/plain");
         httpPut.addHeader("token", token);
 
-        UserIdentity uid = ConnectContext.get().getCurrentUserIdentity();
+        UserIdentity uid = context.getCurrentUserIdentity();
         if (uid == null || StringUtils.isEmpty(uid.getQualifiedUser())) {
             throw new LoadException("user is null");
         }
@@ -651,7 +653,7 @@ public class MysqlLoadManager {
         if (Config.isCloudMode()) {
             String clusterName = "";
             try {
-                clusterName = ConnectContext.get().getCloudCluster();
+                clusterName = context.getCloudCluster();
             } catch (Exception e) {
                 LOG.warn("failed to get compute group: " + e.getMessage());
                 throw new LoadException("failed to get compute group: " + e.getMessage());
@@ -666,24 +668,37 @@ public class MysqlLoadManager {
         return httpPut;
     }
 
-    private String selectBackendForMySqlLoad(String database, String table) throws LoadException {
+    private String selectBackendForMySqlLoad(ConnectContext context, String database, String table)
+            throws LoadException {
         Backend backend = null;
         if (Config.isCloudMode()) {
             String clusterName = "";
             try {
-                clusterName = ConnectContext.get().getCloudCluster();
+                clusterName = context.getCloudCluster();
             } catch (Exception e) {
                 LOG.warn("failed to get cloud cluster: " + e.getMessage());
                 throw new LoadException("failed to get cloud cluster: " + e);
             }
             backend = StreamLoadHandler.selectBackend(clusterName);
+            if (backend == null) {
+                throw new LoadException(SystemInfoService.NO_BACKEND_LOAD_AVAILABLE_MSG
+                        + ", cluster: " + clusterName);
+            }
         } else {
             BeSelectionPolicy policy = new BeSelectionPolicy.Builder().needLoadAvailable().build();
-            List<Long> backendIds = Env.getCurrentSystemInfo().selectBackendIdsByPolicy(policy, 1);
+            // The backend selection policy may reorder all eligible candidates.
+            List<Long> backendIds = Env.getCurrentSystemInfo().selectBackendIdsByPolicy(policy, -1);
             if (backendIds.isEmpty()) {
                 throw new LoadException(SystemInfoService.NO_BACKEND_LOAD_AVAILABLE_MSG + ", policy: " + policy);
             }
-            backend = Env.getCurrentSystemInfo().getBackend(backendIds.get(0));
+            List<Backend> candidates = new ArrayList<>();
+            for (Long backendId : backendIds) {
+                Backend candidate = Env.getCurrentSystemInfo().getBackend(backendId);
+                if (candidate != null) {
+                    candidates.add(candidate);
+                }
+            }
+            backend = BackendSelectionManager.chooseLoadBackend(context, candidates);
             if (backend == null) {
                 throw new LoadException(SystemInfoService.NO_BACKEND_LOAD_AVAILABLE_MSG + ", policy: " + policy);
             }

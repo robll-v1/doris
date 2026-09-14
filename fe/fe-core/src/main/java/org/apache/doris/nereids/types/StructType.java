@@ -20,6 +20,7 @@ package org.apache.doris.nereids.types;
 import org.apache.doris.catalog.Type;
 import org.apache.doris.nereids.annotation.Developing;
 import org.apache.doris.nereids.exceptions.AnalysisException;
+import org.apache.doris.nereids.types.coercion.CharacterType;
 import org.apache.doris.nereids.types.coercion.ComplexDataType;
 
 import com.google.common.collect.ImmutableList;
@@ -28,6 +29,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.stream.Collectors;
@@ -59,7 +61,7 @@ public class StructType extends DataType implements ComplexDataType, NestedColum
         // ATTN: should use LinkedHashMap to keep order
         this.nameToFields = new LinkedHashMap<>();
         for (StructField field : this.fields) {
-            String fieldName = field.getName().toLowerCase();
+            String fieldName = field.getName().toLowerCase(Locale.ROOT);
             StructField existingField = this.nameToFields.put(fieldName, field);
             if (existingField != null) {
                 throw new AnalysisException("Duplicate field name found: " + fieldName);
@@ -75,13 +77,47 @@ public class StructType extends DataType implements ComplexDataType, NestedColum
         return nameToFields;
     }
 
+    /** Get a field by its case-insensitive runtime name. */
     public StructField getField(String name) {
-        return nameToFields.get(name.toLowerCase());
+        StructField field = nameToFields.get(name.toLowerCase(Locale.ROOT));
+        if (field != null && (!field.isLegacyLocaleDependentName() || field.getName().equals(name))) {
+            return field;
+        }
+        StructField legacyMatch = null;
+        for (int i = fields.size() - 1; i >= 0; i--) {
+            StructField legacyField = fields.get(i);
+            // Limit broad case folding to old replayed fields so new ROOT-distinct names remain distinct.
+            if (legacyField.isLegacyLocaleDependentName() && legacyField.getName().equalsIgnoreCase(name)) {
+                if (legacyMatch != null) {
+                    // The old locale was not persisted, so choosing either folded sibling could return wrong data.
+                    return null;
+                }
+                legacyMatch = legacyField;
+            }
+        }
+        return legacyMatch != null ? legacyMatch : field;
     }
 
     @Override
     public DataType conversion() {
         return new StructType(fields.stream().map(StructField::conversion).collect(Collectors.toList()));
+    }
+
+    @Override
+    public boolean isInjectiveCastTo(DataType target) {
+        if (target instanceof StructType) {
+            StructType structType = (StructType) target;
+            if (this.fields.size() != structType.fields.size()) {
+                return false;
+            }
+            for (int i = 0; i < fields.size(); i++) {
+                if (!this.fields.get(i).getDataType().isInjectiveCastTo(structType.fields.get(i).getDataType())) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        return target instanceof CharacterType;
     }
 
     @Override
@@ -114,6 +150,30 @@ public class StructType extends DataType implements ComplexDataType, NestedColum
         }
         StructType that = (StructType) o;
         return Objects.equals(fields, that.fields);
+    }
+
+    @Override
+    public boolean equalsForRecursiveCte(Object o) {
+        if (this == o) {
+            return true;
+        }
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
+        if (!super.equals(o)) {
+            return false;
+        }
+        StructType other = (StructType) o;
+        if (fields.size() != other.fields.size()) {
+            return false;
+        }
+        for (int i = 0; i < fields.size(); ++i) {
+            if ((fields.get(i).isNullable() != other.fields.get(i).isNullable())
+                    || !fields.get(i).getDataType().equalsForRecursiveCte(other.fields.get(i).getDataType())) {
+                return false;
+            }
+        }
+        return true;
     }
 
     @Override

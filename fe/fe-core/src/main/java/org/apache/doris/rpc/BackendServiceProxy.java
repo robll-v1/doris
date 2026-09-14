@@ -119,9 +119,19 @@ public class BackendServiceProxy {
 
     private BackendServiceClient getProxy(TNetworkAddress address) throws UnknownHostException {
         String realIp = Env.getCurrentEnv().getDnsCache().get(address.hostname);
+
+        // Check if DNS resolution failed (returns empty string)
+        if (realIp.isEmpty() && Config.enable_fqdn_mode) {
+            String errorMsg = String.format("Failed to resolve hostname: %s. DNS cache returned empty IP address.",
+                    address.hostname);
+            LOG.warn(errorMsg);
+            throw new UnknownHostException(errorMsg);
+        }
+
         BackendServiceClientExtIp serviceClientExtIp = serviceMap.get(address);
         if (serviceClientExtIp != null && serviceClientExtIp.realIp.equals(realIp)
-                && serviceClientExtIp.client.isNormalState()) {
+                && serviceClientExtIp.client.isNormalState()
+                && serviceClientExtIp.client.isUsingLatestChannelConfig()) {
             return serviceClientExtIp.client;
         }
 
@@ -131,7 +141,13 @@ public class BackendServiceProxy {
         try {
             serviceClientExtIp = serviceMap.get(address);
             if (serviceClientExtIp != null && !serviceClientExtIp.realIp.equals(realIp)) {
-                LOG.warn("Cached ip changed ,before ip: {}, curIp: {}", serviceClientExtIp.realIp, realIp);
+                LOG.warn("Cached ip changed, before ip: {}, curIp: {}", serviceClientExtIp.realIp, realIp);
+                serviceMap.remove(address);
+                removedClient = serviceClientExtIp.client;
+                serviceClientExtIp = null;
+            }
+            if (serviceClientExtIp != null && !serviceClientExtIp.client.isUsingLatestChannelConfig()) {
+                LOG.info("BackendServiceClient channel config changed, recreate client for {}", address);
                 serviceMap.remove(address);
                 removedClient = serviceClientExtIp.client;
                 serviceClientExtIp = null;
@@ -145,7 +161,8 @@ public class BackendServiceProxy {
                 serviceClientExtIp = null;
             }
             if (serviceClientExtIp == null) {
-                BackendServiceClient client = new BackendServiceClient(address, grpcThreadPool);
+                // Pass resolved IP to BackendServiceClient to avoid DNS resolution at gRPC layer
+                BackendServiceClient client = new BackendServiceClient(address, realIp, grpcThreadPool);
                 serviceMap.put(address, new BackendServiceClientExtIp(realIp, client));
             }
             return serviceMap.get(address).client;
@@ -531,6 +548,18 @@ public class BackendServiceProxy {
         }
     }
 
+    public ListenableFuture<InternalService.PSyncTabletMetaResponse> syncTabletMeta(TNetworkAddress address,
+            InternalService.PSyncTabletMetaRequest request) throws RpcException {
+        try {
+            final BackendServiceClient client = getProxy(address);
+            return client.syncTabletMeta(request);
+        } catch (Throwable e) {
+            LOG.warn("failed to sync tablet meta from address={}:{}", address.getHostname(),
+                    address.getPort(), e);
+            throw new RpcException(address.getHostname(), e.getMessage());
+        }
+    }
+
     public Future<InternalService.PFetchRemoteSchemaResponse> fetchRemoteTabletSchemaAsync(
             TNetworkAddress address, InternalService.PFetchRemoteSchemaRequest request) throws RpcException {
         try {
@@ -584,6 +613,28 @@ public class BackendServiceProxy {
             return client.abortRefreshDictionary(request, timeoutSec);
         } catch (Throwable e) {
             LOG.warn("abort refrersh dictionary failed, address={}:{}", address.getHostname(), address.getPort(), e);
+        }
+        return null;
+    }
+
+    public Future<InternalService.PRequestCdcClientResult> requestCdcClient(TNetworkAddress address,
+            InternalService.PRequestCdcClientRequest request) {
+        try {
+            final BackendServiceClient client = getProxy(address);
+            return client.requestCdcClient(request);
+        } catch (Throwable e) {
+            LOG.warn("request cdc client failed, address={}:{}", address.getHostname(), address.getPort(), e);
+        }
+        return null;
+    }
+
+    public Future<InternalService.PRequestCdcClientResult> requestCdcClient(TNetworkAddress address,
+            InternalService.PRequestCdcClientRequest request, int timeoutSec) {
+        try {
+            final BackendServiceClient client = getProxy(address);
+            return client.requestCdcClient(request, timeoutSec);
+        } catch (Throwable e) {
+            LOG.warn("request cdc client failed, address={}:{}", address.getHostname(), address.getPort(), e);
         }
         return null;
     }

@@ -60,7 +60,11 @@ enum TPlanNodeType {
   TEST_EXTERNAL_SCAN_NODE = 31,
   PARTITION_SORT_NODE = 32,
   GROUP_COMMIT_SCAN_NODE = 33,
-  MATERIALIZATION_NODE = 34
+  MATERIALIZATION_NODE = 34,
+  REC_CTE_NODE = 35,
+  REC_CTE_SCAN_NODE = 36,
+  BUCKETED_AGGREGATION_NODE = 37,
+  LOCAL_EXCHANGE_NODE = 38
 }
 
 struct TKeyRange {
@@ -77,6 +81,14 @@ struct TKeyRange {
 // - T<subclass>: all other operational parameters that are the same across
 //   all plan fragments
 
+enum TBinlogScanType {
+  NONE = 0,
+  APPEND_ONLY = 1,
+  MIN_DELTA = 2,
+  DETAIL = 3,
+  UNKNOWN = 4
+}
+
 struct TPaloScanRange {
   1: required list<Types.TNetworkAddress> hosts
   2: required string schema_hash
@@ -87,6 +99,14 @@ struct TPaloScanRange {
   7: optional list<TKeyRange> partition_column_ranges
   8: optional string index_name
   9: optional string table_name
+  10: optional i64 start_tso
+  11: optional i64 end_tso
+  12: optional TBinlogScanType binlog_scan_type
+  // Bucket metadata for BE-side runtime-filter bucket pruning. These fields
+  // are populated only when the scan has an eligible single-column HASH
+  // distribution runtime-filter target.
+  13: optional i32 bucket_seq
+  14: optional i32 bucket_num
 }
 
 enum TFileFormatType {
@@ -108,7 +128,10 @@ enum TFileFormatType {
     FORMAT_CSV_SNAPPYBLOCK = 14,
     FORMAT_WAL = 15,
     FORMAT_ARROW = 16,
-    FORMAT_TEXT = 17
+    FORMAT_TEXT = 17,
+    FORMAT_NATIVE = 18,
+    FORMAT_LANCE = 19,
+    FORMAT_ES_HTTP = 20
 }
 
 // In previous versions, the data compression format and file format were stored together, as TFileFormatType,
@@ -250,9 +273,21 @@ struct TFileTextScanRangeParams {
     8: optional bool empty_field_as_null
 }
 
+enum TColumnCategory {
+    REGULAR = 0,
+    PARTITION_KEY = 1,
+    SYNTHESIZED = 2,
+    GENERATED = 3,
+}
+
 struct TFileScanSlotInfo {
     1: optional Types.TSlotId slot_id;
     2: optional bool is_file_slot;
+    3: optional TColumnCategory category;
+    // Default value expression for this column when it is missing from the data file.
+    // Populated by FE from Column.getDefaultValue() or NULL literal.
+    // This replaces the separate default_value_of_src_slot map in TFileScanRangeParams.
+    4: optional Exprs.TExpr default_value_expr;
 }
 
 // descirbe how to read file
@@ -287,8 +322,18 @@ struct TIcebergDeleteFileDesc {
     2: optional i64 position_lower_bound;
     3: optional i64 position_upper_bound;
     4: optional list<i32> field_ids;
-    // Iceberg file type, 0: data, 1: position delete, 2: equality delete.
+    // Iceberg file type, 0: data, 1: position delete, 2: equality delete, 3: deletion vector. 
     5: optional i32 content;
+    // 6 & 7 : iceberg v3 deletion vector.
+    // The content_offset and content_size_in_bytes fields are used to reference a specific blob for direct access to a deletion vector. 
+    6: optional i64 content_offset;
+    7: optional i64 content_size_in_bytes;
+    8: optional TFileFormatType file_format;
+    // Original Iceberg delete file path before Doris storage path normalization.
+    9: optional string original_path;
+    // Referenced data file path. Required to materialize rows from deletion vectors.
+    10: optional string referenced_data_file_path;
+    11: optional i64 file_size;
 }
 
 struct TIcebergFileDesc {
@@ -305,12 +350,26 @@ struct TIcebergFileDesc {
     6: optional string original_file_path;
     // Deprecated
     7: optional i64 row_count;
+    8: optional i32 partition_spec_id;
+    9: optional string partition_data_json;
+    // Only for format_version >= 3, the starting _row_id to assign to rows added by ADDED data files. 
+    10: optional i64 first_row_id;
+    // Only for format_version >= 3, the sequence number which last updated this file.
+    11: optional i64 last_updated_sequence_number;
+    12: optional string serialized_split;
 }
 
 struct TPaimonDeletionFileDesc {
     1: optional string path;
     2: optional i64 offset;
     3: optional i64 length;
+}
+
+enum TPaimonReaderType {
+    PAIMON_NATIVE = 0,
+    PAIMON_JNI = 1,
+    // Deprecated wire value kept during rolling upgrades. New plans never emit it.
+    PAIMON_CPP = 2,
 }
 
 struct TPaimonFileDesc {
@@ -330,6 +389,11 @@ struct TPaimonFileDesc {
     14: optional string paimon_table  // deprecated
     15: optional i64 row_count // deprecated
     16: optional i64 schema_id; // for schema change.
+    // Reader implementation for logical paimon split. Native file split uses range format type.
+    17: optional TPaimonReaderType reader_type;
+    // Original Paimon RawFile.path() before Doris storage path normalization. Native readers use this
+    // to materialize the public file-location metadata column.
+    18: optional string original_file_path;
 }
 
 struct TTrinoConnectorFileDesc {
@@ -398,6 +462,15 @@ struct TRemoteDorisFileDesc {
     6: optional string password
 }
 
+struct TLanceFileDesc {
+    // URI of the Lance dataset (s3://..., file:///..., etc.)
+    1: optional string dataset_uri
+    // Specific fragment IDs to read (for split-level parallelism)
+    2: optional list<i64> fragment_ids
+    // Dataset version for time travel
+    3: optional i64 version
+}
+
 struct TTableFormatFileDesc {
     1: optional string table_format_type
     2: optional TIcebergFileDesc iceberg_params
@@ -409,12 +482,35 @@ struct TTableFormatFileDesc {
     8: optional TLakeSoulFileDesc lakesoul_params
     9: optional i64 table_level_row_count = -1
     10: optional TRemoteDorisFileDesc remote_doris_params
+    // JDBC connection parameters (used when table_format_type == "jdbc")
+    11: optional map<string, string> jdbc_params
+    12: optional TLanceFileDesc lance_params
+    // ES per-shard parameters (used when table_format_type == "es")
+    // Contains: index, type, shard_id, host_port, es_hosts
+    13: optional map<string, string> es_params
+    // ADBC connection and query parameters (used when table_format_type == "adbc").
+    // Keys: driver_path, driver_entrypoint, uri, username, password,
+    //       adbc.<option> passthrough, and either query_sql or partition_b64.
+    // The partition descriptor is opaque binary, so it travels base64-encoded.
+    14: optional map<string, string> adbc_params
 }
 
 // Deprecated, hive text talbe is a special format, not a serde type
 enum TTextSerdeType {
     JSON_TEXT_SERDE = 0,
     HIVE_TEXT_SERDE = 1,
+}
+
+// A provider-independent logical search request. Physical target information remains in the
+// provider FileDesc (for example, dataset_uri/version/fragment_ids in TLanceFileDesc).
+struct TExternalSearchRequest {
+    1: optional i32 schema_version = 1
+}
+
+struct TLanceScanParams {
+    1: optional binary lance_substrait_filter
+    2: optional TExternalSearchRequest external_search_request
+    3: optional map<string, string> lance_storage_options
 }
 
 struct TFileScanRangeParams {
@@ -481,6 +577,29 @@ struct TFileScanRangeParams {
     27: optional string paimon_predicate
     // enable mapping varbinary type for Doris external table and TVF
     28: optional bool enable_mapping_varbinary = false;
+    29: optional bool enable_mapping_timestamp_tz = false;
+    // Paimon options from FE, used for jni/native scanner
+    // Set at ScanNode level to avoid redundant serialization in each split
+    30: optional map<string, string> paimon_options
+    // ES node-level properties (query_dsl, auth, doc_values_mode, etc.)
+    31: optional map<string, string> es_properties
+    // ES docvalue field→docvalue_type mappings
+    32: optional map<string, string> es_docvalue_context
+    // ES fields field→keyword mappings
+    33: optional map<string, string> es_fields_context
+    // Versioned Iceberg scan semantics negotiated by FE. Absence/zero preserves legacy BE
+    // behavior during a BE-first rolling upgrade; version 1 enables file-wide ID projection and
+    // logical initial-default materialization.
+    34: optional i32 iceberg_scan_semantics_version
+    // FE-generated identity for sharing a deserialized table across JNI scanners in one scan node.
+    35: optional string serialized_table_cache_key
+    // HMS catalog property hive.parquet.time-zone. When absent, format_v2 keeps INT96 wall-clock
+    // values unchanged. When present, only INT96 TIMESTAMP values are converted with this zone.
+    36: optional string hive_parquet_time_zone
+    37: optional TLanceScanParams lance_scan_params
+    // Non-regular columns in the pinned full schema, including columns pruned from phase one.
+    // When present, omitted names are REGULAR. Used to rebuild row-id fetch projections.
+    38: optional map<string, TColumnCategory> column_name_to_category
 }
 
 struct TFileRangeDesc {
@@ -512,6 +631,7 @@ struct TFileRangeDesc {
     14: optional i64 self_split_weight
     // whether the value of columns_from_path is null
     15: optional list<bool> columns_from_path_is_null;
+    16: optional bool file_cache_admission;
 }
 
 struct TSplitSource {
@@ -575,6 +695,7 @@ struct TPaimonMetadataParams {
   9: optional map<string, string> paimon_props
 }
 
+// deprecated
 struct THudiMetadataParams {
   1: optional Types.THudiQueryType hudi_query_type
   2: optional string catalog
@@ -588,6 +709,7 @@ struct TBackendsMetadataParams {
 
 struct TFrontendsMetadataParams {
   1: optional string cluster_name
+  2: optional string current_connected_fe_host
 }
 
 struct TMaterializedViewsMetadataParams {
@@ -630,6 +752,65 @@ struct TQueriesMetadataParams {
 struct TMetaCacheStatsParams {
 }
 
+struct TParquetMetadataParams {
+  1: optional list<string> paths
+  2: optional string mode
+  3: optional Types.TFileType file_type
+  4: optional map<string, string> properties
+  5: optional string bloom_column
+  6: optional string bloom_literal
+}
+
+// Partition boundary descriptor for BE-side runtime filter partition pruning.
+// FE sends only partitions that are candidates for pruning; partitions FE does
+// not want pruned (e.g. default catch-all partitions) are simply omitted.
+//
+// Partition type is inferred from which optional fields are set:
+//   - range_start / range_end set  →  Range partition
+//   - list_values set              →  List partition
+//
+// For Range partitions:
+//   - range_start absent  →  no lower-bound constraint (negative infinity)
+//   - range_end   absent  →  no upper-bound constraint (MAXVALUE / positive infinity)
+struct TPartitionBoundary {
+  1: optional Types.TPartitionId partition_id
+  // slot_id of the partition column
+  2: optional Types.TSlotId slot_id
+
+  // Range partition: closed lower bound; absent means unbounded below
+  3: optional Exprs.TExprNode range_start
+  // Range partition: upper bound. By default (range_end_inclusive=false) the
+  // bound is OPEN, i.e. the column range is [range_start, range_end), which
+  // matches Doris RANGE partition's `VALUES [..., ...)` syntax for the
+  // single-column case. Absent means unbounded above (MAXVALUE).
+  4: optional Exprs.TExprNode range_end
+
+  // List partition: set of concrete values in this partition. A NULL_LITERAL
+  // entry indicates the partition logically contains NULL rows for this column;
+  // the BE pruner translates that into ColumnValueRange::set_contain_null(true)
+  // rather than treating it as an ordinary fixed value.
+  5: optional list<Exprs.TExprNode> list_values
+
+  // When true, treat `range_end` as a CLOSED upper bound, i.e. the projected
+  // column range is [range_start, range_end]. Used when projecting a
+  // multi-column RANGE partition onto its first column: a partition like
+  // [(L1, L2, ...), (U1, U2, ...)) projects to the first column as
+  // [L1, U1] (both ends closed) — for the L1 == U1 case the projection is the
+  // singleton {L1}, and for L1 < U1 the value U1 is reachable via inner-tuple
+  // values of the second+ column. The original half-open form [L1, U1) would
+  // be a strict UNDER-approximation and could wrongly prune the partition.
+  // The single-column case keeps the default open form to preserve exact
+  // Doris partition semantics.
+  6: optional bool range_end_inclusive = false
+}
+
+// Identifies a Lance table for read-only physical index entry inspection.
+struct TLanceIndexMetadataParams {
+  1: optional string catalog
+  2: optional string database
+  3: optional string table
+}
+
 struct TMetaScanRange {
   1: optional Types.TMetadataType metadata_type
   2: optional TIcebergMetadataParams iceberg_params // deprecated
@@ -642,13 +823,15 @@ struct TMetaScanRange {
   9: optional TPartitionsMetadataParams partitions_params
   10: optional TMetaCacheStatsParams meta_cache_stats_params
   11: optional TPartitionValuesMetadataParams partition_values_params
-  12: optional THudiMetadataParams hudi_params
+  12: optional THudiMetadataParams hudi_params // deprecated
   13: optional TPaimonMetadataParams paimon_params // deprecated
 
   // for quering sys tables for Paimon/Iceberg
   14: optional map<string, string> hadoop_props
   15: optional string serialized_table;
   16: optional list<string> serialized_splits;
+  17: optional TParquetMetadataParams parquet_params;
+  18: optional TLanceIndexMetadataParams lance_index_params;
 }
 
 // Specification of an individual data range which is held in its entirety
@@ -706,6 +889,29 @@ struct TBrokerScanNode {
 struct TFileScanNode {
     1: optional Types.TTupleId tuple_id
     2: optional string table_name
+}
+
+struct TRecCTETarget {
+    1: optional Types.TNetworkAddress addr
+    2: optional Types.TUniqueId fragment_instance_id
+    3: optional i32 node_id
+}
+
+struct TRecCTEResetInfo {
+    1: optional Types.TNetworkAddress addr
+    2: optional i32 fragment_id
+}
+
+struct TRecCTENode {
+    1: optional bool is_union_all
+    2: optional list<TRecCTETarget> targets
+    3: optional list<TRecCTEResetInfo> fragments_to_reset
+    4: optional list<list<Exprs.TExpr>> result_expr_lists
+    5: optional list<i32> rec_side_runtime_filter_ids
+    6: optional bool is_used_by_other_rec_cte
+}
+
+struct TRecCTEScanNode {
 }
 
 struct TEsScanNode {
@@ -787,6 +993,9 @@ struct TSchemaScanNode {
   14: optional string catalog
   15: optional list<Types.TNetworkAddress> fe_addr_list
   16: optional string frontend_conjuncts
+  // Captured from the session at plan time, because the FE cannot see the session of the
+  // query when the BE calls back into it for schema metadata.
+  17: optional bool mysql_compatible_index_metadata = false
 }
 
 struct TMetaScanNode {
@@ -809,7 +1018,7 @@ struct TSortInfo {
   // Expressions evaluated over the input row that materialize the tuple to be sorted.
   // Contains one expr per slot in the materialized tuple.
   4: optional list<Exprs.TExpr> sort_tuple_slot_exprs
-  // Indicates whether topn query using two phase read
+  // [deprecated] Two-phase read is replaced by TopN lazy materialization.
   6: optional bool use_two_phase_read
 }
 
@@ -819,6 +1028,12 @@ enum TPushAggOp {
 	COUNT = 2,
 	MIX = 3,
 	COUNT_ON_INDEX = 4
+}
+
+struct TScoreRangeInfo {
+  // Score range filter parameters for BM25 range queries like score() > 0.5
+  1: optional Opcodes.TExprOpcode op
+  2: optional double threshold
 }
 
 struct TOlapScanNode {
@@ -846,6 +1061,19 @@ struct TOlapScanNode {
   20: optional i64 score_sort_limit
   21: optional TSortInfo ann_sort_info
   22: optional i64 ann_sort_limit
+  23: optional TScoreRangeInfo score_range_info
+  // Enable value predicate pushdown for MOR tables
+  24: optional bool enable_mor_value_predicate_pushdown
+  // Read MOR table as DUP table: skip merge, skip delete sign
+  25: optional bool read_mor_as_dup
+  // Read row binlog index instead of base index
+  26: optional bool read_row_binlog
+  // Partition boundary descriptors for BE-side runtime filter partition pruning.
+  // Only partitions that are candidates for pruning are included; partitions FE
+  // does not want pruned (e.g. default catch-all) are omitted from this list.
+  27: optional list<TPartitionBoundary> partition_boundaries
+  // Slot ids of extra storage key columns used only to align the scan tuple with storage schema.
+  28: optional set<i32> extra_key_column_slot_ids
 }
 
 struct TEqJoinCondition {
@@ -875,7 +1103,11 @@ enum TJoinOp {
   // be rejected (ANTI-join), based on the other join conjuncts. This is in contrast
   // to LEFT_ANTI_JOIN where NULLs are not matches and therefore always returned.
   NULL_AWARE_LEFT_ANTI_JOIN = 10,
-  NULL_AWARE_LEFT_SEMI_JOIN = 11
+  NULL_AWARE_LEFT_SEMI_JOIN = 11,
+  ASOF_LEFT_INNER_JOIN = 12,
+  ASOF_RIGHT_INNER_JOIN = 13,
+  ASOF_LEFT_OUTER_JOIN = 14,
+  ASOF_RIGHT_OUTER_JOIN = 15
 }
 
 enum TJoinDistributionType {
@@ -920,6 +1152,7 @@ struct THashJoinNode {
   // use_specific_projections true, if output exprssions is denoted by srcExprList represents, o.w. PlanNode.projections
   // deprecated
   14: optional bool use_specific_projections
+  15: optional Exprs.TExpr match_condition
 }
 
 struct TNestedLoopJoinNode {
@@ -931,7 +1164,8 @@ struct TNestedLoopJoinNode {
 
   4: optional list<Types.TTupleId> vintermediate_tuple_id_list
 
-  // for bitmap filer, don't need to join, but output left child tuple
+  // Deprecated: bitmap runtime filter planning no longer uses this field; for bitmap filer,
+  // don't need to join, but output left child tuple
   5: optional bool is_output_left_side_only
 
   6: optional Exprs.TExpr vjoin_conjunct
@@ -943,6 +1177,11 @@ struct TNestedLoopJoinNode {
   9: optional list<Exprs.TExpr> mark_join_conjuncts
   // deprecated
   10: optional bool use_specific_projections
+
+  // Slots that need to be materialized after join conjunct evaluation.
+  // If this field is not set, BE keeps the legacy behavior.
+  // If this field is set to an empty list, no payload slot needs materialization.
+  11: optional list<Types.TSlotId> materialized_slot_ids
 }
 
 struct TMergeJoinNode {
@@ -1012,6 +1251,15 @@ struct TAggregationNode {
   8: optional bool is_first_phase
   9: optional bool is_colocate
   10: optional TSortInfo agg_sort_info_by_group_key
+}
+
+struct TBucketedAggregationNode {
+  1: optional list<Exprs.TExpr> grouping_exprs
+  2: optional list<Exprs.TExpr> aggregate_functions
+  // Single tuple ID — bucketed agg is one-phase (raw input → final result),
+  // so intermediate and output tuples are always identical.
+  3: optional Types.TTupleId tuple_id
+  5: optional bool need_finalize
 }
 
 struct TRepeatNode {
@@ -1246,6 +1494,24 @@ struct TExchangeNode {
   4: optional Partitions.TPartitionType partition_type
 }
 
+struct TLocalExchangeNode {
+  1: optional Partitions.TLocalPartitionType partition_type
+  // when partition_type in (GLOBAL_EXECUTION_HASH_SHUFFLE, LOCAL_EXECUTION_HASH_SHUFFLE, BUCKET_HASH_SHUFFLE),
+  // the distribute_expr_lists is not null, and the legacy `TPlanNode.distribute_expr_lists` is deprecated
+  //
+  // the hash computation:
+  // 1. for BUCKET_HASH_SHUFFLE, use distribution_exprs to compute hash value and mod by
+  //    `TPipelineFragmentParams.num_buckets`, and mapping bucket index to local instance id by
+  //    `TPipelineFragmentParams.bucket_seq_to_instance_idx`
+  // 2. for LOCAL_EXECUTION_HASH_SHUFFLE, use distribution_exprs to compute hash value and mod by
+  //    `TPipelineFragmentParams.local_params.size`, and backend will mapping instance index to local instance
+  //    by `i -> i`, for example: 1 -> 1, 2 -> 2, ...
+  // 3. for GLOBAL_EXECUTION_HASH_SHUFFLE, use distribution_exprs to compute hash value and mod by
+  //    `TPipelineFragmentParams.total_instances`, and mapping global instance index to local instance by
+  //    `TPipelineFragmentParams.shuffle_idx_to_instance_idx`
+  2: optional list<Exprs.TExpr> distribute_expr_lists
+}
+
 struct TOlapRewriteNode {
     1: required list<Exprs.TExpr> columns
     2: required list<Types.TColumnType> column_types
@@ -1255,6 +1521,7 @@ struct TOlapRewriteNode {
 struct TTableFunctionNode {
     1: optional list<Exprs.TExpr> fnCallExprList
     2: optional list<Types.TSlotId> outputSlotIds
+    3: optional list<Exprs.TExpr> expand_conjuncts
 }
 
 // This contains all of the information computed by the plan as part of the resource
@@ -1298,6 +1565,7 @@ enum TRuntimeFilterType {
   BLOOM = 2,
   MIN_MAX = 4,
   IN_OR_BLOOM = 8,
+  // Deprecated: bitmap runtime filters are no longer planned.
   BITMAP = 16
 }
 
@@ -1311,6 +1579,20 @@ enum TMinMaxRuntimeFilterType {
   // support hash join condition: col_A = col_B
   // support other join condition: n < col_A and col_A < m
   MIN_MAX = 4
+}
+
+// Monotonicity of a runtime filter's target expression on one partition range,
+// used by BE-side partition pruning. FE sends this per partition so BE can
+// project each boundary with the direction proven for that exact range.
+enum TTargetExprMonotonicity {
+  NON_MONOTONIC = 0,
+  MONOTONIC_INCREASING = 1,
+  MONOTONIC_DECREASING = 2
+}
+
+struct TPartitionTargetExprMonotonicity {
+  1: optional Types.TPartitionId partition_id
+  2: optional TTargetExprMonotonicity monotonicity
 }
 
 struct TTopnFilterDesc {
@@ -1357,10 +1639,10 @@ struct TRuntimeFilterDesc {
   // the query options. Should be greater than zero for bloom filters, zero otherwise.
   9: optional i64 bloom_filter_size_bytes
 
-  // for bitmap filter target expr
+  // Deprecated: bitmap runtime filters are no longer planned; for bitmap filter target expr
   10: optional Exprs.TExpr bitmap_target_expr
 
-  // for bitmap filter
+  // Deprecated: bitmap runtime filters are no longer planned; for bitmap filter
   11: optional bool bitmap_filter_not_in
 
   12: optional bool opt_remote_rf; // Deprecated
@@ -1379,6 +1661,31 @@ struct TRuntimeFilterDesc {
   16: optional bool sync_filter_size; // Deprecated
   
   17: optional bool build_bf_by_runtime_size;
+
+  // Per-filter wait time in ms. When set, overrides query-level runtime_filter_wait_time_ms.
+  // 0 means non-blocking (don't wait for this filter).
+  18: optional i32 wait_time_ms;
+
+  // Deprecated compatibility field. Current RF partition pruning uses
+  // planId_to_partition_target_monotonicity for both direct SlotRef targets and
+  // expression targets, so BE can make one per-partition decision path.
+  19: optional map<Types.TPlanNodeId, TTargetExprMonotonicity> planId_to_target_monotonicity;
+
+  // Per-target, per-partition monotonicity. BE must apply the target RF only to
+  // the listed partitions with the listed direction; absent partitions are
+  // unsafe for this RF target and must not be pruned by it.
+  20: optional map<Types.TPlanNodeId, list<TPartitionTargetExprMonotonicity>> planId_to_partition_target_monotonicity;
+
+  // True when a local exchange sits between the filter builder (join) and a same-fragment
+  // target scan: per-instance partial filters are then NOT aligned with the scan's data
+  // slice and must be merged before being applied. Computed truthfully by FE after local
+  // exchange planning; replaces inferring this from the target scan's is_serial_operator.
+  21: optional bool force_local_merge;
+
+  // Scan node ids whose target is a direct SlotRef on the only HASH
+  // distribution column. BE still verifies that the delivered filter has an
+  // exact IN set before using it for bucket pruning.
+  22: optional set<Types.TPlanNodeId> bucket_pruning_target_ids;
 }
 
 
@@ -1437,6 +1744,7 @@ struct TPlanNode {
   36: optional list<TRuntimeFilterDesc> runtime_filters
   37: optional TGroupCommitScanNode group_commit_scan_node
   38: optional TMaterializationNode materialization_node
+  39: optional TRecCTENode rec_cte_node
 
   // Use in vec exec engine
   40: optional Exprs.TExpr vconjunct
@@ -1459,6 +1767,14 @@ struct TPlanNode {
 
   50: optional list<list<Exprs.TExpr>> distribute_expr_lists
   51: optional bool is_serial_operator
+  52: optional TRecCTEScanNode rec_cte_scan_node
+  53: optional TBucketedAggregationNode bucketed_agg_node
+  54: optional TLocalExchangeNode local_exchange_node
+  // COUNT(*) and COUNT(col) share push_down_agg_type_opt=COUNT, but file readers need to know
+  // whether a projected scan slot is the aggregate argument or merely the placeholder retained by
+  // column pruning. Empty means row-count semantics; non-empty identifies explicit COUNT columns.
+  55: optional list<Types.TSlotId> push_down_count_slot_ids
+
   // projections is final projections, which means projecting into results and materializing them into the output block.
   101: optional list<Exprs.TExpr> projections
   102: optional Types.TTupleId output_tuple_id

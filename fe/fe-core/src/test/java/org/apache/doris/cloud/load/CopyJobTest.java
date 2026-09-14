@@ -26,7 +26,7 @@ import org.apache.doris.catalog.FakeEnv;
 import org.apache.doris.cloud.proto.Cloud.ObjectStoreInfoPB.Provider;
 import org.apache.doris.cloud.proto.Cloud.StagePB.StageType;
 import org.apache.doris.cloud.stage.StageUtil;
-import org.apache.doris.cloud.storage.RemoteBase.ObjectInfo;
+import org.apache.doris.cloud.storage.ObjectInfo;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FeMetaVersion;
 import org.apache.doris.common.MetaNotFoundException;
@@ -39,9 +39,10 @@ import org.apache.doris.thrift.TUniqueId;
 import com.google.common.collect.Lists;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.junit.Assert;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
@@ -62,7 +63,7 @@ public class CopyJobTest {
     private static FakeEnv fakeEnv;
     private static Env masterEnv;
 
-    @Before
+    @BeforeEach
     public void setUp() throws InstantiationException, IllegalAccessException, IllegalArgumentException,
             InvocationTargetException, NoSuchMethodException, SecurityException {
         fakeEditLog = new FakeEditLog();
@@ -74,6 +75,16 @@ public class CopyJobTest {
         metaContext.setThreadLocalInfo();
     }
 
+    @AfterEach
+    public void tearDown() {
+        if (fakeEnv != null) {
+            fakeEnv.close();
+        }
+        if (fakeEditLog != null) {
+            fakeEditLog.close();
+        }
+    }
+
     @Test
     public void testParseLoadFiles() {
         Config.cloud_delete_loaded_internal_stage_files = true;
@@ -83,16 +94,16 @@ public class CopyJobTest {
                 "org1/instance1/stage/bob/8f3b7371-c096-48ef-b81c-0eb951dd0f52", "stage/root/root");
         for (String stagePrefix : stagePrefixes) {
             Pair<List<String>, List<String>> files = generateLoadFiles(bucket, stagePrefix);
-            Assert.assertEquals(files.second, StageUtil.parseLoadFiles(files.first, bucket, stagePrefix));
+            Assertions.assertEquals(files.second, StageUtil.parseLoadFiles(files.first, bucket, stagePrefix));
         }
 
-        Assert.assertNull(StageUtil.parseLoadFiles(null, bucket, stagePrefixes.get(0)));
+        Assertions.assertNull(StageUtil.parseLoadFiles(null, bucket, stagePrefixes.get(0)));
 
-        Assert.assertNull(StageUtil.parseLoadFiles(new ArrayList<>(), bucket, "instance1/data/dbId"));
+        Assertions.assertNull(StageUtil.parseLoadFiles(new ArrayList<>(), bucket, "instance1/data/dbId"));
 
         Config.cloud_delete_loaded_internal_stage_files = false;
         Pair<List<String>, List<String>> files = generateLoadFiles(bucket, stagePrefixes.get(0));
-        Assert.assertNull(StageUtil.parseLoadFiles(files.first, bucket, stagePrefixes.get(0)));
+        Assertions.assertNull(StageUtil.parseLoadFiles(files.first, bucket, stagePrefixes.get(0)));
     }
 
     private Pair<List<String>, List<String>> generateLoadFiles(String bucket, String stagePrefix) {
@@ -140,9 +151,9 @@ public class CopyJobTest {
 
         DataInputStream in = new DataInputStream(new FileInputStream(file));
         LoadJob copyJob2 = LoadJob.read(in);
-        Assert.assertEquals(copyJob1.getDbId(), copyJob2.getDbId());
+        Assertions.assertEquals(copyJob1.getDbId(), copyJob2.getDbId());
         in.close();
         file.delete();
-        Assert.assertEquals(copyJob1.getDbId(), copyJob2.getDbId());
+        Assertions.assertEquals(copyJob1.getDbId(), copyJob2.getDbId());
     }
 }

@@ -22,12 +22,14 @@ import org.apache.doris.common.Pair;
 import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.literal.Literal;
+import org.apache.doris.nereids.trees.expressions.literal.format.DateTimeChecker;
 import org.apache.doris.nereids.types.DataType;
 import org.apache.doris.nereids.types.DateTimeType;
 import org.apache.doris.nereids.types.DateTimeV2Type;
 import org.apache.doris.nereids.types.DateType;
 import org.apache.doris.nereids.types.DateV2Type;
 import org.apache.doris.nereids.types.DecimalV3Type;
+import org.apache.doris.nereids.util.ExpressionUtils;
 import org.apache.doris.nereids.util.TypeCoercionUtils;
 
 import com.google.common.collect.Lists;
@@ -47,6 +49,9 @@ public class SearchSignature {
     private final ComputeSignature computeSignature;
     private final List<FunctionSignature> signatures;
     private final List<Expression> arguments;
+    private final boolean hasTimeStampNsArgument;
+    private final boolean hasTimeStampNsCompatibleDateTimeArgument;
+    private final boolean hasDateLikeSignature;
 
     // param1: signature type
     // param2: real argument type
@@ -59,6 +64,15 @@ public class SearchSignature {
         this.computeSignature = computeSignature;
         this.signatures = signatures;
         this.arguments = arguments;
+        this.hasTimeStampNsArgument = arguments.stream()
+                .anyMatch(argument -> argument.getDataType().isTimeStampNsType());
+        this.hasTimeStampNsCompatibleDateTimeArgument = arguments.stream()
+                .anyMatch(argument -> argument.getDataType().isDateTimeType()
+                        || argument.getDataType().isDateTimeV2Type()
+                        || argument.getDataType().isTimeStampTzType());
+        this.hasDateLikeSignature = signatures.stream().anyMatch(signature ->
+                signature.argumentsTypes.stream().anyMatch(DataType::isDateLikeType)
+                        || signature.getVarArgType().filter(DataType::isDateLikeType).isPresent());
     }
 
     public static SearchSignature from(ComputeSignature computeSignature,
@@ -81,10 +95,12 @@ public class SearchSignature {
             int candidateNonStrictMatched = Integer.MAX_VALUE;
             int candidateNonStrictMatchedWithoutStringLiteralCoercion = Integer.MAX_VALUE;
             int candidateDateToDateV2Count = Integer.MIN_VALUE;
+            int candidateTimeZoneCoersionScore = Integer.MIN_VALUE;
             FunctionSignature candidate = null;
             for (FunctionSignature signature : signatures) {
                 if (doMatchArity(signature, arguments)) {
-                    Pair<Boolean, Integer> matchTypesResult = doMatchTypes(signature, arguments, typePredicate);
+                    Pair<Boolean, Pair<Integer, Integer>> matchTypesResult =
+                                                        doMatchTypes(signature, arguments, typePredicate);
                     if (!matchTypesResult.first) {
                         continue;
                     }
@@ -106,17 +122,24 @@ public class SearchSignature {
                     Pair<Integer, Integer> currentNonStrictMatched = nonStrictMatchedCount(signature, arguments);
                     int currentNonStrictMatchedCount = currentNonStrictMatched.first;
                     int currentNonStrictMatchedWithoutStringLiteralCoercion
-                            = currentNonStrictMatchedCount - matchTypesResult.second;
+                            = currentNonStrictMatchedCount - matchTypesResult.second.first;
+                    int currentTimeZoneCoersionScore = matchTypesResult.second.second;
                     if (currentNonStrictMatchedWithoutStringLiteralCoercion
                             < candidateNonStrictMatchedWithoutStringLiteralCoercion) {
                         candidateNonStrictMatchedWithoutStringLiteralCoercion
                                 = currentNonStrictMatchedWithoutStringLiteralCoercion;
                         candidateNonStrictMatched = currentNonStrictMatchedCount;
                         candidateDateToDateV2Count = currentNonStrictMatched.second;
+                        candidateTimeZoneCoersionScore = currentTimeZoneCoersionScore;
                         candidate = signature;
                     } else if (currentNonStrictMatchedWithoutStringLiteralCoercion
                             == candidateNonStrictMatchedWithoutStringLiteralCoercion) {
-                        if (currentNonStrictMatchedCount < candidateNonStrictMatched) {
+                        if (currentTimeZoneCoersionScore > candidateTimeZoneCoersionScore) {
+                            candidateTimeZoneCoersionScore = currentTimeZoneCoersionScore;
+                            candidateNonStrictMatched = currentNonStrictMatchedCount;
+                            candidateDateToDateV2Count = currentNonStrictMatched.second;
+                            candidate = signature;
+                        } else if (currentNonStrictMatchedCount < candidateNonStrictMatched) {
                             candidateNonStrictMatched = currentNonStrictMatchedCount;
                             candidateDateToDateV2Count = currentNonStrictMatched.second;
                             candidate = signature;
@@ -226,29 +249,82 @@ public class SearchSignature {
         return Pair.of(nonStrictMatched, dateToDateV2Count);
     }
 
-    private Pair<Boolean, Integer> doMatchTypes(FunctionSignature sig, List<Expression> arguments,
+    /**
+     * Matches function signature with given arguments using the specified type predicate.
+     *
+     * @return Pair containing:
+     *         - Boolean: whether the signature can successfully match the arguments
+     *         - Pair - Integer, Integer:
+     *           - First integer: count of string literal coercions performed during matching
+     *           - Second integer: priority score for temporal literal coercion
+     */
+    private Pair<Boolean, Pair<Integer, Integer>> doMatchTypes(FunctionSignature sig, List<Expression> arguments,
             BiFunction<DataType, DataType, Boolean> typePredicate) {
         int stringLiteralCoersionCount = 0;
+        int timeZoneCoersionScore = 0;
         int arity = arguments.size();
         for (int i = 0; i < arity; i++) {
             DataType sigArgType = sig.getArgType(i);
             Expression argument = arguments.get(i);
             DataType realType = argument.getDataType();
+            if (hasTimeStampNsArgument && hasTimeStampNsCompatibleDateTimeArgument && hasDateLikeSignature
+                    && realType.isDateLikeType() && !sigArgType.isDateLikeType()) {
+                // Do not bypass temporal exactness checks through a generic string overload.
+                return Pair.of(false, Pair.of(stringLiteralCoersionCount, timeZoneCoersionScore));
+            }
+            if (hasTimeStampNsArgument && hasTimeStampNsCompatibleDateTimeArgument && hasDateLikeSignature
+                    && (realType.isTimeStampNsType() || realType.isDateTimeType()
+                            || realType.isDateTimeV2Type() || realType.isTimeStampTzType())
+                    && sigArgType.isDateLikeType() && !sigArgType.isTimeStampNsType()
+                    && !(computeSignature instanceof SupportsMixedTimeStampNsDateTime)) {
+                // Functions that need a common temporal type use the TIMESTAMP_NS overload.
+                // Functions without a common temporal result opt in to mixed physical signatures.
+                return Pair.of(false, Pair.of(stringLiteralCoersionCount, timeZoneCoersionScore));
+            }
+            if (sigArgType.isTimeStampNsType() && !hasTimeStampNsArgument) {
+                // TIMESTAMP_NS overloads preserve a typed nanosecond argument. They must not
+                // change the historical binding of character or other temporal input.
+                return Pair.of(false, Pair.of(stringLiteralCoersionCount, timeZoneCoersionScore));
+            }
+            if (sigArgType.isTimeStampNsType() && realType.isDateLikeType()
+                    && !realType.isTimeStampNsType()
+                    && !(hasTimeStampNsArgument && hasTimeStampNsCompatibleDateTimeArgument)
+                    && !TypeCoercionUtils.canExactlyCastToTimeStampNs(argument)) {
+                // Other date-like domains are wider than signed epoch nanoseconds. A typed
+                // TIMESTAMP_NS peer must not make a partial column conversion implicit.
+                return Pair.of(false, Pair.of(stringLiteralCoersionCount, timeZoneCoersionScore));
+            }
+            if (realType.isTimeStampNsType() && sigArgType.isDateLikeType()
+                    && !sigArgType.isTimeStampNsType()
+                    && !TypeCoercionUtils.canExactlyCastTimeStampNsTo(argument, sigArgType)) {
+                return Pair.of(false, Pair.of(stringLiteralCoersionCount, timeZoneCoersionScore));
+            }
             // we need to try to do string literal coercion when search signature.
             // for example, FUNC_A has two signature FUNC_A(datetime) and FUNC_A(string)
             // if SQL block is `FUNC_A('2020-02-02 00:00:00')`, we should return signature FUNC_A(datetime).
-            if (!argument.isNullLiteral() && argument.isLiteral() && realType.isStringLikeType()) {
-                realType = TypeCoercionUtils.characterLiteralTypeCoercion(((Literal) argument).getStringValue(),
+            Optional<Literal> literalAfterUnwrapNullable = ExpressionUtils.getLiteralAfterUnwrapNullable(argument);
+            if (!argument.isNullLiteral() && literalAfterUnwrapNullable.isPresent() && realType.isStringLikeType()) {
+                String literalValue = literalAfterUnwrapNullable.get().getStringValue();
+                realType = TypeCoercionUtils.characterLiteralTypeCoercion(literalValue,
                         sigArgType).orElse(argument).getDataType();
                 if (!realType.isStringLikeType()) {
                     stringLiteralCoersionCount++;
                 }
+
+                if (sigArgType.isTimeStampTzType()) {
+                    boolean hasTimeZone = DateTimeChecker.hasTimeZone(literalValue);
+                    if (hasTimeZone) {
+                        timeZoneCoersionScore++;
+                    } else {
+                        timeZoneCoersionScore--;
+                    }
+                }
             }
             if (!typePredicate.apply(sigArgType, realType)) {
-                return Pair.of(false, stringLiteralCoersionCount);
+                return Pair.of(false, Pair.of(stringLiteralCoersionCount, timeZoneCoersionScore));
             }
         }
-        return Pair.of(true, stringLiteralCoersionCount);
+        return Pair.of(true, Pair.of(stringLiteralCoersionCount, timeZoneCoersionScore));
     }
 
     public static void throwCanNotFoundFunctionException(String name, List<Expression> arguments) {

@@ -17,11 +17,12 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "common/factory_creator.h"
 #include "runtime/workload_management/task_controller.h"
 
 namespace doris {
-#include "common/compile_check_begin.h"
 
 class QueryContext;
 
@@ -33,10 +34,10 @@ public:
     ~QueryTaskController() override = default;
 
     bool is_cancelled() const override;
-    bool cancel_impl(const Status& reason, int fragment_id);
-    bool cancel_impl(const Status& reason) override { return cancel_impl(reason, -1); }
+    bool cancel_impl(const Status& reason) override;
     bool is_pure_load_task() const override;
     int32_t get_slot_count() const override;
+    void disable_reserve_memory() override;
     bool is_enable_reserve_memory() const override;
     void set_memory_sufficient(bool sufficient) override;
     int64_t memory_sufficient_time() override;
@@ -44,13 +45,22 @@ public:
                             bool* has_running_task) override;
     size_t get_revocable_size() override;
     Status revoke_memory() override;
-    std::vector<pipeline::PipelineTask*> get_revocable_tasks() override;
+    std::vector<PipelineTask*> get_revocable_tasks() override;
+    // Distinguish missing user metadata from an empty username.
+    bool get_user(std::string* user) override;
+    // Expose task progress counters without leaking full QueryContext.
+    void add_total_task_num(int delta);
+    void inc_finished_task_num();
+    int get_total_task_num() const;
+    int get_finished_task_num() const;
 
 protected:
     QueryTaskController(const std::shared_ptr<QueryContext>& query_ctx) : query_ctx_(query_ctx) {}
 
     const std::weak_ptr<QueryContext> query_ctx_;
+    // Keep task progress counters in controller so they outlive QueryContext if needed.
+    std::atomic<int> _total_task_num {0};
+    std::atomic<int> _finished_task_num {0};
 };
 
-#include "common/compile_check_end.h"
 } // namespace doris

@@ -23,6 +23,17 @@
 # Things will only be downloaded, unpacked and patched once.
 ################################################################
 
+# The shebang above only takes effect when this script is executed directly.
+# `sh download-thirdparty.sh` hands it to /bin/sh instead, which is dash on
+# Debian and Ubuntu and parses none of the `[[ ]]`, arrays and here-strings this
+# script is built on. It does not stop at the first of them either, it keeps
+# going and runs a mangled version of the script. Re-exec under bash so that the
+# way the script was invoked cannot decide whether the download works. Keep this
+# block POSIX, it has to be parsed by the shell that is about to be replaced.
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec bash "$0" "$@"
+fi
+
 set -eo pipefail
 
 curdir="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -55,8 +66,10 @@ SPEC_ARCHIVES=(
 while [[ $# -gt 0 ]]; do
     GIVEN_LIB=$1
     SPEC_LIB=
+    lc_given_lib=$(echo "${GIVEN_LIB}" | tr '[:upper:]' '[:lower:]')
     for TP_ARCH in "${TP_ARCHIVES[@]}"; do
-        if [[ "${GIVEN_LIB,,}" = "${TP_ARCH,,}" ]]; then
+        lc_tp_arch=$(echo "${TP_ARCH}" | tr '[:upper:]' '[:lower:]')
+        if [[ "${lc_given_lib}" = "${lc_tp_arch}" ]]; then
             SPEC_LIB=${TP_ARCH}
             break
         fi
@@ -72,13 +85,39 @@ while [[ $# -gt 0 ]]; do
     )
 done
 if [[ "${SPEC_LIB}" != "" ]]; then
+    # Arrow builds xsimd and Brotli from their source archives.
+    if [[ " ${SPEC_ARCHIVES[*]} " == *' ARROW '* ]]; then
+        for arrow_companion in XSIMD BROTLI; do
+            if [[ " ${SPEC_ARCHIVES[*]} " != *" ${arrow_companion} "* ]]; then
+                SPEC_ARCHIVES+=("${arrow_companion}")
+            fi
+        done
+    fi
+
+    # ARROW_ADBC_FLIGHTSQL is a companion archive of arrow_adbc rather than a
+    # package of its own: it has no build function, build_arrow_adbc() only copies
+    # the prebuilt driver out of it. Its name therefore never appears on a command
+    # line, so narrowing to the named entries alone leaves it unfetched and
+    # `build-thirdparty.sh arrow_adbc` dies on the missing source directory.
+    if [[ -n "${ARROW_ADBC_FLIGHTSQL_SOURCE}" ]] &&
+        [[ " ${SPEC_ARCHIVES[*]} " == *' ARROW_ADBC '* ]] &&
+        [[ " ${SPEC_ARCHIVES[*]} " != *' ARROW_ADBC_FLIGHTSQL '* ]]; then
+        SPEC_ARCHIVES+=('ARROW_ADBC_FLIGHTSQL')
+    fi
     TP_ARCHIVES=("${SPEC_ARCHIVES[@]}")
     echo "Download and build specified libs only: ${TP_ARCHIVES[*]}"
 fi
 
 md5sum_bin='md5sum'
 if ! command -v "${md5sum_bin}" >/dev/null 2>&1; then
-    echo "Warn: md5sum is not installed"
+    # macOS ships BSD md5 rather than GNU md5sum. Giving up on verification there
+    # is not a neutral loss: `wget -O` creates its output file before the transfer,
+    # so a failed download leaves a 0-byte file behind, and an unverified retry
+    # then reports it as a valid cached archive and carries on.
+    md5sum_bin='md5'
+fi
+if ! command -v "${md5sum_bin}" >/dev/null 2>&1; then
+    echo "Warn: neither md5sum nor md5 is installed, archives will not be verified"
     md5sum_bin=""
 fi
 
@@ -90,15 +129,32 @@ md5sum_func() {
 
     if [[ "${md5sum_bin}" == "" ]]; then
         return 0
+    fi
+
+    # Compare the digest alone, the two tools disagree on everything around it.
+    if [[ "${md5sum_bin}" == 'md5' ]]; then
+        md5="$("${md5sum_bin}" -q "${DESC_DIR}/${FILENAME}")"
     else
-        md5="$(md5sum "${DESC_DIR}/${FILENAME}")"
-        if [[ "${md5}" != "${MD5SUM}  ${DESC_DIR}/${FILENAME}" ]]; then
-            echo "${DESC_DIR}/${FILENAME} md5sum check failed!"
-            echo -e "except-md5 ${MD5SUM} \nactual-md5 ${md5}"
-            return 1
-        fi
+        md5="$("${md5sum_bin}" "${DESC_DIR}/${FILENAME}" | awk '{ print $1 }')"
+    fi
+    if [[ "${md5}" != "${MD5SUM}" ]]; then
+        echo "${DESC_DIR}/${FILENAME} md5sum check failed!"
+        echo -e "except-md5 ${MD5SUM} \nactual-md5 ${md5}"
+        return 1
     fi
     return 0
+}
+
+is_git_package() {
+    local TP_ARCH="$1"
+    local GIT_URL_VAR="${TP_ARCH}_GIT_URL"
+    [[ -n "${!GIT_URL_VAR}" ]]
+}
+
+git_url_for() {
+    local TP_ARCH="$1"
+    local GIT_URL_VAR="${TP_ARCH}_GIT_URL"
+    echo "${!GIT_URL_VAR}"
 }
 
 # return 0 if download succeed.
@@ -154,27 +210,44 @@ download_func() {
     return "${STATUS}"
 }
 
+download_with_fallbacks() {
+    local FILENAME="$1"
+    local DESC_DIR="$2"
+    local MD5SUM="$3"
+    shift 3
+
+    local DOWNLOAD_URL=""
+    for DOWNLOAD_URL in "$@"; do
+        [[ -n "${DOWNLOAD_URL}" ]] || continue
+        if download_func "${FILENAME}" "${DOWNLOAD_URL}" "${DESC_DIR}" "${MD5SUM}"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 # download thirdparty archives
 echo "===== Downloading thirdparty archives..."
 for TP_ARCH in "${TP_ARCHIVES[@]}"; do
+    if is_git_package "${TP_ARCH}"; then
+        echo "Skip downloading ${TP_ARCH} (git repo: $(git_url_for "${TP_ARCH}"))"
+        continue
+    fi
     NAME="${TP_ARCH}_NAME"
     MD5SUM="${TP_ARCH}_MD5SUM"
-    if [[ -z "${REPOSITORY_URL}" ]]; then
-        URL="${TP_ARCH}_DOWNLOAD"
-        if ! download_func "${!NAME}" "${!URL}" "${TP_SOURCE_DIR}" "${!MD5SUM}"; then
-            echo "Failed to download ${!NAME}"
-            exit 1
-        fi
-    else
-        URL="${REPOSITORY_URL}/${!NAME}"
-        if ! download_func "${!NAME}" "${URL}" "${TP_SOURCE_DIR}" "${!MD5SUM}"; then
-            #try to download from home
-            URL="${TP_ARCH}_DOWNLOAD"
-            if ! download_func "${!NAME}" "${!URL}" "${TP_SOURCE_DIR}" "${!MD5SUM}"; then
-                echo "Failed to download ${!NAME}"
-                exit 1 # download failed again exit.
-            fi
-        fi
+    URL="${TP_ARCH}_DOWNLOAD"
+    FALLBACK_URL="${TP_ARCH}_FALLBACK_DOWNLOAD"
+    DOWNLOAD_URLS=()
+    if [[ -n "${REPOSITORY_URL}" ]]; then
+        DOWNLOAD_URLS+=("${REPOSITORY_URL%/}/${!NAME}")
+    fi
+    DOWNLOAD_URLS+=("${!URL}")
+    if [[ -n "${!FALLBACK_URL}" ]]; then
+        DOWNLOAD_URLS+=("${!FALLBACK_URL}")
+    fi
+    if ! download_with_fallbacks "${!NAME}" "${TP_SOURCE_DIR}" "${!MD5SUM}" "${DOWNLOAD_URLS[@]}"; then
+        echo "Failed to download ${!NAME}"
+        exit 1
     fi
 done
 echo "===== Downloading thirdparty archives...done"
@@ -182,6 +255,9 @@ echo "===== Downloading thirdparty archives...done"
 # check if all tp archives exists
 echo "===== Checking all thirdpart archives..."
 for TP_ARCH in "${TP_ARCHIVES[@]}"; do
+    if is_git_package "${TP_ARCH}"; then
+        continue
+    fi
     NAME="${TP_ARCH}_NAME"
     if [[ ! -r "${TP_SOURCE_DIR}/${!NAME}" ]]; then
         echo "Failed to fetch ${!NAME}"
@@ -199,6 +275,9 @@ SUFFIX_XZ="\.tar\.xz$"
 SUFFIX_ZIP="\.zip$"
 SUFFIX_BZ2="\.tar\.bz2$"
 for TP_ARCH in "${TP_ARCHIVES[@]}"; do
+    if is_git_package "${TP_ARCH}"; then
+        continue
+    fi
     NAME="${TP_ARCH}_NAME"
     SOURCE="${TP_ARCH}_SOURCE"
 
@@ -237,6 +316,57 @@ for TP_ARCH in "${TP_ARCHIVES[@]}"; do
     fi
 done
 echo "===== Unpacking all thirdparty archives...done"
+
+# Clone and checkout git repositories
+echo "===== Cloning git repositories..."
+for TP_ARCH in "${TP_ARCHIVES[@]}"; do
+    if ! is_git_package "${TP_ARCH}"; then
+        continue
+    fi
+
+    GIT_URL_VAR="${TP_ARCH}_GIT_URL"
+    GIT_TAG_VAR="${TP_ARCH}_GIT_TAG"
+    SOURCE_VAR="${TP_ARCH}_SOURCE"
+    
+    GIT_URL="${!GIT_URL_VAR}"
+    GIT_TAG="${!GIT_TAG_VAR}"
+    SOURCE_DIR="${TP_SOURCE_DIR}/${!SOURCE_VAR}"
+
+    if [[ -z "${GIT_URL}" ]] || [[ -z "${GIT_TAG}" ]] || [[ -z "${!SOURCE_VAR}" ]]; then
+        echo "Warning: ${TP_ARCH} git configuration incomplete, skipping"
+        continue
+    fi
+
+    if [[ ! -d "${SOURCE_DIR}" ]]; then
+        echo "Cloning ${TP_ARCH} from ${GIT_URL}..."
+        cd "${TP_SOURCE_DIR}"
+        if ! git clone "${GIT_URL}" "${!SOURCE_VAR}"; then
+            echo "Failed to clone ${TP_ARCH}"
+            exit 1
+        fi
+    else
+        echo "${TP_ARCH} repository already exists, updating..."
+        cd "${SOURCE_DIR}"
+        git fetch origin || true
+    fi
+
+    cd "${SOURCE_DIR}"
+    if ! git checkout "${GIT_TAG}" 2>/dev/null; then
+        echo "Tag ${GIT_TAG} not found, trying to fetch..."
+        is_shallow="$(git rev-parse --is-shallow-repository 2>/dev/null || echo false)"
+        if [[ "${is_shallow}" == "true" ]]; then
+            git fetch --unshallow origin || git fetch --depth=2147483647 origin
+        else
+            git fetch origin
+        fi
+        if ! git checkout "${GIT_TAG}"; then
+            echo "Failed to checkout ${GIT_TAG} for ${TP_ARCH}"
+            exit 1
+        fi
+    fi
+    echo "Successfully checked out ${GIT_TAG} for ${TP_ARCH}"
+done
+echo "===== Cloning git repositories...done"
 
 echo "===== Patching thirdparty archives..."
 
@@ -339,7 +469,32 @@ if [[ " ${TP_ARCHIVES[*]} " =~ " ARROW " ]]; then
         fi
         cd -
     fi
+    if [[ "${ARROW_SOURCE}" == "arrow-apache-arrow-24.0.0" ]]; then
+        cd "${TP_SOURCE_DIR}/${ARROW_SOURCE}"
+        if [[ ! -f "${PATCHED_MARK}" ]]; then
+            # Introducing the parameter that forces writing INT96 timestamps for
+            # compatibility with the Doris Parquet writer.
+            patch -p1 <"${TP_PATCH_DIR}/apache-arrow-24.0.0-force-write-int96-timestamps.patch"
+
+            # Add Parquet LZO page decompression support used by file scanner v2.
+            patch -p1 <"${TP_PATCH_DIR}/apache-arrow-24.0.0-lzo.patch"
+            touch "${PATCHED_MARK}"
+        fi
+        cd -
+    fi
     echo "Finished patching ${ARROW_SOURCE}"
+fi
+
+# arrow-adbc patch adds the pre-generated JNI header, so that building the JNI
+# bridge needs no Maven. See the patch header for how to regenerate it.
+if [[ " ${TP_ARCHIVES[*]} " =~ " ARROW_ADBC " ]]; then
+    cd "${TP_SOURCE_DIR}/${ARROW_ADBC_SOURCE}"
+    if [[ ! -f "${PATCHED_MARK}" ]]; then
+        patch -p1 <"${TP_PATCH_DIR}/apache-arrow-adbc-24-pregenerated-jni-header.patch"
+        touch "${PATCHED_MARK}"
+    fi
+    cd -
+    echo "Finished patching ${ARROW_ADBC_SOURCE}"
 fi
 
 # patch librdkafka to avoid crash
@@ -366,6 +521,20 @@ if [[ " ${TP_ARCHIVES[*]} " =~ " JEMALLOC_DORIS " ]]; then
         cd -
     fi
     echo "Finished patching ${JEMALLOC_DORIS_SOURCE}"
+fi
+
+# patch libunwind so Doris can force GNU libunwind to use the BE PHDR cache
+# without changing ordinary dl_iterate_phdr callers.
+if [[ " ${TP_ARCHIVES[*]} " =~ " LIBUNWIND " ]]; then
+    if [[ "${LIBUNWIND_SOURCE}" = "libunwind-1.8.3" ]]; then
+        cd "${TP_SOURCE_DIR}/${LIBUNWIND_SOURCE}"
+        if [[ ! -f "${PATCHED_MARK}" ]]; then
+            patch -p1 <"${TP_PATCH_DIR}/libunwind-1.8.3-doris-phdr-cache.patch"
+            touch "${PATCHED_MARK}"
+        fi
+        cd -
+    fi
+    echo "Finished patching ${LIBUNWIND_SOURCE}"
 fi
 
 # patch hyperscan
@@ -524,6 +693,19 @@ if [[ " ${TP_ARCHIVES[*]} " =~ " KRB5 " ]]; then
     echo "Finished patching ${KRB5_SOURCE}"
 fi
 
+# patch libhdfs3
+if [[ " ${TP_ARCHIVES[*]} " =~ " HDFS3 " ]]; then
+    if [[ "${HDFS3_SOURCE}" == "doris-thirdparty-libhdfs3-v2.3.9" ]]; then
+        cd "${TP_SOURCE_DIR}/${HDFS3_SOURCE}"
+        if [[ ! -f "${PATCHED_MARK}" ]]; then
+            patch -p1 <"${TP_PATCH_DIR}/libhdfs3-v2.3.9-hostname.patch"
+            touch "${PATCHED_MARK}"
+        fi
+        cd -
+    fi
+    echo "Finished patching ${HDFS3_SOURCE}"
+fi
+
 # patch bitshuffle
 MACHINE_OS=$(uname -s)
 
@@ -541,22 +723,6 @@ else
         fi
         echo "Finished patching ${BITSHUFFLE_SOURCE}"
     fi
-fi
-
-# patch thrift
-if [[ " ${TP_ARCHIVES[*]} " =~ " THRIFT " ]]; then
-    if [[ "${THRIFT_SOURCE}" == 'thrift-0.16.0' ]]; then
-        cd "${TP_SOURCE_DIR}/${THRIFT_SOURCE}"
-        if [[ ! -f "${PATCHED_MARK}" ]]; then
-            for patch_file in "${TP_PATCH_DIR}"/thrift-*; do
-                echo "patch ${patch_file}"
-                patch -p1 --ignore-whitespace <"${patch_file}"
-            done
-            touch "${PATCHED_MARK}"
-        fi
-        cd -
-    fi
-    echo "Finished patching ${THRIFT_SOURCE}"
 fi
 
 # patch re2
@@ -586,6 +752,22 @@ if [[ " ${TP_ARCHIVES[*]} " =~ " AZURE " ]]; then
     echo "Finished patching ${AZURE_SOURCE}"
 fi
 
+# Apply Doris lance-c patches.
+if [[ " ${TP_ARCHIVES[*]} " =~ " LANCE_C " ]]; then
+    if [[ "${LANCE_C_SOURCE}" == "lance-c-0.1.9" ]]; then
+        cd "${TP_SOURCE_DIR}/${LANCE_C_SOURCE}"
+        if [[ ! -f "${PATCHED_MARK}" ]]; then
+            patch --batch --forward --reject-file=- --fuzz=0 --no-backup-if-mismatch -s \
+                -p1 <"${TP_PATCH_DIR}/lance-c-0.1.9-pr-73.patch"
+            patch --batch --forward --reject-file=- --fuzz=0 --no-backup-if-mismatch -s \
+                -p1 <"${TP_PATCH_DIR}/lance-c-0.1.9-pr-74.patch"
+            touch "${PATCHED_MARK}"
+        fi
+        cd -
+    fi
+    echo "Finished patching ${LANCE_C_SOURCE}"
+fi
+
 if [[ " ${TP_ARCHIVES[*]} " =~ " CCTZ " ]] ; then
     cd $TP_SOURCE_DIR/$CCTZ_SOURCE
     if [[ ! -f "$PATCHED_MARK" ]] ; then
@@ -597,6 +779,19 @@ if [[ " ${TP_ARCHIVES[*]} " =~ " CCTZ " ]] ; then
     fi
     cd -
     echo "Finished patching ${CCTZ_SOURCE}"
+fi
+
+# boost patch to fix sigtimedwait not available on macOS
+if [[ " ${TP_ARCHIVES[*]} " =~ " BOOST " ]]; then
+    cd "${TP_SOURCE_DIR}/${BOOST_SOURCE}"
+    if [[ ! -f "${PATCHED_MARK}" ]]; then
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+            patch -p1 <"${TP_PATCH_DIR}/boost-1.81.0-mac-sigtimedwait.patch"
+        fi
+        touch "${PATCHED_MARK}"
+    fi
+    cd -
+    echo "Finished patching ${BOOST_SOURCE}"
 fi
 
 # vim: ts=4 sw=4 ts=4 tw=100:

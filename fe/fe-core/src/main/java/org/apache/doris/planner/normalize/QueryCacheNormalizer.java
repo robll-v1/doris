@@ -21,16 +21,20 @@
 package org.apache.doris.planner.normalize;
 
 import org.apache.doris.analysis.DescriptorTable;
+import org.apache.doris.catalog.KeysType;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Tablet;
 import org.apache.doris.common.Pair;
 import org.apache.doris.planner.AggregationNode;
+import org.apache.doris.planner.ExchangeNode;
 import org.apache.doris.planner.OlapScanNode;
 import org.apache.doris.planner.PlanFragment;
 import org.apache.doris.planner.PlanNode;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.qe.SessionVariable;
 import org.apache.doris.thrift.TNormalizedPlanNode;
 import org.apache.doris.thrift.TQueryCacheParam;
+import org.apache.doris.thrift.TStringLiteral;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
@@ -52,9 +56,9 @@ import java.util.stream.Collectors;
 public class QueryCacheNormalizer implements Normalizer {
     private final PlanFragment fragment;
     private final DescriptorTable descriptorTable;
-    private final NormalizedIdGenerator normalizedPlanIds =  new NormalizedIdGenerator();
-    private final NormalizedIdGenerator normalizedTupleIds =  new NormalizedIdGenerator();
-    private final NormalizedIdGenerator normalizedSlotIds =  new NormalizedIdGenerator();
+    private final NormalizedIdGenerator normalizedPlanIds = new NormalizedIdGenerator();
+    private final NormalizedIdGenerator normalizedTupleIds = new NormalizedIdGenerator();
+    private final NormalizedIdGenerator normalizedSlotIds = new NormalizedIdGenerator();
 
     // result
     private final TQueryCacheParam queryCacheParam = new TQueryCacheParam();
@@ -71,7 +75,7 @@ public class QueryCacheNormalizer implements Normalizer {
                 return Optional.empty();
             }
             List<TNormalizedPlanNode> normalizedDigestPlans = normalizePlanTree(context, cachePoint.get());
-            byte[] digest = computeDigest(normalizedDigestPlans);
+            byte[] digest = computeDigest(context, normalizedDigestPlans);
             return setQueryCacheParam(cachePoint.get(), digest, context);
         } catch (Throwable t) {
             return Optional.empty();
@@ -89,11 +93,13 @@ public class QueryCacheNormalizer implements Normalizer {
 
     private Optional<TQueryCacheParam> setQueryCacheParam(
             CachePoint cachePoint, byte[] digest, ConnectContext context) {
+        SessionVariable sessionVariable = context.getSessionVariable();
         queryCacheParam.setNodeId(cachePoint.cacheRoot.getId().asInt());
         queryCacheParam.setDigest(digest);
-        queryCacheParam.setForceRefreshQueryCache(context.getSessionVariable().isQueryCacheForceRefresh());
-        queryCacheParam.setEntryMaxBytes(context.getSessionVariable().getQueryCacheEntryMaxBytes());
-        queryCacheParam.setEntryMaxRows(context.getSessionVariable().getQueryCacheEntryMaxRows());
+        queryCacheParam.setForceRefreshQueryCache(sessionVariable.isQueryCacheForceRefresh());
+        queryCacheParam.setEntryMaxBytes(sessionVariable.getQueryCacheEntryMaxBytes());
+        queryCacheParam.setEntryMaxRows(sessionVariable.getQueryCacheEntryMaxRows());
+        queryCacheParam.setAllowIncremental(computeAllowIncremental(cachePoint, sessionVariable));
 
         queryCacheParam.setOutputSlotMapping(
                 cachePoint.cacheRoot.getOutputTupleIds()
@@ -121,15 +127,92 @@ public class QueryCacheNormalizer implements Normalizer {
         if (planRoot instanceof AggregationNode) {
             PlanNode child = planRoot.getChild(0);
             if (child instanceof OlapScanNode) {
-                return Optional.of(new CachePoint(planRoot, planRoot));
+                if (((AggregationNode) planRoot).isQueryCacheCandidate()) {
+                    return Optional.of(new CachePoint(planRoot, planRoot));
+                }
             } else if (child instanceof AggregationNode) {
                 Optional<CachePoint> childCachePoint = doComputeCachePoint(child);
                 if (childCachePoint.isPresent()) {
-                    return Optional.of(new CachePoint(planRoot, planRoot));
+                    if (((AggregationNode) planRoot).isQueryCacheCandidate()) {
+                        return Optional.of(new CachePoint(planRoot, planRoot));
+                    }
+                    return childCachePoint;
                 }
             }
+        } else if (planRoot instanceof ExchangeNode) {
+            return Optional.empty();
+        } else if (planRoot.getChildren().size() == 1) {
+            return doComputeCachePoint(planRoot.getChildren().get(0));
         }
         return Optional.empty();
+    }
+
+    /**
+     * Decide whether BE may serve a stale cache entry by scanning only the delta
+     * rowsets since the cached version and emitting them together with the cached
+     * partial aggregation blocks (the upstream aggregation merges both).
+     *
+     * <p>This is only correct when all of the following hold:
+     * <ul>
+     * <li>The cache point aggregation does not finalize: its output is a partial
+     * state that an upstream aggregation always merges, so emitting the cached
+     * blocks and the delta blocks side by side yields the correct result. A
+     * finalized output has no downstream merge, and the two emissions would
+     * produce duplicated group keys.</li>
+     * <li>The cache point aggregates the raw detail rows directly (its child is
+     * the olap scan node): with another aggregation in between, that inner
+     * aggregation would see only the delta rows during an incremental run, and
+     * its finalized output over the delta is not a mergeable complement of its
+     * output over the cached snapshot.</li>
+     * <li>The scanned index is append-only, guaranteeing "cached snapshot +
+     * delta rowsets == new snapshot": either DUP_KEYS, or merge-on-write
+     * UNIQUE_KEYS, for which BE additionally verifies per tablet (through the
+     * delete bitmap of the delta window) that no pre-existing key was rewritten
+     * and falls back otherwise. Merge-on-read UNIQUE resolves duplicates by
+     * merging across rowsets at read time, so a delta-only scan cannot stand
+     * alone there; AGG tables merge rows inside the storage layer likewise.
+     * DELETE predicates are handled on BE: a delta containing delete predicates
+     * falls back to a full recompute.</li>
+     * </ul>
+     */
+    private boolean computeAllowIncremental(CachePoint cachePoint, SessionVariable sessionVariable) {
+        if (!sessionVariable.getEnableQueryCacheIncremental()) {
+            return false;
+        }
+        // The cache point is always an aggregation node (see doComputeCachePoint).
+        if (((AggregationNode) cachePoint.cacheRoot).isNeedsFinalize()) {
+            return false;
+        }
+        // The cached partial state and the delta partial state merge correctly
+        // only when the cache point aggregates the raw detail rows directly.
+        // With a nested cache point (partial agg over a finalized/deduplicating
+        // agg over scan), the inner agg sees only the delta rows during an
+        // incremental run, so its finalized output over the delta is NOT a
+        // mergeable complement of its output over the cached snapshot (e.g.
+        // "group by cnt" buckets computed from partial counts are simply wrong).
+        if (!(cachePoint.cacheRoot.getChild(0) instanceof OlapScanNode)) {
+            return false;
+        }
+        OlapScanNode scanNode = (OlapScanNode) cachePoint.cacheRoot.getChild(0);
+        OlapTable olapTable = scanNode.getOlapTable();
+        long selectIndexId = scanNode.getSelectedIndexId() == -1
+                ? olapTable.getBaseIndexId()
+                : scanNode.getSelectedIndexId();
+        // Note: judged on the selected index, not the base table: a DUP table
+        // may serve the query from an aggregated materialized view, whose data
+        // is no longer append-only.
+        KeysType keysType = olapTable.getKeysTypeByIndexId(selectIndexId);
+        if (keysType == KeysType.DUP_KEYS) {
+            return true;
+        }
+        // A merge-on-write UNIQUE index is append-only as long as a load does
+        // not touch pre-existing keys, which covers the common "hourly append
+        // plus occasional backfill" pattern: BE verifies per tablet through
+        // the delete bitmap of the delta window and falls back to a full
+        // recompute for the rare load that rewrites history. A merge-on-read
+        // UNIQUE index resolves duplicates by merging across rowsets at read
+        // time, so a delta-only scan cannot stand alone there.
+        return keysType == KeysType.UNIQUE_KEYS && olapTable.getEnableUniqueKeyMergeOnWrite();
     }
 
     private List<TNormalizedPlanNode> normalizePlanTree(ConnectContext context, CachePoint cachePoint) {
@@ -146,13 +229,20 @@ public class QueryCacheNormalizer implements Normalizer {
         normalizedPlans.add(plan.normalize(this));
     }
 
-    public static byte[] computeDigest(List<TNormalizedPlanNode> normalizedDigestPlans) throws Exception {
+    public static byte[] computeDigest(
+            ConnectContext context, List<TNormalizedPlanNode> normalizedDigestPlans) throws Exception {
         TSerializer serializer = new TSerializer(new TCompactProtocol.Factory());
         MessageDigest digest = MessageDigest.getInstance("SHA-256");
 
         for (TNormalizedPlanNode node : normalizedDigestPlans) {
             digest.update(serializer.serialize(node));
         }
+
+        StringBuffer variables = new StringBuffer();
+        context.getSessionVariable().readAffectQueryResultVariables((k, v) -> {
+            variables.append(k).append("=").append(v).append("|");
+        });
+        digest.update(serializer.serialize(new TStringLiteral(variables.toString())));
         return digest.digest();
     }
 

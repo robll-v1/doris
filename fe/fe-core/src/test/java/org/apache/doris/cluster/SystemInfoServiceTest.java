@@ -19,6 +19,7 @@ package org.apache.doris.cluster;
 
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
+import org.apache.doris.catalog.LocalTabletInvertedIndex;
 import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.TabletInvertedIndex;
 import org.apache.doris.common.AnalysisException;
@@ -36,11 +37,12 @@ import org.apache.doris.system.SystemInfoService;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import mockit.Expectations;
-import mockit.Mocked;
-import org.junit.Assert;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.MockedStatic;
+import org.mockito.Mockito;
 
 import java.io.BufferedInputStream;
 import java.io.DataInputStream;
@@ -51,86 +53,45 @@ import java.io.IOException;
 
 public class SystemInfoServiceTest {
 
-    @Mocked
-    private EditLog editLog;
-    @Mocked
-    private Env env;
-    @Mocked
-    private InternalCatalog catalog;
+    private EditLog editLog = Mockito.mock(EditLog.class);
+    private Env env = Mockito.mock(Env.class);
+    private InternalCatalog catalog = Mockito.mock(InternalCatalog.class);
     private SystemInfoService systemInfoService;
     private TabletInvertedIndex invertedIndex;
-    @Mocked
-    private Database db;
-    @Mocked
-    private Table table;
+    private Database db = Mockito.mock(Database.class);
+    private Table table = Mockito.mock(Table.class);
+    private MockedStatic<Env> mockedEnvStatic;
 
 
     private String hostPort;
 
     private long backendId = 10000L;
 
-    @Before
+    @BeforeEach
     public void setUp() throws IOException {
-        new Expectations() {
-            {
-                editLog.logAddBackend((Backend) any);
-                minTimes = 0;
+        mockedEnvStatic = Mockito.mockStatic(Env.class);
 
-                editLog.logDropBackend((Backend) any);
-                minTimes = 0;
+        Mockito.when(env.getNextId()).thenReturn(backendId);
+        Mockito.when(env.getEditLog()).thenReturn(editLog);
+        Mockito.when(env.getInternalCatalog()).thenReturn(catalog);
+        Mockito.when(catalog.getDbNullable(Mockito.anyLong())).thenReturn(db);
+        Mockito.when(db.getTableNullable(Mockito.anyLong())).thenReturn(table);
 
-                editLog.logBackendStateChange((Backend) any);
-                minTimes = 0;
+        systemInfoService = new SystemInfoService();
+        invertedIndex = new LocalTabletInvertedIndex();
 
-                table.readLock();
-                minTimes = 0;
+        mockedEnvStatic.when(Env::getCurrentEnv).thenReturn(env);
+        mockedEnvStatic.when(Env::getCurrentInternalCatalog).thenReturn(catalog);
+        mockedEnvStatic.when(Env::getCurrentSystemInfo).thenReturn(systemInfoService);
+        mockedEnvStatic.when(Env::getCurrentInvertedIndex).thenReturn(invertedIndex);
+        mockedEnvStatic.when(Env::getCurrentEnvJournalVersion).thenReturn(FeConstants.meta_version);
+    }
 
-                table.readUnlock();
-                minTimes = 0;
-
-                env.getNextId();
-                minTimes = 0;
-                result = backendId;
-
-                env.getEditLog();
-                minTimes = 0;
-                result = editLog;
-
-                env.getInternalCatalog();
-                minTimes = 0;
-                result = catalog;
-
-                catalog.getDbNullable(anyLong);
-                minTimes = 0;
-                result = db;
-
-                db.getTableNullable(anyLong);
-                minTimes = 0;
-                result = table;
-
-                env.clear();
-                minTimes = 0;
-
-                Env.getCurrentEnv();
-                minTimes = 0;
-                result = env;
-
-                systemInfoService = new SystemInfoService();
-                Env.getCurrentSystemInfo();
-                minTimes = 0;
-                result = systemInfoService;
-
-                invertedIndex = new TabletInvertedIndex();
-                Env.getCurrentInvertedIndex();
-                minTimes = 0;
-                result = invertedIndex;
-
-                Env.getCurrentEnvJournalVersion();
-                minTimes = 0;
-                result = FeConstants.meta_version;
-            }
-        };
-
+    @AfterEach
+    public void tearDown() {
+        if (mockedEnvStatic != null) {
+            mockedEnvStatic.close();
+        }
     }
 
     public void mkdir(String dirString) {
@@ -188,16 +149,20 @@ public class SystemInfoServiceTest {
         Env.getCurrentSystemInfo().dropAllBackend();
     }
 
-    @Test(expected = AnalysisException.class)
+    @Test
     public void validHostAndPortTest1() throws Exception {
-        createHostAndPort(1);
-        systemInfoService.validateHostAndPort(hostPort);
+        Assertions.assertThrows(AnalysisException.class, () -> {
+            createHostAndPort(1);
+            systemInfoService.validateHostAndPort(hostPort);
+        });
     }
 
-    @Test(expected = AnalysisException.class)
+    @Test
     public void validHostAndPortTest3() throws Exception {
-        createHostAndPort(3);
-        systemInfoService.validateHostAndPort(hostPort);
+        Assertions.assertThrows(AnalysisException.class, () -> {
+            createHostAndPort(3);
+            systemInfoService.validateHostAndPort(hostPort);
+        });
     }
 
     @Test
@@ -214,25 +179,25 @@ public class SystemInfoServiceTest {
         try {
             Env.getCurrentSystemInfo().addBackends(op.getHostInfos(), true);
         } catch (DdlException e) {
-            Assert.fail();
+            Assertions.fail();
         }
 
         try {
             Env.getCurrentSystemInfo().addBackends(op.getHostInfos(), true);
         } catch (DdlException e) {
-            Assert.assertTrue(e.getMessage().contains("already exists"));
+            Assertions.assertTrue(e.getMessage().contains("already exists"));
         }
 
-        Assert.assertNotNull(Env.getCurrentSystemInfo().getBackend(backendId));
-        Assert.assertNotNull(Env.getCurrentSystemInfo().getBackendWithHeartbeatPort("192.168.0.1", 1234));
+        Assertions.assertNotNull(Env.getCurrentSystemInfo().getBackend(backendId));
+        Assertions.assertNotNull(Env.getCurrentSystemInfo().getBackendWithHeartbeatPort("192.168.0.1", 1234));
 
-        Assert.assertTrue(Env.getCurrentSystemInfo().getAllBackendIds(false).size() == 1);
-        Assert.assertTrue(Env.getCurrentSystemInfo().getAllBackendIds(false).get(0) == backendId);
+        Assertions.assertTrue(Env.getCurrentSystemInfo().getAllBackendIds(false).size() == 1);
+        Assertions.assertTrue(Env.getCurrentSystemInfo().getAllBackendIds(false).get(0) == backendId);
 
-        Assert.assertTrue(Env.getCurrentSystemInfo().getBackendReportVersion(backendId) == 0L);
+        Assertions.assertTrue(Env.getCurrentSystemInfo().getBackendReportVersion(backendId) == 0L);
 
         Env.getCurrentSystemInfo().updateBackendReportVersion(backendId, 2L, 20000L, 30000L, true);
-        Assert.assertTrue(Env.getCurrentSystemInfo().getBackendReportVersion(backendId) == 2L);
+        Assertions.assertTrue(Env.getCurrentSystemInfo().getBackendReportVersion(backendId) == 2L);
     }
 
     @Test
@@ -252,13 +217,13 @@ public class SystemInfoServiceTest {
             Env.getCurrentSystemInfo().dropBackends(dropBackendOp.getHostInfos());
         } catch (DdlException e) {
             e.printStackTrace();
-            Assert.fail();
+            Assertions.fail();
         }
 
         try {
             Env.getCurrentSystemInfo().dropBackends(dropBackendOp.getHostInfos());
         } catch (DdlException e) {
-            Assert.assertTrue(e.getMessage().contains("does not exist"));
+            Assertions.assertTrue(e.getMessage().contains("does not exist"));
         }
     }
 
@@ -279,13 +244,13 @@ public class SystemInfoServiceTest {
             Env.getCurrentSystemInfo().dropBackends(dropBackendOp.getHostInfos());
         } catch (DdlException e) {
             e.printStackTrace();
-            Assert.fail();
+            Assertions.fail();
         }
 
         try {
             Env.getCurrentSystemInfo().dropBackends(dropBackendOp.getHostInfos());
         } catch (DdlException e) {
-            Assert.assertTrue(e.getMessage().contains("does not exist"));
+            Assertions.assertTrue(e.getMessage().contains("does not exist"));
         }
     }
 
@@ -308,10 +273,10 @@ public class SystemInfoServiceTest {
 
         DataInputStream dis = new DataInputStream(new BufferedInputStream(new FileInputStream(file)));
         long checksum2 = systemInfoService.loadBackends(dis, 0);
-        Assert.assertEquals(checksum1, checksum2);
-        Assert.assertEquals(1, systemInfoService.getAllBackendsByAllCluster().size());
+        Assertions.assertEquals(checksum1, checksum2);
+        Assertions.assertEquals(1, systemInfoService.getAllBackendsByAllCluster().size());
         Backend back2 = systemInfoService.getBackend(1);
-        Assert.assertEquals(back1, back2);
+        Assertions.assertEquals(back1, back2);
         dis.close();
 
         deleteDir(dir);

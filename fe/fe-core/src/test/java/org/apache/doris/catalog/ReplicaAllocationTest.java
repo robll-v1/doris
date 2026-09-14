@@ -29,12 +29,12 @@ import org.apache.doris.system.SystemInfoService;
 import org.apache.doris.thrift.TStorageMedium;
 
 import com.google.common.collect.Maps;
-import mockit.Delegate;
-import mockit.Expectations;
-import mockit.Mocked;
-import org.junit.Assert;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.MockedStatic;
+import org.mockito.Mockito;
 
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
@@ -42,63 +42,67 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.List;
 import java.util.Map;
 
 public class ReplicaAllocationTest {
-    @Mocked
-    SystemInfoService systemInfoService;
+    private SystemInfoService systemInfoService = Mockito.mock(SystemInfoService.class);
+    private MockedStatic<Env> mockedEnvStatic;
 
-    @Before
+    @BeforeEach
     public void setUp() throws DdlException {
-        new Expectations() {
-            {
-                systemInfoService.selectBackendIdsForReplicaCreation((ReplicaAllocation) any, Maps.newHashMap(),
-                        (TStorageMedium) any, false, true);
-                minTimes = 0;
-                result = new Delegate() {
-                    Pair<Map<Tag, List<Long>>, TStorageMedium> selectBackendIdsForReplicaCreation() {
-                        return Pair.of(Maps.newHashMap(), TStorageMedium.HDD);
-                    }
-                };
-            }
-        };
+        mockedEnvStatic = Mockito.mockStatic(Env.class);
+        mockedEnvStatic.when(Env::getCurrentSystemInfo).thenReturn(systemInfoService);
+
+        Mockito.doAnswer(invocation -> Pair.of(Maps.newHashMap(), TStorageMedium.HDD))
+                .when(systemInfoService).selectBackendIdsForReplicaCreation(
+                        Mockito.any(ReplicaAllocation.class),
+                        Mockito.anyMap(),
+                        Mockito.nullable(TStorageMedium.class),
+                        Mockito.eq(false),
+                        Mockito.eq(true));
+    }
+
+    @AfterEach
+    public void tearDown() {
+        if (mockedEnvStatic != null) {
+            mockedEnvStatic.close();
+        }
     }
 
     @Test
     public void testNormal() throws AnalysisException {
         // DEFAULT_ALLOCATION
         ReplicaAllocation replicaAlloc = ReplicaAllocation.DEFAULT_ALLOCATION;
-        Assert.assertFalse(replicaAlloc.isNotSet());
-        Assert.assertEquals(replicaAlloc, ReplicaAllocation.DEFAULT_ALLOCATION);
-        Assert.assertFalse(replicaAlloc.isEmpty());
-        Assert.assertEquals(3, replicaAlloc.getTotalReplicaNum());
-        Assert.assertEquals("tag.location.default: 3", replicaAlloc.toCreateStmt());
+        Assertions.assertFalse(replicaAlloc.isNotSet());
+        Assertions.assertEquals(replicaAlloc, ReplicaAllocation.DEFAULT_ALLOCATION);
+        Assertions.assertFalse(replicaAlloc.isEmpty());
+        Assertions.assertEquals(3, replicaAlloc.getTotalReplicaNum());
+        Assertions.assertEquals("tag.location.default: 3", replicaAlloc.toCreateStmt());
 
         // NOT SET
         replicaAlloc = ReplicaAllocation.NOT_SET;
-        Assert.assertTrue(replicaAlloc.isNotSet());
-        Assert.assertNotEquals(replicaAlloc, ReplicaAllocation.DEFAULT_ALLOCATION);
-        Assert.assertTrue(replicaAlloc.isEmpty());
-        Assert.assertEquals(0, replicaAlloc.getTotalReplicaNum());
-        Assert.assertEquals("", replicaAlloc.toCreateStmt());
+        Assertions.assertTrue(replicaAlloc.isNotSet());
+        Assertions.assertNotEquals(replicaAlloc, ReplicaAllocation.DEFAULT_ALLOCATION);
+        Assertions.assertTrue(replicaAlloc.isEmpty());
+        Assertions.assertEquals(0, replicaAlloc.getTotalReplicaNum());
+        Assertions.assertEquals("", replicaAlloc.toCreateStmt());
 
         // set replica num
         replicaAlloc = new ReplicaAllocation((short) 5);
-        Assert.assertFalse(replicaAlloc.isNotSet());
-        Assert.assertNotEquals(replicaAlloc, ReplicaAllocation.DEFAULT_ALLOCATION);
-        Assert.assertFalse(replicaAlloc.isEmpty());
-        Assert.assertEquals(5, replicaAlloc.getTotalReplicaNum());
-        Assert.assertEquals("tag.location.default: 5", replicaAlloc.toCreateStmt());
+        Assertions.assertFalse(replicaAlloc.isNotSet());
+        Assertions.assertNotEquals(replicaAlloc, ReplicaAllocation.DEFAULT_ALLOCATION);
+        Assertions.assertFalse(replicaAlloc.isEmpty());
+        Assertions.assertEquals(5, replicaAlloc.getTotalReplicaNum());
+        Assertions.assertEquals("tag.location.default: 5", replicaAlloc.toCreateStmt());
 
         // set replica num with tag
         replicaAlloc = new ReplicaAllocation();
         replicaAlloc.put(Tag.create(Tag.TYPE_LOCATION, "zone1"), (short) 3);
         replicaAlloc.put(Tag.create(Tag.TYPE_LOCATION, "zone2"), (short) 2);
-        Assert.assertFalse(replicaAlloc.isNotSet());
-        Assert.assertFalse(replicaAlloc.isEmpty());
-        Assert.assertEquals(5, replicaAlloc.getTotalReplicaNum());
-        Assert.assertEquals("tag.location.zone2: 2, tag.location.zone1: 3", replicaAlloc.toCreateStmt());
+        Assertions.assertFalse(replicaAlloc.isNotSet());
+        Assertions.assertFalse(replicaAlloc.isEmpty());
+        Assertions.assertEquals(5, replicaAlloc.getTotalReplicaNum());
+        Assertions.assertEquals("tag.location.zone2: 2, tag.location.zone1: 3", replicaAlloc.toCreateStmt());
     }
 
     @Test
@@ -106,39 +110,39 @@ public class ReplicaAllocationTest {
         Map<String, String> properties = Maps.newHashMap();
         properties.put(PropertyAnalyzer.PROPERTIES_REPLICATION_NUM, "3");
         ReplicaAllocation replicaAlloc = PropertyAnalyzer.analyzeReplicaAllocation(properties, "");
-        Assert.assertEquals(ReplicaAllocation.DEFAULT_ALLOCATION, replicaAlloc);
-        Assert.assertTrue(properties.isEmpty());
+        Assertions.assertEquals(ReplicaAllocation.DEFAULT_ALLOCATION, replicaAlloc);
+        Assertions.assertTrue(properties.isEmpty());
 
         // not set
         properties = Maps.newHashMap();
         replicaAlloc = PropertyAnalyzer.analyzeReplicaAllocation(properties, "");
-        Assert.assertEquals(ReplicaAllocation.NOT_SET, replicaAlloc);
+        Assertions.assertEquals(ReplicaAllocation.NOT_SET, replicaAlloc);
 
         properties = Maps.newHashMap();
         properties.put("default." + PropertyAnalyzer.PROPERTIES_REPLICATION_NUM, "3");
         replicaAlloc = PropertyAnalyzer.analyzeReplicaAllocation(properties, "default");
-        Assert.assertEquals(ReplicaAllocation.DEFAULT_ALLOCATION, replicaAlloc);
-        Assert.assertTrue(properties.isEmpty());
+        Assertions.assertEquals(ReplicaAllocation.DEFAULT_ALLOCATION, replicaAlloc);
+        Assertions.assertTrue(properties.isEmpty());
 
         properties = Maps.newHashMap();
         properties.put(PropertyAnalyzer.PROPERTIES_REPLICATION_ALLOCATION, "tag.location.zone2: 2, tag.location.zone1: 3");
         replicaAlloc = PropertyAnalyzer.analyzeReplicaAllocation(properties, "");
-        Assert.assertNotEquals(ReplicaAllocation.DEFAULT_ALLOCATION, replicaAlloc);
-        Assert.assertFalse(replicaAlloc.isNotSet());
-        Assert.assertFalse(replicaAlloc.isEmpty());
-        Assert.assertEquals(5, replicaAlloc.getTotalReplicaNum());
-        Assert.assertEquals("tag.location.zone2: 2, tag.location.zone1: 3", replicaAlloc.toCreateStmt());
-        Assert.assertTrue(properties.isEmpty());
+        Assertions.assertNotEquals(ReplicaAllocation.DEFAULT_ALLOCATION, replicaAlloc);
+        Assertions.assertFalse(replicaAlloc.isNotSet());
+        Assertions.assertFalse(replicaAlloc.isEmpty());
+        Assertions.assertEquals(5, replicaAlloc.getTotalReplicaNum());
+        Assertions.assertEquals("tag.location.zone2: 2, tag.location.zone1: 3", replicaAlloc.toCreateStmt());
+        Assertions.assertTrue(properties.isEmpty());
 
         properties = Maps.newHashMap();
         properties.put("dynamic_partition." + PropertyAnalyzer.PROPERTIES_REPLICATION_ALLOCATION, "tag.location.zone2: 1, tag.location.zone1: 3");
         replicaAlloc = PropertyAnalyzer.analyzeReplicaAllocation(properties, "dynamic_partition");
-        Assert.assertNotEquals(ReplicaAllocation.DEFAULT_ALLOCATION, replicaAlloc);
-        Assert.assertFalse(replicaAlloc.isNotSet());
-        Assert.assertFalse(replicaAlloc.isEmpty());
-        Assert.assertEquals(4, replicaAlloc.getTotalReplicaNum());
-        Assert.assertEquals("tag.location.zone2: 1, tag.location.zone1: 3", replicaAlloc.toCreateStmt());
-        Assert.assertTrue(properties.isEmpty());
+        Assertions.assertNotEquals(ReplicaAllocation.DEFAULT_ALLOCATION, replicaAlloc);
+        Assertions.assertFalse(replicaAlloc.isNotSet());
+        Assertions.assertFalse(replicaAlloc.isEmpty());
+        Assertions.assertEquals(4, replicaAlloc.getTotalReplicaNum());
+        Assertions.assertEquals("tag.location.zone2: 1, tag.location.zone1: 3", replicaAlloc.toCreateStmt());
+        Assertions.assertTrue(properties.isEmpty());
     }
 
     @Test
@@ -175,7 +179,7 @@ public class ReplicaAllocationTest {
         // 2. Read objects from file
         DataInputStream dis = new DataInputStream(Files.newInputStream(path));
         ReplicaAllocation newAlloc = ReplicaAllocation.read(dis);
-        Assert.assertEquals(replicaAlloc, newAlloc);
+        Assertions.assertEquals(replicaAlloc, newAlloc);
 
         // 3. delete files
         dis.close();

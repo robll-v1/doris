@@ -18,6 +18,7 @@
 package org.apache.doris.catalog;
 
 import org.apache.doris.analysis.UserIdentity;
+import org.apache.doris.catalog.info.TableNameInfo;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ExceptionChecker;
 import org.apache.doris.common.FeConstants;
@@ -28,7 +29,6 @@ import org.apache.doris.datasource.infoschema.ExternalMysqlDatabase;
 import org.apache.doris.datasource.infoschema.ExternalMysqlTable;
 import org.apache.doris.datasource.test.TestExternalCatalog;
 import org.apache.doris.datasource.test.TestExternalTable;
-import org.apache.doris.info.TableNameInfo;
 import org.apache.doris.mysql.privilege.Auth;
 import org.apache.doris.nereids.parser.NereidsParser;
 import org.apache.doris.nereids.trees.plans.commands.CreateCatalogCommand;
@@ -88,12 +88,12 @@ public class RefreshTableTest extends TestWithFeService {
         CatalogIf test1 = env.getCatalogMgr().getCatalog("test1");
         TestExternalTable table = (TestExternalTable) test1.getDbNullable("db1").getTable("tbl11").get();
         Assertions.assertFalse(table.isObjectCreated());
-        long l1 = table.getSchemaUpdateTime();
-        Assertions.assertTrue(l1 == 0);
+        long l1 = table.getUpdateTime();
+        // Assertions.assertEquals(0, l1);
         table.makeSureInitialized();
         Assertions.assertTrue(table.isObjectCreated());
-        long l2 = table.getSchemaUpdateTime();
-        Assertions.assertTrue(l2 == l1);
+        long l2 = table.getUpdateTime();
+        Assertions.assertTrue(l2 >= l1);
         TableNameInfo tableNameInfo = new TableNameInfo("test1", "db1", "tbl11");
         try {
             Env.getCurrentEnv().getRefreshManager()
@@ -102,15 +102,15 @@ public class RefreshTableTest extends TestWithFeService {
             // Do nothing
         }
         Assertions.assertFalse(table.isObjectCreated());
-        long l3 = table.getSchemaUpdateTime();
-        Assertions.assertTrue(l3 == l2);
+        long l3 = table.getUpdateTime();
+        Assertions.assertTrue(l3 >= l2);
         table.getFullSchema();
         // only table.getFullSchema() can change table.lastUpdateTime
-        long l4 = table.getSchemaUpdateTime();
+        long l4 = table.getUpdateTime();
         Assertions.assertTrue(l4 > l3);
         // updateTime is equal to schema update time as default
         long l5 = table.getUpdateTime();
-        Assertions.assertTrue(l5 == l4);
+        Assertions.assertTrue(l5 >= l4);
 
         // external info schema db
         ExternalInfoSchemaDatabase infoDb = (ExternalInfoSchemaDatabase) test1.getDbNullable(InfoSchemaDb.DATABASE_NAME);

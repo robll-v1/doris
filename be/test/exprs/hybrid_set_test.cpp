@@ -19,15 +19,24 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
+#include <bit>
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 
-#include "common/config.h"
+#include "core/field.h"
 #include "exprs/create_predicate_function.h"
 #include "gtest/internal/gtest-internal.h"
 #include "testutil/column_helper.h"
+#include "util/debug_points.h"
+#include "util/defer_op.h"
 
 namespace doris {
+
+static constexpr auto CONVERT_COLUMN_IF_OVERFLOW_DEBUG_POINT =
+        "ColumnStr.convert_column_if_overflow.max_string_size";
 
 // mock
 class HybridSetTest : public testing::Test {
@@ -121,6 +130,133 @@ TEST_F(HybridSetTest, Numeric) {
     TEST_NUMERIC(PrimitiveType::TYPE_DECIMAL32);
     TEST_NUMERIC(PrimitiveType::TYPE_DECIMAL64);
     TEST_NUMERIC(PrimitiveType::TYPE_DECIMAL128I);
+}
+
+TEST_F(HybridSetTest, IntegerMinMaxAndRangeLookup) {
+    const auto field = [](int32_t value) { return Field::create_field<TYPE_INT>(value); };
+    const auto verify = [&](HybridSetBase& set) {
+        for (int32_t value : {1, 5, 9}) {
+            set.insert(&value);
+        }
+
+        Field min_value;
+        Field max_value;
+        bool contains_nan = false;
+        set.get_min_max(min_value, max_value, contains_nan);
+        EXPECT_EQ(min_value.get<TYPE_INT>(), 1);
+        EXPECT_EQ(max_value.get<TYPE_INT>(), 9);
+
+        EXPECT_TRUE(set.contains_any_in_range(field(1), field(1)));
+        EXPECT_TRUE(set.contains_any_in_range(field(4), field(5)));
+        EXPECT_TRUE(set.contains_any_in_range(field(9), field(10)));
+        EXPECT_FALSE(set.contains_any_in_range(field(2), field(4)));
+        EXPECT_FALSE(set.contains_any_in_range(field(6), field(8)));
+
+        set.clear();
+        set.get_min_max(min_value, max_value, contains_nan);
+        EXPECT_TRUE(min_value.is_null());
+        EXPECT_TRUE(max_value.is_null());
+    };
+
+    HybridSet<TYPE_INT> dynamic_set(false);
+    EXPECT_TRUE(dynamic_set.supports_fast_range_lookup());
+    verify(dynamic_set);
+
+    HybridSet<TYPE_INT, FixedContainer<int32_t, 3>> fixed_set(false);
+    EXPECT_TRUE(fixed_set.supports_fast_range_lookup());
+    verify(fixed_set);
+}
+
+TEST_F(HybridSetTest, SignedBitSetRangeLookup) {
+    const auto tinyint_field = [](int8_t value) {
+        return Field::create_field<TYPE_TINYINT>(value);
+    };
+    HybridSet<TYPE_TINYINT, BitSetContainer<int8_t>> tinyint_set(false);
+    EXPECT_FALSE(tinyint_set.supports_fast_range_lookup());
+    for (int8_t value : {int8_t {-100}, int8_t {-1}, int8_t {0}, int8_t {100}}) {
+        tinyint_set.insert(&value);
+    }
+    EXPECT_TRUE(tinyint_set.contains_any_in_range(tinyint_field(-2), tinyint_field(1)));
+    EXPECT_TRUE(tinyint_set.contains_any_in_range(tinyint_field(-100), tinyint_field(-100)));
+    EXPECT_FALSE(tinyint_set.contains_any_in_range(tinyint_field(-99), tinyint_field(-2)));
+    EXPECT_FALSE(tinyint_set.contains_any_in_range(tinyint_field(1), tinyint_field(99)));
+
+    const auto smallint_field = [](int16_t value) {
+        return Field::create_field<TYPE_SMALLINT>(value);
+    };
+    HybridSet<TYPE_SMALLINT, BitSetContainer<int16_t>> edge_set(false);
+    int16_t min_value = std::numeric_limits<int16_t>::min();
+    int16_t max_value = std::numeric_limits<int16_t>::max();
+    edge_set.insert(&min_value);
+    edge_set.insert(&max_value);
+
+    Field min_field;
+    Field max_field;
+    bool contains_nan = false;
+    edge_set.get_min_max(min_field, max_field, contains_nan);
+    EXPECT_EQ(min_field.get<TYPE_SMALLINT>(), min_value);
+    EXPECT_EQ(max_field.get<TYPE_SMALLINT>(), max_value);
+    EXPECT_TRUE(
+            edge_set.contains_any_in_range(smallint_field(min_value), smallint_field(min_value)));
+    EXPECT_TRUE(
+            edge_set.contains_any_in_range(smallint_field(max_value), smallint_field(max_value)));
+    EXPECT_FALSE(
+            edge_set.contains_any_in_range(smallint_field(static_cast<int16_t>(min_value + 1)),
+                                           smallint_field(static_cast<int16_t>(max_value - 1))));
+
+    HybridSet<TYPE_SMALLINT, BitSetContainer<int16_t>> crossing_set(false);
+    for (int16_t value : {int16_t {-30000}, int16_t {-1}, int16_t {0}, int16_t {30000}}) {
+        crossing_set.insert(&value);
+    }
+    EXPECT_TRUE(crossing_set.contains_any_in_range(smallint_field(-2), smallint_field(1)));
+    EXPECT_TRUE(crossing_set.contains_any_in_range(smallint_field(-1), smallint_field(-1)));
+    EXPECT_TRUE(crossing_set.contains_any_in_range(smallint_field(0), smallint_field(0)));
+    EXPECT_FALSE(crossing_set.contains_any_in_range(smallint_field(-29999), smallint_field(-2)));
+    EXPECT_FALSE(crossing_set.contains_any_in_range(smallint_field(1), smallint_field(29999)));
+}
+
+TEST_F(HybridSetTest, StringRangeLookupPreservesEmbeddedNull) {
+    const std::array<std::string, 3> values = {std::string("a\0a", 3), std::string("a\0c", 3),
+                                               std::string("b\0b", 3)};
+    const std::string missing("a\0b", 3);
+    const std::string upper_hole("b\0a", 3);
+    const auto field = [](const std::string& value) {
+        return Field::create_field<TYPE_STRING>(String(value.data(), value.size()));
+    };
+    const auto verify = [&](HybridSetBase& set) {
+        Field min_value;
+        Field max_value;
+        bool contains_nan = false;
+        set.get_min_max(min_value, max_value, contains_nan);
+        EXPECT_EQ(min_value.get<TYPE_STRING>(), values.front());
+        EXPECT_EQ(max_value.get<TYPE_STRING>(), values.back());
+
+        EXPECT_TRUE(set.contains_any_in_range(field(values.front()), field(values.front())));
+        EXPECT_TRUE(set.contains_any_in_range(field(missing), field(values[1])));
+        EXPECT_FALSE(set.contains_any_in_range(field(missing), field(missing)));
+        EXPECT_FALSE(set.contains_any_in_range(field(std::string("a\0d", 3)), field(upper_hole)));
+    };
+
+    StringSet<> owning_set(false);
+    for (const auto& value : values) {
+        StringRef ref(value);
+        owning_set.insert(&ref);
+    }
+    verify(owning_set);
+
+    StringSet<FixedContainer<std::string, 3>> fixed_owning_set(false);
+    for (const auto& value : values) {
+        StringRef ref(value);
+        fixed_owning_set.insert(&ref);
+    }
+    verify(fixed_owning_set);
+
+    StringValueSet<> borrowed_set(false);
+    for (const auto& value : values) {
+        StringRef ref(value);
+        borrowed_set.insert(&ref);
+    }
+    verify(borrowed_set);
 }
 
 #define TEST_DATE(primitive_type)                                                  \
@@ -391,6 +527,41 @@ TEST_F(HybridSetTest, double) {
     a = 5.1;
     EXPECT_FALSE(set->find(&a));
 }
+
+TEST_F(HybridSetTest, DynamicFloatingSetFindsDorisEqualNanPayload) {
+    const auto check_type = []<PrimitiveType Type, typename UInt>(UInt stored_bits,
+                                                                  UInt probe_bits) {
+        using T = typename PrimitiveTypeTraits<Type>::CppType;
+        std::unique_ptr<HybridSetBase> set(create_set(Type, false));
+        for (int value = 0; value < FIXED_CONTAINER_MAX_SIZE; ++value) {
+            T finite = static_cast<T>(value);
+            set->insert(&finite);
+        }
+        const T stored_nan = std::bit_cast<T>(stored_bits);
+        set->insert(&stored_nan);
+        ASSERT_EQ(FIXED_CONTAINER_MAX_SIZE + 1, set->size());
+
+        Field min_value;
+        Field max_value;
+        bool contains_nan = false;
+        set->get_min_max(min_value, max_value, contains_nan);
+        EXPECT_TRUE(contains_nan);
+        EXPECT_EQ(T {0}, min_value.get<Type>());
+        EXPECT_EQ(T {FIXED_CONTAINER_MAX_SIZE - 1}, max_value.get<Type>());
+
+        const T probe_nan = std::bit_cast<T>(probe_bits);
+        EXPECT_TRUE(set->find(&probe_nan));
+        uint8_t match = 1;
+        set->find_batch_raw_fixed(reinterpret_cast<const uint8_t*>(&probe_nan), 1, sizeof(T),
+                                  &match);
+        EXPECT_EQ(1, match);
+    };
+
+    check_type.template operator()<TYPE_FLOAT>(uint32_t {0x7fc00001U}, uint32_t {0x7fc00002U});
+    check_type.template operator()<TYPE_DOUBLE>(uint64_t {0x7ff8000000000001ULL},
+                                                uint64_t {0x7ff8000000000002ULL});
+}
+
 TEST_F(HybridSetTest, string) {
     std::unique_ptr<HybridSetBase> set(create_set(PrimitiveType::TYPE_VARCHAR, false));
     StringRef a;
@@ -446,9 +617,8 @@ TEST_F(HybridSetTest, string) {
     {                                                                                       \
         std::unique_ptr<HybridSetBase> set(create_set<N>(PrimitiveType::TYPE_INT, false));  \
                                                                                             \
-        auto column = vectorized::ColumnHelper::create_column<vectorized::DataTypeInt32>(   \
-                {1, 2, 3, 4, 5, 6, 7, 8});                                                  \
-        auto result_column = vectorized::ColumnUInt8::create(N, 0);                         \
+        auto column = ColumnHelper::create_column<DataTypeInt32>({1, 2, 3, 4, 5, 6, 7, 8}); \
+        auto result_column = ColumnUInt8::create(N, 0);                                     \
         try {                                                                               \
             set->find_batch(*column, N, result_column->get_data());                         \
             ASSERT_TRUE(false) << "should not be here";                                     \
@@ -501,18 +671,16 @@ TEST_F(HybridSetTest, FixedContainer) {
     TEST_FIXED_CONTAINER(8);
 
     std::unique_ptr<HybridSetBase> set(create_set<8>(PrimitiveType::TYPE_INT, false));
-    auto column = vectorized::ColumnHelper::create_column<vectorized::DataTypeInt32>(
-            {1, 2, 3, 4, 5, 6, 7, 8});
+    auto column = ColumnHelper::create_column<DataTypeInt32>({1, 2, 3, 4, 5, 6, 7, 8});
 }
 
 TEST_F(HybridSetTest, FindBatch) {
     std::unique_ptr<HybridSetBase> string_set(create_set(PrimitiveType::TYPE_VARCHAR, true));
-    auto string_column = vectorized::ColumnHelper::create_column<vectorized::DataTypeString>(
+    auto string_column = ColumnHelper::create_column<DataTypeString>(
             {"ab", "cd", "ef", "gh", "ij", "kl", "mn", "op"});
-    auto nullmap_column = vectorized::ColumnUInt8::create(8, 0);
+    auto nullmap_column = ColumnUInt8::create(8, 0);
 
-    auto nullable_column =
-            vectorized::ColumnNullable::create(string_column->clone(), nullmap_column->clone());
+    auto nullable_column = ColumnNullable::create(string_column->clone(), nullmap_column->clone());
 
     string_set->insert_fixed_len(nullable_column->clone(), 0);
     ASSERT_EQ(string_set->size(), nullable_column->size());
@@ -520,15 +688,14 @@ TEST_F(HybridSetTest, FindBatch) {
     nullmap_column->get_data()[1] = 1;
     nullmap_column->get_data()[3] = 1;
     nullmap_column->get_data()[6] = 1;
-    auto nullable_column2 =
-            vectorized::ColumnNullable::create(string_column->clone(), nullmap_column->clone());
+    auto nullable_column2 = ColumnNullable::create(string_column->clone(), nullmap_column->clone());
 
     std::unique_ptr<HybridSetBase> string_set2(create_set(PrimitiveType::TYPE_VARCHAR, true));
     string_set2->insert_fixed_len(nullable_column2->clone(), 0);
     ASSERT_EQ(string_set2->size(), nullable_column2->size() - 3);
     ASSERT_TRUE(string_set2->contain_null());
 
-    auto result_column = vectorized::ColumnUInt8::create(nullable_column2->size(), 0);
+    auto result_column = ColumnUInt8::create(nullable_column2->size(), 0);
     string_set->find_batch(*string_column, string_column->size(), result_column->get_data());
 
     ASSERT_EQ(result_column->get_data()[0], 1);
@@ -551,7 +718,7 @@ TEST_F(HybridSetTest, FindBatch) {
     ASSERT_EQ(result_column->get_data()[6], 0);
     ASSERT_EQ(result_column->get_data()[7], 0);
 
-    // Only bloom fitler need to handle nullaware(VRuntimeFilterWrapper::execute),
+    // Only bloom fitler need to handle nullaware(RuntimeFilterExpr::execute),
     // So HybridSet will return false when find null value.
     string_set2->find_batch_nullable(*string_column, string_column->size(),
                                      nullmap_column->get_data(), result_column->get_data());
@@ -621,20 +788,19 @@ TEST_F(HybridSetTest, StringValueSet) {
         test_string_value_set(i);
     }
 
-    vectorized::ColumnPtr string_column =
-            vectorized::ColumnHelper::create_column<vectorized::DataTypeString>(
-                    {"ab", "cd", "ef", "gh", "ij", "kl", "mn", "op", "qr", "st", "uv", "wx"});
-    auto nullmap_column = vectorized::ColumnUInt8::create(12, 0);
+    ColumnPtr string_column = ColumnHelper::create_column<DataTypeString>(
+            {"ab", "cd", "ef", "gh", "ij", "kl", "mn", "op", "qr", "st", "uv", "wx"});
+    auto nullmap_column = ColumnUInt8::create(12, 0);
 
-    vectorized::ColumnPtr nullable_column =
-            vectorized::ColumnNullable::create(string_column->clone(), nullmap_column->clone());
+    ColumnPtr nullable_column =
+            ColumnNullable::create(string_column->clone(), nullmap_column->clone());
 
     std::unique_ptr<HybridSetBase> string_value_set(create_string_value_set(0, true));
     string_value_set->insert_fixed_len(nullable_column, 0);
 
     ASSERT_EQ(string_value_set->size(), nullable_column->size());
 
-    auto results = vectorized::ColumnUInt8::create(string_column->size(), 0);
+    auto results = ColumnUInt8::create(string_column->size(), 0);
     string_value_set->find_batch(*string_column, string_column->size(), results->get_data());
     for (size_t i = 0; i != string_column->size(); ++i) {
         ASSERT_TRUE(results->get_data()[i]);
@@ -646,8 +812,7 @@ TEST_F(HybridSetTest, StringValueSet) {
     nullmap_column->get_data()[1] = 1;
     nullmap_column->get_data()[3] = 1;
     nullmap_column->get_data()[6] = 1;
-    auto nullable_column2 =
-            vectorized::ColumnNullable::create(string_column, nullmap_column->clone());
+    auto nullable_column2 = ColumnNullable::create(string_column, nullmap_column->clone());
 
     string_value_set->insert_fixed_len(nullable_column2->clone(), 0);
     ASSERT_EQ(string_value_set->size(), nullable_column2->size() - 3);
@@ -667,11 +832,16 @@ TEST_F(HybridSetTest, StringValueSet) {
     }
 
     // test ColumnStr64
-    auto string_overflow_size = config::string_overflow_size;
-    config::string_overflow_size = 10;
-    Defer defer([string_overflow_size]() { config::string_overflow_size = string_overflow_size; });
+    auto origin_enable_debug_points = config::enable_debug_points;
+    config::enable_debug_points = true;
+    DebugPoints::instance()->add_with_params(CONVERT_COLUMN_IF_OVERFLOW_DEBUG_POINT,
+                                             {{"max_string_size", "10"}});
+    Defer defer([origin_enable_debug_points]() {
+        DebugPoints::instance()->remove(CONVERT_COLUMN_IF_OVERFLOW_DEBUG_POINT);
+        config::enable_debug_points = origin_enable_debug_points;
+    });
 
-    vectorized::ColumnPtr string64_column = string_column->clone()->convert_column_if_overflow();
+    ColumnPtr string64_column = string_column->clone()->convert_column_if_overflow();
     ASSERT_TRUE(string64_column->is_column_string64());
 
     string_value_set->clear();
@@ -688,8 +858,8 @@ TEST_F(HybridSetTest, StringValueSet) {
     string_value_set->clear();
     ASSERT_EQ(string_value_set->size(), 0);
 
-    vectorized::ColumnNullable::Ptr nullable_column3 =
-            vectorized::ColumnNullable::create(string64_column->clone(), nullmap_column->clone());
+    ColumnNullable::Ptr nullable_column3 =
+            ColumnNullable::create(string64_column->clone(), nullmap_column->clone());
 
     string_value_set->insert_fixed_len(nullable_column3, 0);
     ASSERT_EQ(string_value_set->size(), string64_column->size() - 3);

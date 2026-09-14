@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("test_hive_ctas", "p0,external,hive,external_docker,external_docker_hive") {
+suite("test_hive_ctas", "p0,external") {
     String enabled = context.config.otherConfigs.get("enableHiveTest")
     if (enabled == null || !enabled.equalsIgnoreCase("true")) {
         logger.info("diable Hive test.")
@@ -340,7 +340,8 @@ suite("test_hive_ctas", "p0,external,hive,external_docker,external_docker_hive")
             sql """ create database if not exists `test_hive_ex_ctas` """;
             test {
                 sql """ create database `test_hive_ex_ctas` """
-                exception "errCode = 2, detailMessage = Can't create database 'test_hive_ex_ctas'; database exists"
+                exception "Failed to create Hive database test_hive_ex_ctas"
+                exception "already exists"
             }
             sql """use `${catalog_name}`.`test_hive_ex_ctas`"""
             sql """ DROP DATABASE IF EXISTS ${catalog_name}.test_hive_ex_ctas """
@@ -349,7 +350,7 @@ suite("test_hive_ctas", "p0,external,hive,external_docker,external_docker_hive")
             try {
                 test {
                     sql """ DROP DATABASE ${catalog_name}.test_no_exist """
-                    exception "errCode = 2, detailMessage = Can't drop database 'test_no_exist'; database doesn't exist"
+                    exception "Failed to get database: 'test_no_exist'"
                 }
                 sql """ DROP DATABASE IF EXISTS ${catalog_name}.test_err """
                 sql """ CREATE DATABASE ${catalog_name}.test_err """
@@ -360,7 +361,8 @@ suite("test_hive_ctas", "p0,external,hive,external_docker,external_docker_hive")
                         "owner" = "err"
                     )
                     """;
-                    exception "errCode = 2, detailMessage = Can't create database 'test_err'; database exists"
+                    exception "Failed to create Hive database test_err"
+                    exception "already exists"
                 }
                 sql """ DROP DATABASE IF EXISTS ${catalog_name}.test_err """
 
@@ -569,7 +571,8 @@ suite("test_hive_ctas", "p0,external,hive,external_docker,external_docker_hive")
             'type'='hms',
             'hive.metastore.uris' = 'thrift://${externalEnvIp}:${hms_port}',
             'fs.defaultFS' = 'hdfs://${externalEnvIp}:${hdfs_port}',
-            'use_meta_cache' = 'true'
+            'use_meta_cache' = 'true',
+            'hive.parquet.time-zone' = 'Asia/Shanghai'
         );"""
         sql """switch ${catalog_name}"""
 

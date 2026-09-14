@@ -20,7 +20,14 @@ set(LIBRARY_OUTPUT_PATH "${BUILD_DIR}/src/udf")
 # where to put generated binaries
 set(EXECUTABLE_OUTPUT_PATH "${BUILD_DIR}/src/udf")
 
+file(GLOB PYTHON_UDF_SOURCES "python/*.cpp")
+
 # Build this library twice. Once to be linked into the main Doris. This version
 # can have dependencies on our other libs. The second version is shipped as part
 # of the UDF sdk, which can't use other libs.
-add_library(Udf STATIC udf.cpp)
+add_library(Udf STATIC ${PYTHON_UDF_SOURCES})
+
+# Unity build: eight homogeneous python-UDF glue TUs sharing the Python/arrow
+# header closure; batch 0 merges them into a single unity TU.
+set_target_properties(Udf PROPERTIES UNITY_BUILD ${DORIS_UNITY_BUILD}
+                                     UNITY_BUILD_BATCH_SIZE 0)

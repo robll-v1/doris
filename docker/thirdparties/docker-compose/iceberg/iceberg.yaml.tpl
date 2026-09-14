@@ -20,7 +20,7 @@ version: "3"
 services:
 
   spark-iceberg:
-    image: tabulario/spark-iceberg
+    image: apache/spark:4.0.0
     container_name: doris--spark-iceberg
     hostname: doris--spark-iceberg
     depends_on:
@@ -29,18 +29,22 @@ services:
       mc:
         condition: service_completed_successfully
     volumes:
-      - ./data/output/spark-warehouse:/home/iceberg/warehouse
-      - ./data/output/spark-notebooks:/home/iceberg/notebooks/notebooks
+      - ./data/output/spark-warehouse:/opt/spark/warehouse
       - ./data:/mnt/data
       - ./scripts:/mnt/scripts
       - ./spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
-      - ./data/input/jars/paimon-spark-3.5-1.0.1.jar:/opt/spark/jars/paimon-spark-3.5-1.0.1.jar
-      - ./data/input/jars/paimon-s3-1.0.1.jar:/opt/spark/jars/paimon-s3-1.0.1.jar
+      - ./data/input/jars/iceberg-aws-bundle-1.10.1.jar:/opt/spark/jars/iceberg-aws-bundle-1.10.1.jar
+      - ./data/input/jars/iceberg-spark-runtime-4.0_2.13-1.10.1.jar:/opt/spark/jars/iceberg-spark-runtime-4.0_2.13-1.10.1.jar
+      - ./data/input/jars/paimon-s3-1.3.1.jar:/opt/spark/jars/paimon-s3-1.3.1.jar
+      - ./data/input/jars/paimon-spark-4.0-1.3.1.jar:/opt/spark/jars/paimon-spark-4.0-1.3.1.jar
     environment:
       - AWS_ACCESS_KEY_ID=admin
       - AWS_SECRET_ACCESS_KEY=password
       - AWS_REGION=us-east-1
+    ports:
+      - ${SPARK_THRIFT_PORT}:10000
     entrypoint: /bin/sh /mnt/scripts/entrypoint.sh
+    user: root
     networks:
       - doris--iceberg
     healthcheck:
@@ -50,14 +54,14 @@ services:
       retries: 120
 
   postgres:
-    image: postgis/postgis:14-3.3
-    container_name: doris--postgres
+    image: ${ICEBERG_POSTGRES_IMAGE:-postgis/postgis:14-3.3}
+    container_name: doris--iceberg-postgres
     environment:
       POSTGRES_PASSWORD: 123456
       POSTGRES_USER: root
       POSTGRES_DB: iceberg
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U root" ]
+      test: [ "CMD-SHELL", "pg_isready -U root -d iceberg" ]
       interval: 5s
       timeout: 60s
       retries: 120
@@ -67,12 +71,13 @@ services:
       - doris--iceberg
 
   rest:
-    image: tabulario/iceberg-rest:1.6.0
+    image: apache/iceberg-rest-fixture:1.10.0
     container_name: doris--iceberg-rest
     ports:
       - ${REST_CATALOG_PORT}:8181
     volumes:
       - ./data:/mnt/data
+      - ./data/input/jars/postgresql-42.7.4.jar:/opt/jdbc/postgresql.jar
     depends_on:
       postgres:
         condition: service_healthy
@@ -90,11 +95,32 @@ services:
       - CATALOG_JDBC_PASSWORD=123456
     networks:
       - doris--iceberg
-    entrypoint: /bin/bash /mnt/data/input/script/rest_init.sh
+    command: 
+      - java
+      - -cp
+      - /usr/lib/iceberg-rest/iceberg-rest-adapter.jar:/opt/jdbc/postgresql.jar
+      - org.apache.iceberg.rest.RESTCatalogServer
+
+  trino:
+    image: trinodb/trino:482
+    container_name: doris--iceberg-trino
+    depends_on:
+      rest:
+        condition: service_started
+      mc:
+        condition: service_completed_successfully
+    user: root
+    networks:
+      - doris--iceberg
+    healthcheck:
+      test: ["CMD-SHELL", "test -d /etc/trino/catalog && command -v trino >/dev/null"]
+      interval: 5s
+      timeout: 60s
+      retries: 120
 
   minio:
-    image: minio/minio:RELEASE.2025-01-20T14-49-07Z
-    container_name: doris--minio
+    image: doristhirdpartydocker/minio:RELEASE.2025-01-20T14-49-07Z
+    container_name: doris--iceberg-minio
     ports:
       - ${MINIO_API_PORT}:9000
     healthcheck:
@@ -108,6 +134,7 @@ services:
       - MINIO_DOMAIN=minio
     volumes:
       - ./data/input/minio_data:/data
+      - ./scripts/preinstalled_data/:/mnt/preinstalled_data
     networks:
       doris--iceberg:
         aliases:
@@ -118,8 +145,8 @@ services:
     depends_on:
       minio:
         condition: service_healthy
-    image: minio/mc:RELEASE.2025-01-17T23-25-50Z
-    container_name: doris--mc
+    image: doristhirdpartydocker/mc:RELEASE.2025-01-17T23-25-50Z
+    container_name: doris--iceberg-mc
     environment:
       - AWS_ACCESS_KEY_ID=admin
       - AWS_SECRET_ACCESS_KEY=password
@@ -128,6 +155,7 @@ services:
       - doris--iceberg
     volumes:
       - ./data:/mnt/data
+      - ./scripts/preinstalled_data/:/mnt/preinstalled_data
     entrypoint: >
       /bin/sh -c "
       until (/usr/bin/mc config host add minio http://minio:9000 admin password) do echo '...waiting...' && sleep 1; done;
@@ -138,7 +166,8 @@ services:
         /usr/bin/mc mb minio/warehouse;
         /usr/bin/mc policy set public minio/warehouse;
         /usr/bin/mc cp -r /mnt/data/input/minio/warehouse/* minio/warehouse/;
-      fi
+      fi;
+      /usr/bin/mc cp -r /mnt/preinstalled_data/iceberg/ minio/warehouse/wh/multi_catalog/;
       "
 
 networks:

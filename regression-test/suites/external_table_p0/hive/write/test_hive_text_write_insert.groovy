@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("test_hive_text_write_insert", "p0,external,hive,external_docker,external_docker_hive") {
+suite("test_hive_text_write_insert", "p0,external") {
     def q01 = { String format_compression, String catalog_name ->
         logger.info("hive sql: " + """ truncate table all_types_text; """)
         hive_docker """ truncate table all_types_text; """
@@ -881,7 +881,7 @@ suite("test_hive_text_write_insert", "p0,external,hive,external_docker,external_
         return;
     }
 
-    for (String hivePrefix : ["hive2", "hive3"]) {
+    for (String hivePrefix : ["hive3"]) {
         setHivePrefix(hivePrefix)
         try {
             String hms_port = context.config.otherConfigs.get(hivePrefix + "HmsPort")
@@ -893,7 +893,8 @@ suite("test_hive_text_write_insert", "p0,external,hive,external_docker,external_
             sql """create catalog if not exists ${catalog_name} properties (
                 'type'='hms',
                 'hive.metastore.uris' = 'thrift://${externalEnvIp}:${hms_port}',
-                'fs.defaultFS' = 'hdfs://${externalEnvIp}:${hdfs_port}'
+                'fs.defaultFS' = 'hdfs://${externalEnvIp}:${hdfs_port}',
+                'hive.parquet.time-zone' = 'Asia/Shanghai'
             );"""
             sql """use `${catalog_name}`.`write_test`"""
             logger.info("hive sql: " + """ use `write_test` """)

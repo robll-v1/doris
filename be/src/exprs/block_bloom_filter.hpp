@@ -20,7 +20,9 @@
 
 #pragma once
 
-#include "vec/common/string_ref.h"
+#include <crc32c/crc32c.h>
+
+#include "core/string_ref.h"
 #ifdef __AVX2__
 #include <immintrin.h>
 #elif defined(__ARM_NEON)
@@ -28,7 +30,6 @@
 #endif
 
 #include "common/status.h"
-#include "util/hash_util.hpp"
 #include "util/slice.h"
 
 namespace butil {
@@ -36,7 +37,6 @@ class IOBufAsZeroCopyInputStream;
 }
 
 namespace doris {
-#include "common/compile_check_begin.h"
 
 // https://github.com/apache/kudu/blob/master/src/kudu/util/block_bloom_filter.h
 // BlockBloomFilter is modified based on Impala's BlockBloomFilter.
@@ -76,7 +76,7 @@ public:
     // Same as above with convenience of hashing the key.
     void insert(const StringRef& key) noexcept {
         if (key.data) {
-            insert(HashUtil::crc32c_hash(key.data, uint32_t(key.size), _hash_seed));
+            insert(crc32c::Extend(_hash_seed, (const uint8_t*)key.data, uint32_t(key.size)));
         }
     }
 
@@ -105,7 +105,7 @@ public:
     // Same as above with convenience of hashing the key.
     bool find(const StringRef& key) const noexcept {
         if (key.data) {
-            return find(HashUtil::crc32c_hash(key.data, uint32_t(key.size), _hash_seed));
+            return find(crc32c::Extend(_hash_seed, (const uint8_t*)key.data, uint32_t(key.size)));
         }
         return false;
     }
@@ -275,4 +275,3 @@ private:
 };
 
 } // namespace doris
-#include "common/compile_check_end.h"

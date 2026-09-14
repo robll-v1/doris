@@ -29,10 +29,10 @@ import org.apache.doris.nereids.trees.plans.GroupPlan;
 import org.apache.doris.nereids.trees.plans.JoinType;
 import org.apache.doris.nereids.trees.plans.logical.LogicalJoin;
 import org.apache.doris.nereids.types.IntegerType;
-import org.apache.doris.statistics.ColumnStatistic;
-import org.apache.doris.statistics.ColumnStatisticBuilder;
-import org.apache.doris.statistics.Statistics;
-import org.apache.doris.statistics.StatisticsBuilder;
+import org.apache.doris.statistics.model.ColumnStatistic;
+import org.apache.doris.statistics.model.ColumnStatisticBuilder;
+import org.apache.doris.statistics.model.Statistics;
+import org.apache.doris.statistics.model.StatisticsBuilder;
 
 import com.google.common.base.Supplier;
 import com.google.common.collect.Lists;
@@ -140,5 +140,47 @@ public class JoinEstimateTest {
         ColumnStatistic outCStats = outputStats.findColumnStatistics(c);
         Assertions.assertNotNull(outAStats);
         Assertions.assertEquals(20.0, outCStats.ndv);
+    }
+
+    @Test
+    public void testAsofInnerJoinStats() {
+        SlotReference a = new SlotReference("a", IntegerType.INSTANCE);
+        SlotReference b = new SlotReference("b", IntegerType.INSTANCE);
+        EqualTo eq = new EqualTo(a, b);
+
+        // left probe
+        Statistics leftStats = new StatisticsBuilder().setRowCount(100).build();
+        leftStats.addColumnStats(a,
+                new ColumnStatisticBuilder(100)
+                        .setNdv(50)
+                        .build()
+        );
+
+        // right build with original ndv larger than current ndv
+        Statistics rightStats = new StatisticsBuilder().setRowCount(80).build();
+        ColumnStatistic original = new ColumnStatisticBuilder(80)
+                .setNdv(20)
+                .build();
+        rightStats.addColumnStats(b,
+                new ColumnStatisticBuilder(80)
+                        .setNdv(10)
+                        .setOriginal(original)
+                        .build()
+        );
+
+        IdGenerator<GroupId> idGenerator = GroupId.createGenerator();
+        GroupPlan left = new GroupPlan(new Group(idGenerator.getNextId(), new LogicalProperties(
+                (Supplier<List<Slot>>) () -> Lists.newArrayList(a), () -> DataTrait.EMPTY_TRAIT)));
+        GroupPlan right = new GroupPlan(new Group(idGenerator.getNextId(), new LogicalProperties(
+                (Supplier<List<Slot>>) () -> Lists.newArrayList(b), () -> DataTrait.EMPTY_TRAIT)));
+
+        LogicalJoin join = new LogicalJoin(JoinType.ASOF_LEFT_INNER_JOIN, Lists.newArrayList(eq),
+                left, right, null);
+        Statistics outputStats = JoinEstimation.estimate(leftStats, rightStats, join);
+
+        // expected rowCount = left.rowCount * build.ndv / build.originalNdv = 100 * 10 / 20 = 50
+        Assertions.assertEquals(50.0, outputStats.getRowCount());
+        ColumnStatistic outAStats = outputStats.findColumnStatistics(a);
+        Assertions.assertNotNull(outAStats);
     }
 }

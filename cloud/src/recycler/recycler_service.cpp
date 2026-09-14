@@ -22,8 +22,12 @@
 #include <fmt/format.h>
 #include <gen_cpp/cloud.pb.h>
 #include <google/protobuf/util/json_util.h>
+#include <rapidjson/document.h>
+#include <rapidjson/prettywriter.h>
+#include <rapidjson/stringbuffer.h>
 
 #include <algorithm>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <numeric>
@@ -32,10 +36,13 @@
 #include <vector>
 
 #include "common/config.h"
+#include "common/configbase.h"
 #include "common/defer.h"
+#include "common/http_helper.h"
 #include "common/logging.h"
 #include "common/util.h"
-#include "cpp/s3_rate_limiter.h"
+#include "cpp/token_bucket_rate_limiter.h"
+#include "meta-service/meta_service_http.h"
 #include "meta-store/keys.h"
 #include "meta-store/txn_kv_error.h"
 #include "recycler/checker.h"
@@ -46,8 +53,6 @@
 #include "snapshot/snapshot_manager.h"
 
 namespace doris::cloud {
-
-extern std::tuple<int, std::string_view> convert_ms_code_to_http_code(MetaServiceCode ret);
 
 RecyclerServiceImpl::RecyclerServiceImpl(std::shared_ptr<TxnKv> txn_kv, Recycler* recycler,
                                          Checker* checker,
@@ -235,7 +240,7 @@ void RecyclerServiceImpl::statistics_recycle(StatisticsRecycleRequest& req, Meta
         std::ranges::for_each(resource_types, [&](const auto& resource_type) {
             int64_t to_recycle_num =
                     g_bvar_recycler_instance_last_round_to_recycle_num.get({id, resource_type});
-            int64_t to_recycle_bytes = to_recycle_bytes =
+            int64_t to_recycle_bytes =
                     g_bvar_recycler_instance_last_round_to_recycle_bytes.get({id, resource_type});
 
             ss << "Task Type: " << resource_type << "\n";
@@ -394,6 +399,85 @@ void RecyclerServiceImpl::check_instance(const std::string& instance_id, MetaSer
     }
 }
 
+std::pair<MetaServiceCode, std::string> RecyclerServiceImpl::skip_instance_data_cleanup(
+        const std::string& instance_id) {
+    std::unique_ptr<Transaction> txn;
+    TxnErrorCode err = txn_kv_->create_txn(&txn);
+    if (err != TxnErrorCode::TXN_OK) {
+        std::string msg = fmt::format("failed to create txn, err={}", err);
+        LOG(WARNING) << msg << " instance_id=" << instance_id;
+        return {MetaServiceCode::KV_TXN_CREATE_ERR, std::move(msg)};
+    }
+
+    std::string key = instance_key({instance_id});
+    std::string value;
+    err = txn->get(key, &value);
+    if (err != TxnErrorCode::TXN_OK) {
+        std::string msg =
+                fmt::format("failed to get instance, instance_id={}, err={}", instance_id, err);
+        LOG(WARNING) << msg;
+        return {MetaServiceCode::KV_TXN_GET_ERR, std::move(msg)};
+    }
+
+    InstanceInfoPB instance;
+    if (!instance.ParseFromString(value)) {
+        std::string msg = fmt::format("malformed instance info, key={}", hex(key));
+        LOG(WARNING) << msg;
+        return {MetaServiceCode::PROTOBUF_PARSE_ERR, std::move(msg)};
+    }
+    auto current_state = instance.recycle_state();
+    if (instance.status() != InstanceInfoPB::DELETED) {
+        std::string msg = fmt::format(
+                "failed to set instance recycle state, instance is not deleted, instance_id={}",
+                instance_id);
+        LOG(WARNING) << msg;
+        return {MetaServiceCode::INVALID_ARGUMENT, std::move(msg)};
+    }
+    if (current_state != INSTANCE_RECYCLE_STATE_DATA_CLEANUP_PENDING) {
+        std::string msg = fmt::format(
+                "failed to set instance recycle state, instance state should be {}"
+                ", current_state={}"
+                ", instance_id={}",
+                INSTANCE_RECYCLE_STATE_DATA_CLEANUP_PENDING, current_state, instance_id);
+        LOG(WARNING) << msg;
+        return {MetaServiceCode::INVALID_ARGUMENT, std::move(msg)};
+    }
+    if (instance.has_multi_version_status() &&
+        instance.multi_version_status() != MultiVersionStatus::MULTI_VERSION_DISABLED) {
+        std::string msg = fmt::format(
+                "cannot skip instance data cleanup for a multi-version instance, instance_id={}, "
+                "multi_version_status={}",
+                instance_id, MultiVersionStatus_Name(instance.multi_version_status()));
+        LOG(WARNING) << msg;
+        return {MetaServiceCode::INVALID_ARGUMENT, std::move(msg)};
+    }
+
+    instance.set_recycle_state(INSTANCE_RECYCLE_STATE_METADATA_CLEANUP_PENDING);
+    instance.set_recycle_state_update_time_ms(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count());
+    if (!instance.SerializeToString(&value)) {
+        std::string msg = "failed to serialize InstanceInfoPB";
+        LOG(WARNING) << msg << " instance_id=" << instance_id;
+        return {MetaServiceCode::PROTOBUF_SERIALIZE_ERR, std::move(msg)};
+    }
+
+    txn->atomic_add(system_meta_service_instance_update_key(), 1);
+    txn->put(key, value);
+    err = txn->commit();
+    if (err != TxnErrorCode::TXN_OK) {
+        std::string msg = fmt::format("failed to commit kv txn, err={}", err);
+        LOG(WARNING) << msg << " instance_id=" << instance_id;
+        return {MetaServiceCode::KV_TXN_COMMIT_ERR, std::move(msg)};
+    }
+    LOG(WARNING) << "successfully skipped instance data cleanup, instance_id=" << instance_id
+                 << " current_state=" << InstanceRecycleState_Name(current_state)
+                 << " target_state=" << InstanceRecycleState_Name(instance.recycle_state());
+
+    return {MetaServiceCode::OK, "OK"};
+}
+
 void recycle_copy_jobs(const std::shared_ptr<TxnKv>& txn_kv, const std::string& instance_id,
                        MetaServiceCode& code, std::string& msg,
                        RecyclerThreadPoolGroup thread_pool_group,
@@ -504,207 +588,47 @@ void check_meta(const std::shared_ptr<TxnKv>& txn_kv, const std::string& instanc
 }
 
 void RecyclerServiceImpl::http(::google::protobuf::RpcController* controller,
-                               const ::doris::cloud::MetaServiceHttpRequest* request,
-                               ::doris::cloud::MetaServiceHttpResponse* response,
+                               const ::doris::cloud::MetaServiceHttpRequest*,
+                               ::doris::cloud::MetaServiceHttpResponse*,
                                ::google::protobuf::Closure* done) {
-    auto cntl = static_cast<brpc::Controller*>(controller);
-    LOG(INFO) << "rpc from " << cntl->remote_side() << " request: " << request->DebugString();
+    auto* cntl = static_cast<brpc::Controller*>(controller);
+    LOG(INFO) << "rpc from " << cntl->remote_side()
+              << " request: " << cntl->http_request().uri().path();
     brpc::ClosureGuard closure_guard(done);
-    MetaServiceCode code = MetaServiceCode::OK;
-    int status_code = 200;
-    std::string msg = "OK";
-    std::string req;
-    std::string response_body;
-    std::string request_body;
-    DORIS_CLOUD_DEFER {
-        status_code = std::get<0>(convert_ms_code_to_http_code(code));
-        LOG(INFO) << (code == MetaServiceCode::OK ? "succ to " : "failed to ") << "http"
-                  << " " << cntl->remote_side() << " request=\n"
-                  << req << "\n ret=" << code << " msg=" << msg;
-        cntl->http_response().set_status_code(status_code);
-        cntl->response_attachment().append(response_body);
+    const auto& unresolved_path = cntl->http_request().unresolved_path();
+    auto api_path = split_http_api_path(unresolved_path);
+    const auto& handlers = get_http_handlers();
+    auto it = handlers.find(api_path.route);
+    const auto* handler =
+            it == handlers.end() ? nullptr : resolve_http_handler(it->second, api_path.version);
+    if (handler == nullptr ||
+        (it->second.role != HttpRole::RECYCLER && it->second.role != HttpRole::BOTH)) {
+        std::string msg = "http path not found or not allowed";
+        cntl->http_response().set_status_code(404);
+        cntl->response_attachment().append(msg);
         cntl->response_attachment().append("\n");
-    };
-
-    // Prepare input request info
-    auto unresolved_path = cntl->http_request().unresolved_path();
-    auto uri = cntl->http_request().uri();
-    std::stringstream ss;
-    ss << "\nuri_path=" << uri.path();
-    ss << "\nunresolved_path=" << unresolved_path;
-    ss << "\nmethod=" << brpc::HttpMethod2Str(cntl->http_request().method());
-    ss << "\nquery strings:";
-    for (auto it = uri.QueryBegin(); it != uri.QueryEnd(); ++it) {
-        ss << "\n" << it->first << "=" << it->second;
+        return;
     }
-    ss << "\nheaders:";
-    for (auto it = cntl->http_request().HeaderBegin(); it != cntl->http_request().HeaderEnd();
-         ++it) {
-        ss << "\n" << it->first << ":" << it->second;
-    }
-    req = ss.str();
-    ss.clear();
-    request_body = cntl->request_attachment().to_string(); // Just copy
 
     // Auth
-    auto token = uri.GetQuery("token");
+    const auto* token = cntl->http_request().uri().GetQuery("token");
     if (token == nullptr || *token != config::http_token) {
-        msg = "incorrect token, token=" + (token == nullptr ? std::string("(not given)") : *token);
-        response_body = "incorrect token";
-        status_code = 403;
+        std::string msg = "incorrect token, token=" +
+                          (token == nullptr ? std::string("(not given)") : *token);
+        cntl->http_response().set_status_code(403);
+        cntl->response_attachment().append(msg);
+        cntl->response_attachment().append("\n");
+        LOG(WARNING) << "failed to handle http from " << cntl->remote_side() << " msg: " << msg;
         return;
     }
 
-    if (unresolved_path == "recycle_instance") {
-        RecycleInstanceRequest req;
-        auto st = google::protobuf::util::JsonStringToMessage(request_body, &req);
-        if (!st.ok()) {
-            msg = "failed to RecycleInstanceRequest, error: " + st.message().ToString();
-            response_body = msg;
-            LOG(WARNING) << msg;
-            return;
-        }
-        RecycleInstanceResponse res;
-        recycle_instance(cntl, &req, &res, nullptr);
-        code = res.status().code();
-        msg = res.status().msg();
-        response_body = msg;
-        return;
-    }
+    auto [status_code, msg, body] = (*handler)(this, cntl);
+    cntl->http_response().set_status_code(status_code);
+    cntl->response_attachment().append(body);
+    cntl->response_attachment().append("\n");
 
-    if (unresolved_path == "statistics_recycle") {
-        StatisticsRecycleRequest req;
-        auto st = google::protobuf::util::JsonStringToMessage(request_body, &req);
-        if (!st.ok()) {
-            msg = "failed to StatisticsRecycleRequest, error: " + st.message().ToString();
-            response_body = msg;
-            LOG(WARNING) << msg;
-            return;
-        }
-        statistics_recycle(req, code, msg);
-        response_body = msg;
-        return;
-    }
-
-    if (unresolved_path == "recycle_copy_jobs") {
-        auto instance_id = uri.GetQuery("instance_id");
-        if (instance_id == nullptr || instance_id->empty()) {
-            msg = "no instance id";
-            response_body = msg;
-            status_code = 400;
-            return;
-        }
-        recycle_copy_jobs(txn_kv_, *instance_id, code, msg, recycler_->_thread_pool_group,
-                          txn_lazy_committer_);
-
-        response_body = msg;
-        return;
-    }
-
-    if (unresolved_path == "recycle_job_info") {
-        auto instance_id = uri.GetQuery("instance_id");
-        if (instance_id == nullptr || instance_id->empty()) {
-            msg = "no instance id";
-            response_body = msg;
-            status_code = 400;
-            return;
-        }
-        std::string key;
-        job_recycle_key({*instance_id}, &key);
-        recycle_job_info(txn_kv_, *instance_id, key, code, msg);
-        response_body = msg;
-        return;
-    }
-
-    if (unresolved_path == "check_instance") {
-        auto instance_id = uri.GetQuery("instance_id");
-        if (instance_id == nullptr || instance_id->empty()) {
-            msg = "no instance id";
-            response_body = msg;
-            status_code = 400;
-            return;
-        }
-        if (!checker_) {
-            msg = "checker not enabled";
-            response_body = msg;
-            status_code = 400;
-            return;
-        }
-        check_instance(*instance_id, code, msg);
-        response_body = msg;
-        return;
-    }
-
-    if (unresolved_path == "check_job_info") {
-        auto instance_id = uri.GetQuery("instance_id");
-        if (instance_id == nullptr || instance_id->empty()) {
-            msg = "no instance id";
-            response_body = msg;
-            status_code = 400;
-            return;
-        }
-        std::string key;
-        job_check_key({*instance_id}, &key);
-        recycle_job_info(txn_kv_, *instance_id, key, code, msg);
-        response_body = msg;
-        return;
-    }
-
-    if (unresolved_path == "check_meta") {
-        auto instance_id = uri.GetQuery("instance_id");
-        auto host = uri.GetQuery("host");
-        auto port = uri.GetQuery("port");
-        auto user = uri.GetQuery("user");
-        auto password = uri.GetQuery("password");
-        if (instance_id == nullptr || instance_id->empty() || host == nullptr || host->empty() ||
-            port == nullptr || port->empty() || password == nullptr || user == nullptr ||
-            user->empty()) {
-            msg = "no instance id or mysql conn str info";
-            response_body = msg;
-            status_code = 400;
-            return;
-        }
-        LOG(INFO) << " host " << *host;
-        LOG(INFO) << " port " << *port;
-        LOG(INFO) << " user " << *user;
-        LOG(INFO) << " instance " << *instance_id;
-        check_meta(txn_kv_, *instance_id, *host, *port, *user, *password, msg);
-        status_code = 200;
-        response_body = msg;
-        return;
-    }
-
-    if (unresolved_path == "adjust_rate_limiter") {
-        auto type_string = uri.GetQuery("type");
-        auto speed = uri.GetQuery("speed");
-        auto burst = uri.GetQuery("burst");
-        auto limit = uri.GetQuery("limit");
-        if (type_string->empty() || speed->empty() || burst->empty() || limit->empty() ||
-            (*type_string != "get" && *type_string != "put")) {
-            msg = "argument not suitable";
-            response_body = msg;
-            status_code = 400;
-            return;
-        }
-        auto max_speed = speed->empty() ? 0 : std::stoul(*speed);
-        auto max_burst = burst->empty() ? 0 : std::stoul(*burst);
-        auto max_limit = burst->empty() ? 0 : std::stoul(*limit);
-        if (0 != reset_s3_rate_limiter(string_to_s3_rate_limit_type(*type_string), max_speed,
-                                       max_burst, max_limit)) {
-            msg = "adjust failed";
-            response_body = msg;
-            status_code = 400;
-            return;
-        }
-
-        status_code = 200;
-        response_body = msg;
-        return;
-    }
-
-    status_code = 404;
-    msg = "http path " + uri.path() + " not found, it may be not implemented";
-    response_body = msg;
+    LOG(INFO) << (status_code == 200 ? "succ to " : "failed to ") << __PRETTY_FUNCTION__ << " "
+              << cntl->remote_side() << " ret=" << status_code << " msg=" << msg;
 }
 
 } // namespace doris::cloud

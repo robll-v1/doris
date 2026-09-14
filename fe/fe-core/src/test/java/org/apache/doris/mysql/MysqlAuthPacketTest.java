@@ -17,16 +17,19 @@
 
 package org.apache.doris.mysql;
 
-import org.junit.Assert;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 
 public class MysqlAuthPacketTest {
+    private static final String OIDC_PLUGIN_NAME = "authentication_openid_connect_client";
+
     private ByteBuffer byteBuffer;
 
-    @Before
+    @BeforeEach
     public void setUp() {
         MysqlSerializer serializer = MysqlSerializer.newInstance();
 
@@ -41,14 +44,20 @@ public class MysqlAuthPacketTest {
         // user name
         serializer.writeNulTerminateString("palo-user");
         // plugin data
-        serializer.writeInt1(20);
-        byte[] buf = new byte[20];
-        for (int i = 0; i < 20; ++i) {
-            buf[i] = (byte) ('a' + i);
-        }
-        serializer.writeBytes(buf);
+        serializer.writeLenEncodedBytes("oidc-token".getBytes(StandardCharsets.UTF_8));
         // database
         serializer.writeNulTerminateString("testDb");
+        // plugin name
+        serializer.writeNulTerminateString(OIDC_PLUGIN_NAME);
+        // connect attrs
+        MysqlSerializer attrsSerializer = MysqlSerializer.newInstance();
+        attrsSerializer.writeLenEncodedString("_client_name");
+        attrsSerializer.writeLenEncodedString("mysql");
+        attrsSerializer.writeLenEncodedString("_client_version");
+        attrsSerializer.writeLenEncodedString("9.2.0");
+        byte[] attrs = attrsSerializer.toArray();
+        serializer.writeVInt(attrs.length);
+        serializer.writeBytes(attrs);
 
         byteBuffer = serializer.toByteBuffer();
     }
@@ -56,9 +65,12 @@ public class MysqlAuthPacketTest {
     @Test
     public void testRead() {
         MysqlAuthPacket packet = new MysqlAuthPacket();
-        Assert.assertTrue(packet.readFrom(byteBuffer));
-        Assert.assertEquals("palo-user", packet.getUser());
-        Assert.assertEquals("testDb", packet.getDb());
+        Assertions.assertTrue(packet.readFrom(byteBuffer));
+        Assertions.assertEquals("palo-user", packet.getUser());
+        Assertions.assertEquals("testDb", packet.getDb());
+        Assertions.assertEquals("oidc-token", new String(packet.getAuthResponse(), StandardCharsets.UTF_8));
+        Assertions.assertEquals(OIDC_PLUGIN_NAME, packet.getPluginName());
+        Assertions.assertEquals("mysql", packet.getConnectAttributes().get("_client_name"));
+        Assertions.assertEquals("9.2.0", packet.getConnectAttributes().get("_client_version"));
     }
-
 }

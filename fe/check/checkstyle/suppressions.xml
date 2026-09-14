@@ -23,6 +23,16 @@ under the License.
     "https://checkstyle.org/dtds/suppressions_1_2.dtd">
 
 <suppressions>
+    <!--
+      TEMPORARY. be-java-extensions is the one place left with JUnit 4 tests; those modules are
+      being rewritten in apache/doris#66729, so they are migrated there rather than conflicted
+      with here. Delete this suppression once that lands, and junit-vintage-engine in fe/pom.xml
+      with it - at that point nothing in this reactor runs a JUnit 4 test, and junit:junit stops
+      reaching the build. (The workflow's pkg:maven/junit/junit exception stays: the standalone
+      samples/ projects still declare junit:junit directly.)
+    -->
+    <suppress files="[\\/]be-java-extensions[\\/]" id="banJUnit4"/>
+
     <!-- Excludes test files from having Javadocs for classes and methods -->
     <suppress files="[\\/]jmockit[\\/]" checks=".*" />
     <suppress files="[\\/]test[\\/]" checks="MissingJavadocMethod" />
@@ -69,6 +79,13 @@ under the License.
     <!-- ignore hudi disk map copied from hudi/common/util/collection/DiskMap.java -->
     <suppress files="org[\\/]apache[\\/]hudi[\\/]common[\\/]util[\\/]collection[\\/]DiskMap\.java" checks="[a-zA-Z0-9]*"/>
 
+    <!-- ignore iceberg delete file index copied from iceberg/DeleteFileIndex.java -->
+    <suppress files="org[\\/]apache[\\/]iceberg[\\/]DeleteFileIndex\.java" checks="[a-zA-Z0-9]*"/>
+    <!-- Iceberg package access is required to preserve historical schema binding in DataTableScan. -->
+    <suppress files="org[\\/]apache[\\/]iceberg[\\/]SchemaAwareDataTableScan\.java" checks="[a-zA-Z0-9]*"/>
+
     <!-- ignore gensrc/thrift/ExternalTableSchema.thrift -->
     <suppress files=".*thrift/schema/external/.*" checks=".*"/>
+    <suppress files="software/amazon/awssdk/core/client/builder/SdkDefaultClientBuilder.java" checks=".*"/>
+    <suppress files="software/amazon/awssdk/core/client/builder/UncloseableScheduledExecutorService.java" checks=".*"/>
 </suppressions>

@@ -32,27 +32,26 @@
 
 #include "common/exception.h"
 #include "common/object_pool.h"
+#include "core/column/column_nothing.h"
+#include "core/data_type/data_type_array.h"
+#include "core/data_type/data_type_decimal.h"
+#include "core/data_type/data_type_factory.hpp"
+#include "core/data_type/data_type_map.h"
+#include "core/data_type/data_type_struct.h"
+#include "core/types.h"
+#include "exec/common/util.hpp"
+#include "exprs/aggregate/aggregate_function.h"
+#include "exprs/function/function_helpers.h"
+#include "exprs/vexpr.h"
 #include "util/string_util.h"
-#include "vec/aggregate_functions/aggregate_function.h"
-#include "vec/columns/column_nothing.h"
-#include "vec/core/types.h"
-#include "vec/data_types/data_type_array.h"
-#include "vec/data_types/data_type_decimal.h"
-#include "vec/data_types/data_type_factory.hpp"
-#include "vec/data_types/data_type_map.h"
-#include "vec/data_types/data_type_struct.h"
-#include "vec/exprs/vexpr.h"
-#include "vec/functions/function_helpers.h"
-#include "vec/utils/util.hpp"
 
 namespace doris {
-#include "common/compile_check_begin.h"
 const int RowDescriptor::INVALID_IDX = -1;
 
 SlotDescriptor::SlotDescriptor(const TSlotDescriptor& tdesc)
         : _id(tdesc.id),
-          _type(vectorized::DataTypeFactory::instance().create_data_type(
-                  tdesc.slotType, tdesc.nullIndicatorBit != -1)),
+          _type(DataTypeFactory::instance().create_data_type(tdesc.slotType,
+                                                             tdesc.nullIndicatorBit != -1)),
           _parent(tdesc.parent),
           _col_pos(tdesc.columnPos),
           _col_name(tdesc.colName),
@@ -90,8 +89,8 @@ SlotDescriptor::SlotDescriptor(const TSlotDescriptor& tdesc)
 
 SlotDescriptor::SlotDescriptor(const PSlotDescriptor& pdesc)
         : _id(pdesc.id()),
-          _type(vectorized::DataTypeFactory::instance().create_data_type(
-                  pdesc.slot_type(), pdesc.null_indicator_bit() != -1)),
+          _type(DataTypeFactory::instance().create_data_type(pdesc.slot_type(),
+                                                             pdesc.null_indicator_bit() != -1)),
           _parent(pdesc.parent()),
           _col_pos(pdesc.column_pos()),
           _col_name(pdesc.col_name()),
@@ -105,6 +104,9 @@ SlotDescriptor::SlotDescriptor(const PSlotDescriptor& pdesc)
     auto convert_to_thrift_column_access_path = [](const PColumnAccessPath& pb_path) {
         TColumnAccessPath thrift_path;
         thrift_path.type = (TAccessPathType::type)pb_path.type();
+        if (pb_path.has_version()) {
+            thrift_path.__set_version(pb_path.version());
+        }
         if (pb_path.has_data_access_path()) {
             thrift_path.__isset.data_access_path = true;
             for (int i = 0; i < pb_path.data_access_path().path_size(); ++i) {
@@ -161,6 +163,9 @@ void SlotDescriptor::to_protobuf(PSlotDescriptor* pslot) const {
                                                      doris::PColumnAccessPath* pb_path) {
         pb_path->Clear();
         pb_path->set_type((PAccessPathType)thrift_path.type); // 使用 reinterpret_cast 进行类型转换
+        if (thrift_path.__isset.version) {
+            pb_path->set_version(thrift_path.version);
+        }
         if (thrift_path.__isset.data_access_path) {
             auto* pb_data = pb_path->mutable_data_access_path();
             pb_data->Clear();
@@ -186,13 +191,13 @@ void SlotDescriptor::to_protobuf(PSlotDescriptor* pslot) const {
     }
 }
 
-vectorized::DataTypePtr SlotDescriptor::get_data_type_ptr() const {
-    return vectorized::get_data_type_with_default_argument(type());
+DataTypePtr SlotDescriptor::get_data_type_ptr() const {
+    return get_data_type_with_default_argument(type());
 }
 
-vectorized::MutableColumnPtr SlotDescriptor::get_empty_mutable_column() const {
+MutableColumnPtr SlotDescriptor::get_empty_mutable_column() const {
     if (this->get_virtual_column_expr() != nullptr) {
-        return vectorized::ColumnNothing::create(0);
+        return ColumnNothing::create(0);
     }
 
     return type()->create_column();
@@ -309,6 +314,15 @@ MaxComputeTableDescriptor::MaxComputeTableDescriptor(const TTableDescriptor& tde
     } else {
         _init_status =
                 Status::InvalidArgument("fail to init MaxComputeTableDescriptor, missing quota.");
+    }
+
+    if (tdesc.mcTable.__isset.properties) [[likely]] {
+        _props = tdesc.mcTable.properties;
+    } else {
+        static const std::string MC_ACCESS_KEY = "mc.access_key";
+        static const std::string MC_SECRET_KEY = "mc.secret_key";
+        _props.insert({MC_ACCESS_KEY, _access_key});
+        _props.insert({MC_SECRET_KEY, _secret_key});
     }
 }
 
@@ -455,6 +469,16 @@ std::string TupleDescriptor::debug_string() const {
     out << " has_varlen_slots=" << _has_varlen_slots;
     out << ")";
     return out.str();
+}
+
+int TupleDescriptor::get_column_id(SlotId slot_id) const {
+    for (int column_id = 0; auto* slot : slots()) {
+        if (slot->id() == slot_id) {
+            return column_id;
+        }
+        ++column_id;
+    }
+    return -1;
 }
 
 RowDescriptor::RowDescriptor(const DescriptorTbl& desc_tbl,
@@ -733,5 +757,4 @@ std::string DescriptorTbl::debug_string() const {
 
     return out.str();
 }
-#include "common/compile_check_end.h"
 } // namespace doris

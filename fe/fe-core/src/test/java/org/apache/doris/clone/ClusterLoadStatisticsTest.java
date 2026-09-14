@@ -19,7 +19,8 @@ package org.apache.doris.clone;
 
 import org.apache.doris.catalog.DiskInfo;
 import org.apache.doris.catalog.Env;
-import org.apache.doris.catalog.Replica;
+import org.apache.doris.catalog.LocalReplica;
+import org.apache.doris.catalog.LocalTabletInvertedIndex;
 import org.apache.doris.catalog.Replica.ReplicaState;
 import org.apache.doris.catalog.TabletInvertedIndex;
 import org.apache.doris.catalog.TabletMeta;
@@ -31,9 +32,9 @@ import org.apache.doris.thrift.TStorageMedium;
 
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Maps;
-import org.junit.Assert;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.Map;
@@ -49,7 +50,7 @@ public class ClusterLoadStatisticsTest {
     private SystemInfoService systemInfoService;
     private TabletInvertedIndex invertedIndex;
 
-    @Before
+    @BeforeEach
     public void setUp() {
         // be1
         // 50%, 95%, 2%
@@ -148,20 +149,23 @@ public class ClusterLoadStatisticsTest {
         systemInfoService.addBackend(be4);
 
         // tablet
-        invertedIndex = new TabletInvertedIndex();
+        invertedIndex = new LocalTabletInvertedIndex();
 
-        invertedIndex.addTablet(50000, new TabletMeta(1, 2, 3, 4, 5, TStorageMedium.HDD));
-        invertedIndex.addReplica(50000, new Replica(50001, be1.getId(), 0, ReplicaState.NORMAL));
-        invertedIndex.addReplica(50000, new Replica(50002, be2.getId(), 0, ReplicaState.NORMAL));
-        invertedIndex.addReplica(50000, new Replica(50003, be3.getId(), 0, ReplicaState.NORMAL));
+        invertedIndex.addTablet(50000, new TabletMeta(1, 2, 3, 4, 5, TStorageMedium.HDD,
+                false /* isRowBinlog */));
+        invertedIndex.addReplica(50000, new LocalReplica(50001, be1.getId(), 0, ReplicaState.NORMAL));
+        invertedIndex.addReplica(50000, new LocalReplica(50002, be2.getId(), 0, ReplicaState.NORMAL));
+        invertedIndex.addReplica(50000, new LocalReplica(50003, be3.getId(), 0, ReplicaState.NORMAL));
 
-        invertedIndex.addTablet(60000, new TabletMeta(1, 2, 3, 4, 5, TStorageMedium.HDD));
-        invertedIndex.addReplica(60000, new Replica(60002, be2.getId(), 0, ReplicaState.NORMAL));
-        invertedIndex.addReplica(60000, new Replica(60003, be3.getId(), 0, ReplicaState.NORMAL));
+        invertedIndex.addTablet(60000, new TabletMeta(1, 2, 3, 4, 5, TStorageMedium.HDD,
+                false /* isRowBinlog */));
+        invertedIndex.addReplica(60000, new LocalReplica(60002, be2.getId(), 0, ReplicaState.NORMAL));
+        invertedIndex.addReplica(60000, new LocalReplica(60003, be3.getId(), 0, ReplicaState.NORMAL));
 
-        invertedIndex.addTablet(70000, new TabletMeta(1, 2, 3, 4, 5, TStorageMedium.HDD));
-        invertedIndex.addReplica(70000, new Replica(70002, be2.getId(), 0, ReplicaState.NORMAL));
-        invertedIndex.addReplica(70000, new Replica(70003, be3.getId(), 0, ReplicaState.NORMAL));
+        invertedIndex.addTablet(70000, new TabletMeta(1, 2, 3, 4, 5, TStorageMedium.HDD,
+                false /* isRowBinlog */));
+        invertedIndex.addReplica(70000, new LocalReplica(70002, be2.getId(), 0, ReplicaState.NORMAL));
+        invertedIndex.addReplica(70000, new LocalReplica(70003, be3.getId(), 0, ReplicaState.NORMAL));
     }
 
     @Test
@@ -170,15 +174,15 @@ public class ClusterLoadStatisticsTest {
                 Tag.DEFAULT_BACKEND_TAG, systemInfoService, invertedIndex, null);
         loadStatistic.init();
         List<List<String>> infos = loadStatistic.getStatistic(TStorageMedium.HDD);
-        Assert.assertEquals(3, infos.size());
+        Assertions.assertEquals(3, infos.size());
         BackendLoadStatistic beStat1 = loadStatistic.getBackendLoadStatistic(be1.getId());
-        Assert.assertNotNull(beStat1);
+        Assertions.assertNotNull(beStat1);
         RootPathLoadStatistic path2 = beStat1.getPathStatisticByPathHash(1002);
         RootPathLoadStatistic path3 = beStat1.getPathStatisticByPathHash(1003);
-        Assert.assertEquals(Classification.HIGH, path2.getLocalClazz());
-        Assert.assertEquals(Classification.HIGH, path2.getGlobalClazz());
-        Assert.assertEquals(Classification.LOW, path3.getLocalClazz());
-        Assert.assertEquals(Classification.LOW, path3.getGlobalClazz());
+        Assertions.assertEquals(Classification.HIGH, path2.getLocalClazz());
+        Assertions.assertEquals(Classification.HIGH, path2.getGlobalClazz());
+        Assertions.assertEquals(Classification.LOW, path3.getLocalClazz());
+        Assertions.assertEquals(Classification.LOW, path3.getGlobalClazz());
     }
 
 }

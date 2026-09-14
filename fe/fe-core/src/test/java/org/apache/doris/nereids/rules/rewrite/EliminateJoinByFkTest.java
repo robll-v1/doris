@@ -49,7 +49,7 @@ class EliminateJoinByFkTest extends TestWithFeService implements MemoPatternMatc
     @Override
     protected void runBeforeAll() throws Exception {
         createDatabase("test");
-        connectContext.setDatabase("default_cluster:test");
+        connectContext.setDatabase("test");
         createTables(
                 "CREATE TABLE IF NOT EXISTS pri (\n"
                         + "    id1 int not null\n"
@@ -68,9 +68,16 @@ class EliminateJoinByFkTest extends TestWithFeService implements MemoPatternMatc
                         + ")\n"
                         + "UNIQUE KEY(id3)\n"
                         + "DISTRIBUTED BY HASH(id3) BUCKETS 10\n"
+                        + "PROPERTIES (\"replication_num\" = \"1\")\n",
+                "CREATE TABLE IF NOT EXISTS unrelated_pri (\n"
+                        + "    id1 int not null\n"
+                        + ")\n"
+                        + "UNIQUE KEY(id1)\n"
+                        + "DISTRIBUTED BY HASH(id1) BUCKETS 10\n"
                         + "PROPERTIES (\"replication_num\" = \"1\")\n"
         );
         addConstraint("Alter table pri add constraint pk primary key (id1)");
+        addConstraint("Alter table unrelated_pri add constraint unrelated_pk primary key (id1)");
         addConstraint("Alter table foreign_not_null add constraint f_not_null foreign key (id2)\n"
                 + "references pri(id1)");
         addConstraint("Alter table foreign_null add constraint f_not_null foreign key (id3)\n"
@@ -103,6 +110,17 @@ class EliminateJoinByFkTest extends TestWithFeService implements MemoPatternMatc
                 .analyze(sql)
                 .rewrite()
                 .nonMatch(logicalJoin())
+                .printlnTree();
+    }
+
+    @Test
+    void testDoNotEliminateJoinWithUnrelatedPrimaryTable() {
+        String sql = "select foreign_not_null.id2 from unrelated_pri "
+                + "inner join foreign_not_null on unrelated_pri.id1 = foreign_not_null.id2";
+        PlanChecker.from(connectContext)
+                .analyze(sql)
+                .rewrite()
+                .matches(logicalJoin())
                 .printlnTree();
     }
 
@@ -289,5 +307,26 @@ class EliminateJoinByFkTest extends TestWithFeService implements MemoPatternMatc
                 ImmutableSet.of(new Not(new IsNull(null1)), new Not(new IsNull(null2))),
                 oneRowRelation);
         Assertions.assertEquals(expectFilter, result2.first);
+    }
+
+    @Test
+    void testAsofJoinUnchange() {
+        String sql = "select pri.id1 from pri asof inner join foreign_not_null "
+                + "match_condition(cast(pri.id1 as datetime) > cast(foreign_not_null.id2 as datetime)) "
+                + "on pri.id1 = foreign_not_null.id2";
+        PlanChecker.from(connectContext)
+                .analyze(sql)
+                .rewrite()
+                .anyMatches(logicalJoin())
+                .printlnTree();
+
+        sql = "select foreign_not_null.id2 from pri asof join foreign_not_null "
+                + "match_condition(cast(pri.id1 as datetime) > cast(foreign_not_null.id2 as datetime)) "
+                + "on pri.id1 = foreign_not_null.id2";
+        PlanChecker.from(connectContext)
+                .analyze(sql)
+                .rewrite()
+                .anyMatches(logicalJoin())
+                .printlnTree();
     }
 }

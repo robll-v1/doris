@@ -20,6 +20,8 @@ package org.apache.doris.clone;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.DiskInfo;
 import org.apache.doris.catalog.Env;
+import org.apache.doris.catalog.LocalReplica;
+import org.apache.doris.catalog.LocalTablet;
 import org.apache.doris.catalog.MaterializedIndex;
 import org.apache.doris.catalog.MysqlCompatibleDatabase;
 import org.apache.doris.catalog.OlapTable;
@@ -47,6 +49,22 @@ public class RebalancerTestUtil {
     // Add only one path, PathHash:id
     public static Backend createBackend(long id, long totalCap, long usedCap) {
         return createBackend(id, totalCap, Lists.newArrayList(usedCap), 1);
+    }
+
+    // Add only one path with specified storage medium, PathHash:id
+    public static Backend createBackend(long id, long totalCap, long usedCap, TStorageMedium medium) {
+        Backend be = new Backend(id, "192.168.0." + id, 9051);
+        Map<String, DiskInfo> disks = Maps.newHashMap();
+        DiskInfo diskInfo = new DiskInfo("/path1");
+        diskInfo.setPathHash(id);
+        diskInfo.setTotalCapacityB(totalCap);
+        diskInfo.setDataUsedCapacityB(usedCap);
+        diskInfo.setAvailableCapacityB(totalCap - usedCap);
+        diskInfo.setStorageMedium(medium);
+        disks.put(diskInfo.getRootPath(), diskInfo);
+        be.setDisks(ImmutableMap.copyOf(disks));
+        be.setAlive(true);
+        return be;
     }
 
     /**
@@ -84,8 +102,8 @@ public class RebalancerTestUtil {
         int schemaHash = olapTable.getSchemaHashByIndexId(baseIndex.getId());
 
         TabletMeta tabletMeta = new TabletMeta(db.getId(), olapTable.getId(),
-                partition.getId(), baseIndex.getId(), schemaHash, medium);
-        Tablet tablet = new Tablet(tabletId);
+                partition.getId(), baseIndex.getId(), schemaHash, medium, false /* isRowBinlog */);
+        Tablet tablet = new LocalTablet(tabletId);
 
         // add tablet to olapTable
         olapTable.getPartition("p0").getBaseIndex().addTablet(tablet, tabletMeta);
@@ -99,7 +117,8 @@ public class RebalancerTestUtil {
         invertedIndex.addTablet(tablet.getId(), tabletMeta);
 
         IntStream.range(0, beIds.size()).forEach(i -> {
-            Replica replica = new Replica(tablet.getId() + i, beIds.get(i), Replica.ReplicaState.NORMAL, 1, tabletMeta.getOldSchemaHash());
+            Replica replica = new LocalReplica(tablet.getId() + i, beIds.get(i), Replica.ReplicaState.NORMAL, 1,
+                    tabletMeta.getOldSchemaHash());
             // We've set pathHash to beId for simplicity
             replica.setPathHash(beIds.get(i));
             if (replicaSizes != null) {

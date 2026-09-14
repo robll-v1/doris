@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("test_iceberg_insert_overwrite", "p0,external,iceberg,external_docker,external_docker_iceberg") {
+suite("test_iceberg_insert_overwrite", "p0,external") {
     def format_compressions = ["parquet_zstd", "orc_zlib"]
 
     def q01 = { String format_compression, String catalog_name ->
@@ -831,6 +831,7 @@ suite("test_iceberg_insert_overwrite", "p0,external,iceberg,external_docker,exte
                 'type'='hms',
                 'hive.metastore.uris' = 'thrift://${externalEnvIp}:${hms_port}',
                 'fs.defaultFS' = 'hdfs://${externalEnvIp}:${hdfs_port}',
+                'hive.parquet.time-zone' = 'Asia/Shanghai',
                 'use_meta_cache' = 'true'
             );"""
 

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("test_mysql_all_types_select", "p0,external,mysql,external_docker,external_docker_mysql") {
+suite("test_mysql_all_types_select", "p0,external") {
     String enabled = context.config.otherConfigs.get("enableJdbcTest")
     String externalEnvIp = context.config.otherConfigs.get("externalEnvIp")
     String s3_endpoint = getS3Endpoint()
@@ -50,6 +50,7 @@ suite("test_mysql_all_types_select", "p0,external,mysql,external_docker,external
 
 
         sql """use mysql_all_type_test.test_varbinary_db"""
+        sql """ CALL EXECUTE_STMT("mysql_all_type_test", "delete from test_varbinary_db.test_varbinary where id in (3, 4, 5)") """
         qt_desc_varbinary_type """desc test_varbinary;"""
         qt_select_varbinary_type """select * from test_varbinary order by id;"""
         qt_select_varbinary_type2 """insert into test_varbinary values(3, X'48656C6C6F20576F726C6421');"""
@@ -58,5 +59,27 @@ suite("test_mysql_all_types_select", "p0,external,mysql,external_docker,external
         qt_select_varbinary_type5 """select * from test_varbinary order by id;"""
 
         sql """drop catalog if exists mysql_all_type_test """
+
+        sql """drop catalog if exists mysql_timestamp_tz_type_test """
+        sql """create catalog if not exists mysql_timestamp_tz_type_test properties(
+            "type"="jdbc",
+            "user"="root",
+            "password"="123456",
+            "jdbc_url" = "jdbc:mysql://${externalEnvIp}:${mysql_port}/doris_test?useSSL=false",
+            "driver_url" = "${driver_url}",
+            "driver_class" = "com.mysql.cj.jdbc.Driver",
+            "enable.mapping.varbinary" = "true",
+            "enable.mapping.timestamp_tz" = "true"
+        );"""
+        sql """SET time_zone = '+08:00';"""
+        sql """use mysql_timestamp_tz_type_test.test_timestamp_tz_db"""
+        sql """ CALL EXECUTE_STMT("mysql_timestamp_tz_type_test", "delete from test_timestamp_tz_db.ts_test where id in (3, 4)") """
+        qt_desc_timestamp_tz """desc ts_test;"""
+        qt_select_timestamp_tz """select * from ts_test order by id;"""
+        qt_select_timestamp_tz2 """insert into ts_test values(3,"1999-10-10 12:00:00+08:00","1999-10-10 12:00:00");"""
+        qt_select_timestamp_tz3 """insert into ts_test values(4,NULL, NULL);"""
+        qt_select_timestamp_tz5 """select * from ts_test order by id;"""
+        sql """SET time_zone = '+00:00';"""
+        qt_select_timestamp_tz6 """select * from ts_test order by id;"""
     }
 }

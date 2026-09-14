@@ -16,6 +16,7 @@
 // under the License.
 
 suite('project_distinct_to_agg') {
+    sql "set parallel_pipeline_task_num=2"
     def tbl = 'tbl_project_distinct_to_agg'
     sql "SET ignore_shape_nodes='PhysicalDistribute'"
     sql "drop table if exists ${tbl} force"
@@ -29,4 +30,21 @@ suite('project_distinct_to_agg') {
     explainAndOrderResult 'agg',  "select distinct sum(a) from ${tbl}"
 
     sql "drop table if exists ${tbl} force"
+
+    qt_select '''
+        (
+        SELECT
+            DISTINCT t_alias.u_col, cast(1 as bigint)
+        FROM (select [1,1,1] k1) as t
+            lateral view explode(k1) t_alias as u_col
+        )
+        UNION ALL (
+            SELECT
+                DISTINCT 1, t_alias.u_col
+            FROM (select [2,2,2] k1) as t
+                lateral view explode(k1) t_alias as u_col
+        )
+        ORDER BY
+            1, 2;
+    '''
 }

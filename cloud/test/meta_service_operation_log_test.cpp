@@ -47,6 +47,8 @@ extern void create_tablet(MetaServiceProxy* meta_service, int64_t table_id, int6
                           int64_t partition_id, int64_t tablet_id);
 extern doris::RowsetMetaCloudPB create_rowset(int64_t txn_id, int64_t tablet_id, int partition_id,
                                               int64_t version, int num_rows);
+extern void prepare_rowset(MetaServiceProxy* meta_service, const doris::RowsetMetaCloudPB& rowset,
+                           CreateRowsetResponse& res);
 extern void commit_rowset(MetaServiceProxy* meta_service, const doris::RowsetMetaCloudPB& rowset,
                           CreateRowsetResponse& res);
 extern void add_tablet(CreateTabletsRequest& req, int64_t table_id, int64_t index_id,
@@ -425,6 +427,7 @@ TEST(MetaServiceOperationLogTest, CommitIndexLog) {
     constexpr int64_t db_id = 123;
     constexpr int64_t table_id = 10001;
     constexpr int64_t index_id = 10002;
+    constexpr int64_t part_id = 10003;
 
     {
         // write instance
@@ -461,12 +464,17 @@ TEST(MetaServiceOperationLogTest, CommitIndexLog) {
         req.set_table_id(table_id);
         req.add_index_ids(index_id);
         req.set_is_new_table(true);
+        for (size_t i = 0; i < 5; i++) {
+            req.add_partition_ids(part_id + i);
+        }
         meta_service->commit_index(&ctrl, &req, &res, nullptr);
         ASSERT_EQ(res.status().code(), MetaServiceCode::OK) << res.status().DebugString();
     }
 
     auto txn_kv = meta_service->txn_kv();
     Versionstamp version1;
+    Versionstamp version2;
+
     {
         // Verify index meta/index/inverted indexes are exists
         std::string index_meta_key = versioned::meta_index_key({instance_id, index_id});
@@ -488,7 +496,35 @@ TEST(MetaServiceOperationLogTest, CommitIndexLog) {
         ASSERT_EQ(index_index.table_id(), table_id);
     }
 
-    Versionstamp version2;
+    {
+        // Verify table version exists
+        MetaReader meta_reader(instance_id, txn_kv.get());
+        ASSERT_EQ(meta_reader.get_table_version(table_id, &version2), TxnErrorCode::TXN_OK);
+    }
+
+    {
+        for (size_t i = 0; i < 5; i++) {
+            std::string part_index_key = versioned::partition_index_key({instance_id, part_id + i});
+            std::string part_meta_key = versioned::meta_partition_key({instance_id, part_id + i});
+            std::string part_inverted_index_key = versioned::partition_inverted_index_key(
+                    {instance_id, db_id, table_id, part_id + i});
+            std::unique_ptr<Transaction> txn;
+            ASSERT_EQ(txn_kv->create_txn(&txn), TxnErrorCode::TXN_OK);
+            std::string value;
+            ASSERT_EQ(versioned_get(txn.get(), part_meta_key, &version1, &value),
+                      TxnErrorCode::TXN_OK);
+
+            ASSERT_EQ(txn->get(part_index_key, &value), TxnErrorCode::TXN_OK);
+
+            PartitionIndexPB part_index;
+            ASSERT_TRUE(part_index.ParseFromString(value));
+            ASSERT_EQ(part_index.db_id(), db_id);
+            ASSERT_EQ(part_index.table_id(), table_id);
+
+            ASSERT_EQ(txn->get(part_inverted_index_key, &value), TxnErrorCode::TXN_OK);
+        }
+    }
+
     {
         // Verify table version exists
         MetaReader meta_reader(instance_id, txn_kv.get());
@@ -807,7 +843,7 @@ TEST(MetaServiceOperationLogTest, CommitTxn) {
         LOG(INFO) << "Creating rowset for tablet_id=" << (tablet_id_base + i)
                   << ", partition_id=" << partition_id << ", txn_id=" << txn_id
                   << ", rowset=" << tmp_rowset.ShortDebugString();
-
+        prepare_rowset(meta_service.get(), tmp_rowset, res);
         commit_rowset(meta_service.get(), tmp_rowset, res);
         ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
     }
@@ -1014,6 +1050,7 @@ TEST(MetaServiceOperationLogTest, CommitTxnEventually) {
     create_tablet(meta_service.get(), table_id, 1237, partition_id, tablet_id_base);
     auto tmp_rowset = create_rowset(txn_id, tablet_id_base, partition_id, 1, 100);
     CreateRowsetResponse res;
+    prepare_rowset(meta_service.get(), tmp_rowset, res);
     commit_rowset(meta_service.get(), tmp_rowset, res);
     ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
 
@@ -1239,6 +1276,7 @@ TEST(MetaServiceOperationLogTest, CommitTxnWithSubTxn) {
         create_tablet(meta_service.get(), table_id, 1238, partition_id, tablet_id_base + i);
         auto tmp_rowset = create_rowset(sub_txn_id, tablet_id_base + i, partition_id, 1, 100);
         CreateRowsetResponse res;
+        prepare_rowset(meta_service.get(), tmp_rowset, res);
         commit_rowset(meta_service.get(), tmp_rowset, res);
         ASSERT_EQ(res.status().code(), MetaServiceCode::OK);
     }
@@ -1258,6 +1296,8 @@ TEST(MetaServiceOperationLogTest, CommitTxnWithSubTxn) {
         meta_service->commit_txn(reinterpret_cast<::google::protobuf::RpcController*>(&cntl), &req,
                                  &commit_res, nullptr);
         ASSERT_EQ(commit_res.status().code(), MetaServiceCode::OK);
+        ASSERT_TRUE(commit_res.has_version_update_time_ms());
+        ASSERT_GT(commit_res.version_update_time_ms(), 0);
     }
 
     auto txn_kv = meta_service->txn_kv();
@@ -1356,12 +1396,17 @@ TEST(MetaServiceOperationLogTest, CommitTxnWithSubTxn) {
         VersionPB versioned_partition_version;
         ASSERT_TRUE(versioned_partition_version.ParseFromString(partition_version_val));
         ASSERT_EQ(versionstamp, commit_versionstamp);
+        ASSERT_TRUE(versioned_partition_version.has_update_time_ms());
+        ASSERT_EQ(versioned_partition_version.update_time_ms(),
+                  commit_res.version_update_time_ms());
 
         key = partition_version_key({instance_id, db_id, table_id, partition_id});
         ASSERT_EQ(txn->get(key, &partition_version_val), TxnErrorCode::TXN_OK);
         VersionPB partition_version;
         ASSERT_TRUE(partition_version.ParseFromString(partition_version_val));
         ASSERT_EQ(versioned_partition_version.version(), partition_version.version());
+        ASSERT_TRUE(partition_version.has_update_time_ms());
+        ASSERT_EQ(partition_version.update_time_ms(), commit_res.version_update_time_ms());
     }
 
     {

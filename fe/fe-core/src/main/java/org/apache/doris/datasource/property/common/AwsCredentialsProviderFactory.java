@@ -23,8 +23,6 @@ package org.apache.doris.datasource.property.common;
 
 
 import software.amazon.awssdk.auth.credentials.AnonymousCredentialsProvider;
-import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
-import software.amazon.awssdk.auth.credentials.AwsCredentialsProviderChain;
 import software.amazon.awssdk.auth.credentials.ContainerCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.EnvironmentVariableCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.InstanceProfileCredentialsProvider;
@@ -40,89 +38,17 @@ public final class AwsCredentialsProviderFactory {
     }
 
     /* =========================
-     * AWS SDK V1
-     * ========================= */
-
-    public static com.amazonaws.auth.AWSCredentialsProvider createV1(
-            AwsCredentialsProviderMode mode) {
-
-        switch (mode) {
-            case ENV:
-                return new com.amazonaws.auth.EnvironmentVariableCredentialsProvider();
-            case SYSTEM_PROPERTIES:
-                return new com.amazonaws.auth.SystemPropertiesCredentialsProvider();
-            case WEB_IDENTITY:
-                return com.amazonaws.auth.WebIdentityTokenCredentialsProvider.create();
-            case CONTAINER:
-                return new com.amazonaws.auth.EC2ContainerCredentialsProviderWrapper();
-            case ANONYMOUS:
-                throw new UnsupportedOperationException(
-                        "AWS SDK V1 does not support anonymous credentials provider.");
-            case INSTANCE_PROFILE:
-                return new com.amazonaws.auth.InstanceProfileCredentialsProvider();
-            case DEFAULT:
-                return createDefaultV1();
-            default:
-                throw new UnsupportedOperationException(
-                        "AWS SDK V1 does not support credentials provider mode: " + mode);
-        }
-    }
-
-    private static com.amazonaws.auth.AWSCredentialsProvider createDefaultV1() {
-        List<com.amazonaws.auth.AWSCredentialsProvider> providers = new ArrayList<>();
-        providers.add(new com.amazonaws.auth.InstanceProfileCredentialsProvider());
-        //lazy + env
-        providers.add(com.amazonaws.auth.WebIdentityTokenCredentialsProvider.create());
-        providers.add(new com.amazonaws.auth.EC2ContainerCredentialsProviderWrapper());
-        providers.add(new com.amazonaws.auth.EnvironmentVariableCredentialsProvider());
-        providers.add(new com.amazonaws.auth.SystemPropertiesCredentialsProvider());
-        return new com.amazonaws.auth.AWSCredentialsProviderChain(
-                providers.toArray(new com.amazonaws.auth.AWSCredentialsProvider[0]));
-    }
-
-    /* =========================
      * AWS SDK V2
      * ========================= */
 
-    public static AwsCredentialsProvider createV2(
-            AwsCredentialsProviderMode mode,
-            boolean includeAnonymousInDefault) {
-        switch (mode) {
-            case ENV:
-                return EnvironmentVariableCredentialsProvider.create();
-            case SYSTEM_PROPERTIES:
-                return SystemPropertyCredentialsProvider.create();
-            case WEB_IDENTITY:
-                return WebIdentityTokenFileCredentialsProvider.create();
-            case CONTAINER:
-                return ContainerCredentialsProvider.create();
-            case INSTANCE_PROFILE:
-                return InstanceProfileCredentialsProvider.create();
-            case ANONYMOUS:
-                return AnonymousCredentialsProvider.create();
-            case DEFAULT:
-                return createDefaultV2(includeAnonymousInDefault);
-            default:
-                throw new UnsupportedOperationException(
-                        "AWS SDK V2 does not support credentials provider mode: " + mode);
-        }
+    private static boolean isWebIdentityConfigured() {
+        return System.getenv("AWS_ROLE_ARN") != null
+                && System.getenv("AWS_WEB_IDENTITY_TOKEN_FILE") != null;
     }
 
-    private static AwsCredentialsProvider createDefaultV2(
-            boolean includeAnonymous) {
-
-        List<AwsCredentialsProvider> providers = new ArrayList<>();
-        providers.add(InstanceProfileCredentialsProvider.create());
-        providers.add(WebIdentityTokenFileCredentialsProvider.create());
-        providers.add(ContainerCredentialsProvider.create());
-        providers.add(EnvironmentVariableCredentialsProvider.create());
-        providers.add(SystemPropertyCredentialsProvider.create());
-        if (includeAnonymous) {
-            providers.add(AnonymousCredentialsProvider.create());
-        }
-        return AwsCredentialsProviderChain.builder()
-                .credentialsProviders(providers)
-                .build();
+    private static boolean isContainerCredentialsConfigured() {
+        return System.getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI") != null
+                || System.getenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") != null;
     }
 
     public static String getV2ClassName(AwsCredentialsProviderMode mode, boolean includeAnonymousInDefault) {
@@ -143,16 +69,21 @@ public final class AwsCredentialsProviderFactory {
                 List<String> providers = new ArrayList<>();
                 providers.add(EnvironmentVariableCredentialsProvider.class.getName());
                 providers.add(SystemPropertyCredentialsProvider.class.getName());
-                providers.add(WebIdentityTokenFileCredentialsProvider.class.getName());
-                providers.add(ContainerCredentialsProvider.class.getName());
                 providers.add(InstanceProfileCredentialsProvider.class.getName());
+                if (isWebIdentityConfigured()) {
+                    providers.add(WebIdentityTokenFileCredentialsProvider.class.getName());
+                }
+                if (isContainerCredentialsConfigured()) {
+                    providers.add(ContainerCredentialsProvider.class.getName());
+                }
                 if (includeAnonymousInDefault) {
                     providers.add(AnonymousCredentialsProvider.class.getName());
                 }
-                return String.join("+", providers);
+                return String.join(",", providers);
             default:
                 throw new UnsupportedOperationException(
                         "AWS SDK V2 does not support credentials provider mode: " + mode);
         }
     }
+
 }

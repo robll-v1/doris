@@ -17,17 +17,14 @@
 
 package org.apache.doris.common.classloader;
 
-import org.apache.doris.common.jni.utils.ExpiringMap;
-import org.apache.doris.common.jni.utils.Log4jOutputStream;
 import org.apache.doris.common.jni.utils.UdfClassCache;
 
 import com.google.common.collect.Streams;
-import org.apache.log4j.Level;
-import org.apache.log4j.Logger;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import java.io.File;
 import java.io.IOException;
-import java.io.PrintStream;
 import java.io.UncheckedIOException;
 import java.net.MalformedURLException;
 import java.net.URL;
@@ -39,6 +36,7 @@ import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import java.util.stream.Collectors;
@@ -47,9 +45,66 @@ import java.util.stream.Collectors;
  * BE will load scanners by JNI call, and then the JniConnector on BE will get scanner class by getLoadedClass.
  */
 public class ScannerLoader {
-    public static final Logger LOG = Logger.getLogger(ScannerLoader.class);
+    static {
+        // Explicitly initialize log4j2 to ensure logging works in JNI environment
+        try {
+            // Set logPath system property if not already set or normalize it
+            String logPath = System.getProperty("logPath");
+            if (logPath == null || logPath.isEmpty()) {
+                String dorisHome = System.getenv("DORIS_HOME");
+                if (dorisHome != null) {
+                    logPath = dorisHome + "/log/jni.log";
+                }
+            }
+            // Normalize path to remove double slashes
+            if (logPath != null) {
+                logPath = logPath.replaceAll("//+", "/");
+                System.setProperty("logPath", logPath);
+            }
+
+            // Point log4j2 to our configuration file in classpath
+            System.setProperty("log4j2.configurationFile", "log4j2.properties");
+
+            // Disable log4j2's shutdown hook to prevent premature shutdown in JNI environment
+            System.setProperty("log4j.shutdownHookEnabled", "false");
+
+            // Force log4j2 to reconfigure with our settings
+            org.apache.logging.log4j.core.LoggerContext ctx =
+                    (org.apache.logging.log4j.core.LoggerContext) LogManager.getContext(false);
+            ctx.reconfigure();
+
+            // Log initialization success
+            Logger logger = LogManager.getLogger(ScannerLoader.class);
+            logger.info("Log4j2 initialized successfully. Log file: {}", logPath);
+
+            // Test SLF4J bridge
+            org.slf4j.Logger slf4jLogger = org.slf4j.LoggerFactory.getLogger(ScannerLoader.class);
+            slf4jLogger.info("SLF4J bridge to log4j2 verified successfully");
+        } catch (Exception e) {
+            System.err.println("Failed to initialize log4j2: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    public static final Logger LOG = LogManager.getLogger(ScannerLoader.class);
     private static final Map<String, Class<?>> loadedClasses = new HashMap<>();
-    private static final ExpiringMap<String, UdfClassCache> udfLoadedClasses = new ExpiringMap<>();
+    // Cache of UDF class metadata (including the URLClassLoader used to load the UDF).
+    // Entries are inserted on first use and only ever removed by an explicit
+    // cleanUdfClassLoader() call (triggered by FE on DROP FUNCTION). There is intentionally
+    // no time-based eviction: that previously caused two issues —
+    //   1) closing a URLClassLoader while another thread was still loading classes from it
+    //      led to NoClassDefFoundError;
+    //   2) rebuilding a fresh URLClassLoader on every eviction produced multiple coexisting
+    //      ClassLoaders for the same UDF, which broke lazy class resolution and reflective
+    //      lookups inside user UDF code.
+    // Cache by function id so a recreated function with the same signature does not reuse
+    // the previous function's class loader.
+    // NOTE: a cache miss in BaseExecutor.getClassCache() is NOT only reachable after
+    // cleanUdfClassLoader() — concurrent first-time loads of the same function can also
+    // both observe a miss. cacheClassLoader() must therefore insert atomically via
+    // putIfAbsent and must never close a cache that was already published to the map,
+    // because another executor may already be holding it.
+    private static final Map<Long, UdfClassCacheEntry> udfLoadedClasses = new ConcurrentHashMap<>();
     private static final String CLASS_SUFFIX = ".class";
     private static final String LOAD_PACKAGE = "org.apache.doris";
 
@@ -57,42 +112,109 @@ public class ScannerLoader {
      * Load all classes from $DORIS_HOME/lib/java_extensions/*
      */
     public void loadAllScannerJars() {
-        redirectStdStreamsToLog4j();
+        LOG.info("Starting to load scanner JARs from $DORIS_HOME/lib/java_extensions/");
         String basePath = System.getenv("DORIS_HOME");
         File library = new File(basePath, "/lib/java_extensions/");
+        LOG.info("Scanner library path: {}", library.getAbsolutePath());
         // TODO: add thread pool to load each scanner
         listFiles(library).stream().filter(File::isDirectory).forEach(sd -> {
+            LOG.info("Loading scanner from directory: {}", sd.getName());
             JniScannerClassLoader classLoader = new JniScannerClassLoader(sd.getName(), buildClassPath(sd),
                         this.getClass().getClassLoader());
             try (ThreadClassLoaderContext ignored = new ThreadClassLoaderContext(classLoader)) {
                 loadJarClassFromDir(sd, classLoader);
             }
         });
+        LOG.info("Finished loading scanner JARs");
     }
 
-    private void redirectStdStreamsToLog4j() {
-        Logger outLogger = Logger.getLogger("stdout");
-        PrintStream logPrintStream = new PrintStream(new Log4jOutputStream(outLogger, Level.INFO));
-        System.setOut(logPrintStream);
+    private static class UdfClassCacheEntry {
+        private final String functionSignature;
+        private final UdfClassCache classCache;
 
-        Logger errLogger = Logger.getLogger("stderr");
-        PrintStream errorPrintStream = new PrintStream(new Log4jOutputStream(errLogger, Level.ERROR));
-        System.setErr(errorPrintStream);
+        UdfClassCacheEntry(String functionSignature, UdfClassCache classCache) {
+            this.functionSignature = functionSignature;
+            this.classCache = classCache;
+        }
     }
 
-    public static UdfClassCache getUdfClassLoader(String functionSignature) {
-        return udfLoadedClasses.get(functionSignature);
+    public static UdfClassCache getUdfClassLoader(long functionId) {
+        UdfClassCacheEntry entry = udfLoadedClasses.get(functionId);
+        return entry == null ? null : entry.classCache;
     }
 
-    public static synchronized void cacheClassLoader(String functionSignature, UdfClassCache classCache,
-            long expirationTime) {
-        LOG.info("Cache UDF for: " + functionSignature);
-        udfLoadedClasses.put(functionSignature, classCache, expirationTime * 60 * 1000L);
+    /**
+     * Cache the UDF class metadata for the given catalog function id.
+     *
+     * <p>Insertion is atomic via {@link Map#putIfAbsent}: if another executor
+     * thread has already published a cache entry for {@code functionId}, the {@code classCache}
+     * argument is treated as a redundant build and closed here (it has not yet been handed
+     * to any executor, so closing its URLClassLoader is safe). The already-published entry
+     * is returned to the caller so the current executor can switch to it.</p>
+     *
+     * <p>The {@code expirationTime} parameter is kept for backward compatibility with the
+     * existing call sites and DDL property {@code expiration_time}, but is no longer used:
+     * cached entries are not evicted by time. Removal happens only via
+     * {@link #cleanUdfClassLoader(String, long)} on DROP FUNCTION.</p>
+     *
+     * @return the {@link UdfClassCache} actually held in the map after this call —
+     *         either {@code classCache} (we won the race) or the pre-existing entry
+     *         (another thread won; {@code classCache} has been closed and must not be used).
+     */
+    public static UdfClassCache cacheClassLoader(String functionSignature, long functionId,
+            UdfClassCache classCache, long expirationTime) {
+        LOG.info("Cache UDF for function signature: {}, function id: {}", functionSignature, functionId);
+        UdfClassCacheEntry newEntry = new UdfClassCacheEntry(functionSignature, classCache);
+        UdfClassCacheEntry existing = udfLoadedClasses.putIfAbsent(functionId, newEntry);
+        if (existing == null) {
+            return classCache;
+        }
+        // Lost the race against a concurrent first-time load. The cache we just built has
+        // never been exposed to any executor, so closing its URLClassLoader here cannot
+        // affect anyone. Do NOT touch `existing` — another executor may already be using it.
+        try {
+            newEntry.classCache.close();
+        } catch (Exception e) {
+            LOG.warn("Failed to close UdfClassCache for function signature: {}, function id: {}",
+                    newEntry.functionSignature, functionId, e);
+        }
+        return existing.classCache;
     }
 
-    public synchronized void cleanUdfClassLoader(String functionSignature) {
-        LOG.info("cleanUdfClassLoader for: " + functionSignature);
-        udfLoadedClasses.remove(functionSignature);
+    public void cleanUdfClassLoader(String functionSignature, long functionId) {
+        LOG.info("cleanUdfClassLoader for function signature: {}, function id: {}",
+                functionSignature, functionId);
+        if (functionId > 0) {
+            UdfClassCacheEntry removed = udfLoadedClasses.remove(functionId);
+            if (removed != null) {
+                // Immediately close the URLClassLoader. NOTE: any in-flight query still holding a
+                // reference to this cache (e.g. via JNIContext.executor) will fail with
+                // NoClassDefFoundError on lazy class resolution after this point. This is the
+                // accepted semantic of DROP FUNCTION: the function is gone, queries against it
+                // are expected to fail.
+                try {
+                    removed.classCache.close();
+                } catch (Exception e) {
+                    LOG.warn("Failed to close UdfClassCache for function signature: {}, function id: {}",
+                            removed.functionSignature, functionId, e);
+                }
+            }
+            return;
+        }
+
+        // Old FEs do not set function_id in cleanup requests, so remove every cache with
+        // the requested signature.
+        udfLoadedClasses.forEach((cachedFunctionId, entry) -> {
+            if (entry.functionSignature.equals(functionSignature)
+                    && udfLoadedClasses.remove(cachedFunctionId, entry)) {
+                try {
+                    entry.classCache.close();
+                } catch (Exception e) {
+                    LOG.warn("Failed to close UdfClassCache for function signature: {}, function id: {}",
+                            entry.functionSignature, cachedFunctionId, e);
+                }
+            }
+        });
     }
 
     /**

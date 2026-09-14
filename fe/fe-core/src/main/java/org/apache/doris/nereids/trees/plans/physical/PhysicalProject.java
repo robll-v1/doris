@@ -29,6 +29,7 @@ import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.expressions.SlotReference;
 import org.apache.doris.nereids.trees.expressions.functions.NoneMovableFunction;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.Uuid;
+import org.apache.doris.nereids.trees.plans.AbstractPlan;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.PlanType;
 import org.apache.doris.nereids.trees.plans.algebra.Project;
@@ -36,7 +37,7 @@ import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
 import org.apache.doris.nereids.util.ExpressionUtils;
 import org.apache.doris.nereids.util.Utils;
 import org.apache.doris.qe.ConnectContext;
-import org.apache.doris.statistics.Statistics;
+import org.apache.doris.statistics.model.Statistics;
 
 import com.google.common.base.Preconditions;
 import com.google.common.base.Supplier;
@@ -161,32 +162,29 @@ public class PhysicalProject<CHILD_TYPE extends Plan> extends PhysicalUnary<CHIL
     @Override
     public PhysicalProject<Plan> withChildren(List<Plan> children) {
         Preconditions.checkArgument(children.size() == 1);
-        return new PhysicalProject<>(projects,
-                groupExpression,
-                getLogicalProperties(),
-                physicalProperties,
-                statistics,
-                children.get(0)
-        );
+        return AbstractPlan.copyWithSameId(this, () -> new PhysicalProject<>(projects,
+                groupExpression, getLogicalProperties(), physicalProperties, statistics, children.get(0)));
     }
 
     @Override
     public PhysicalProject<CHILD_TYPE> withGroupExpression(Optional<GroupExpression> groupExpression) {
-        return new PhysicalProject<>(projects, groupExpression, getLogicalProperties(), child());
+        return AbstractPlan.copyWithSameId(this, () -> new PhysicalProject<>(projects, groupExpression,
+                getLogicalProperties(), child()));
     }
 
     @Override
     public Plan withGroupExprLogicalPropChildren(Optional<GroupExpression> groupExpression,
             Optional<LogicalProperties> logicalProperties, List<Plan> children) {
         Preconditions.checkArgument(children.size() == 1);
-        return new PhysicalProject<>(projects, groupExpression, logicalProperties.get(), children.get(0));
+        return AbstractPlan.copyWithSameId(this, () -> new PhysicalProject<>(projects, groupExpression,
+                logicalProperties.get(), children.get(0)));
     }
 
     @Override
     public PhysicalProject<CHILD_TYPE> withPhysicalPropertiesAndStats(PhysicalProperties physicalProperties,
             Statistics statistics) {
-        return new PhysicalProject<>(projects, groupExpression, getLogicalProperties(), physicalProperties,
-                statistics, child());
+        return AbstractPlan.copyWithSameId(this, () -> new PhysicalProject<>(projects, groupExpression,
+                getLogicalProperties(), physicalProperties, statistics, child()));
     }
 
     /**
@@ -196,13 +194,8 @@ public class PhysicalProject<CHILD_TYPE extends Plan> extends PhysicalUnary<CHIL
      * @return new project
      */
     public PhysicalProject<Plan> withProjectionsAndChild(List<NamedExpression> projections, Plan child) {
-        return new PhysicalProject<>(Utils.fastToImmutableList(projections),
-                groupExpression,
-                getLogicalProperties(),
-                physicalProperties,
-                statistics,
-                child
-        );
+        return AbstractPlan.copyWithSameId(this, () -> new PhysicalProject<>(Utils.fastToImmutableList(projections),
+                groupExpression, getLogicalProperties(), physicalProperties, statistics, child));
     }
 
     @Override
@@ -323,6 +316,13 @@ public class PhysicalProject<CHILD_TYPE extends Plan> extends PhysicalUnary<CHIL
                 } else if (childTrait.isUniform(slot)) {
                     builder.addUniformSlot(proj.toSlot());
                 }
+            } else {
+                // e.g. project `days_sub(begin_time, 1)` over a uniform constant slot `begin_time`:
+                // substitute the constant values so the projected slot also becomes a uniform
+                // constant, then downstream constant propagation can fold predicates over it.
+                Optional<Expression> constantExpr = ExpressionUtils.foldToConstantByUniformValues(
+                        proj.child(0), child(0).getLogicalProperties().getTrait());
+                constantExpr.ifPresent(expr -> builder.addUniformSlotAndLiteral(proj.toSlot(), expr));
             }
         }
     }

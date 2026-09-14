@@ -31,6 +31,8 @@
 #include <utility>
 #include <vector>
 
+#include "common/bvars.h"
+#include "common/config.h"
 #include "common/defer.h"
 #include "common/encryption_util.h"
 #include "common/logging.h"
@@ -65,6 +67,7 @@ using namespace std::chrono;
 int OperationLogRecycleChecker::init() {
     source_snapshot_versionstamp_ = Versionstamp::min();
     if (instance_info_.has_source_snapshot_id() &&
+        instance_info_.snapshot_compact_status() != SNAPSHOT_COMPACT_DONE &&
         !SnapshotManager::parse_snapshot_versionstamp(instance_info_.source_snapshot_id(),
                                                       &source_snapshot_versionstamp_)) {
         LOG_WARNING("failed to parse versionstamp from source snapshot id")
@@ -82,7 +85,8 @@ int OperationLogRecycleChecker::init() {
     snapshots_.clear();
     snapshot_indexes_.clear();
     MetaReader reader(instance_id_);
-    err = reader.get_snapshots(txn.get(), &snapshots_);
+    std::vector<std::pair<SnapshotPB, Versionstamp>> snapshots;
+    err = reader.get_snapshots(txn.get(), &snapshots);
     if (err != TxnErrorCode::TXN_OK) {
         LOG_WARNING("failed to get snapshots").tag("err", err);
         return -1;
@@ -96,16 +100,22 @@ int OperationLogRecycleChecker::init() {
     }
 
     max_versionstamp_ = Versionstamp(read_version, 0);
-    for (size_t i = 0; i < snapshots_.size(); ++i) {
-        auto&& [snapshot, versionstamp] = snapshots_[i];
-        snapshot_indexes_.insert(std::make_pair(versionstamp, i));
+    for (size_t i = 0; i < snapshots.size(); ++i) {
+        auto&& [snapshot, versionstamp] = snapshots[i];
+        if (snapshot.status() == SnapshotStatus::SNAPSHOT_ABORTED ||
+            snapshot.status() == SnapshotStatus::SNAPSHOT_RECYCLED) {
+            continue;
+        }
+        snapshot_indexes_.insert(std::make_pair(versionstamp, snapshots_.size()));
+        snapshots_.push_back(std::make_pair(std::move(snapshot), versionstamp));
     }
 
     return 0;
 }
 
 bool OperationLogRecycleChecker::can_recycle(const Versionstamp& log_versionstamp,
-                                             int64_t log_min_timestamp) const {
+                                             int64_t log_min_timestamp,
+                                             OperationLogReferenceInfo* reference_info) const {
     Versionstamp log_min_read_timestamp(log_min_timestamp, 0);
     if (log_versionstamp > max_versionstamp_) {
         // Not recycleable.
@@ -114,12 +124,15 @@ bool OperationLogRecycleChecker::can_recycle(const Versionstamp& log_versionstam
 
     // Do not recycle operation logs referenced by active snapshots.
     if (log_min_read_timestamp < source_snapshot_versionstamp_) {
+        reference_info->referenced_by_instance = true;
         return false;
     }
 
     auto it = snapshot_indexes_.lower_bound(log_min_read_timestamp);
     if (it != snapshot_indexes_.end() && snapshots_[it->second].second < log_versionstamp) {
         // in [log_min_read_timestmap, log_versionstamp)
+        reference_info->referenced_by_snapshot = true;
+        reference_info->referenced_snapshot_timestamp = snapshots_[it->second].second;
         return false;
     }
 
@@ -165,6 +178,7 @@ private:
     int recycle_tablet_load_stats(int64_t tablet_id);
     int recycle_tablet_compact_stats(int64_t tablet_id);
     int recycle_partition_version(int64_t partition_id);
+    int recycle_table_stream_offset(const TableStreamIdentityPB& identity, int64_t partition_id);
     int recycle_rowset_meta(int64_t tablet_id, int64_t end_version, const std::string& rowset_id);
 
     std::string_view instance_id_;
@@ -195,6 +209,7 @@ int OperationLogRecycler::recycle_drop_partition_log(const DropPartitionLogPB& d
         recycle_partition_pb.set_creation_time(::time(nullptr));
         recycle_partition_pb.set_expiration(drop_partition_log.expired_at_s());
         recycle_partition_pb.set_state(RecyclePartitionPB::DROPPED);
+        recycle_partition_pb.mutable_table_streams()->CopyFrom(drop_partition_log.table_streams());
         std::string recycle_partition_value;
         if (!recycle_partition_pb.SerializeToString(&recycle_partition_value)) {
             LOG_WARNING("failed to serialize RecyclePartitionPB").tag("partition_id", partition_id);
@@ -233,6 +248,10 @@ int OperationLogRecycler::recycle_drop_index_log(const DropIndexLogPB& drop_inde
         recycle_index_pb.set_creation_time(::time(nullptr));
         recycle_index_pb.set_expiration(drop_index_log.expiration());
         recycle_index_pb.set_state(RecycleIndexPB::DROPPED);
+        recycle_index_pb.set_object_type(drop_index_log.object_type());
+        if (drop_index_log.has_stream_db_id()) {
+            recycle_index_pb.set_stream_db_id(drop_index_log.stream_db_id());
+        }
         std::string recycle_index_value;
         if (!recycle_index_pb.SerializeToString(&recycle_index_value)) {
             LOG_WARNING("failed to serialize RecycleIndexPB").tag("index_id", index_id);
@@ -256,6 +275,16 @@ int OperationLogRecycler::recycle_commit_txn_log(const CommitTxnLogPB& commit_tx
     AnnotateTag txn_tag("txn_id", txn_id);
     for (const auto& [partition_id, _] : commit_txn_log.partition_version_map()) {
         RETURN_ON_FAILURE(recycle_partition_version(partition_id));
+    }
+
+    for (const TableStreamPartitionSetPB& partition_set : commit_txn_log.table_stream_offset_gc()) {
+        if (!partition_set.has_identity()) {
+            LOG_WARNING("table stream offset GC entry is missing identity");
+            return -1;
+        }
+        for (int64_t partition_id : partition_set.partition_ids()) {
+            RETURN_ON_FAILURE(recycle_table_stream_offset(partition_set.identity(), partition_id));
+        }
     }
 
     for (const auto& [tablet_id, _] : commit_txn_log.tablet_to_partition_map()) {
@@ -551,6 +580,42 @@ int OperationLogRecycler::recycle_partition_version(int64_t partition_id) {
     }
 }
 
+int OperationLogRecycler::recycle_table_stream_offset(const TableStreamIdentityPB& identity,
+                                                      int64_t partition_id) {
+    MetaReader meta_reader(instance_id_, log_version_);
+    Versionstamp previous_version;
+    TxnErrorCode err = meta_reader.get_table_stream_offset(txn_.get(), identity, partition_id,
+                                                           nullptr, &previous_version);
+    if (err == TxnErrorCode::TXN_OK) {
+        if (previous_version < min_read_versionstamp_) {
+            LOG_FATAL("table stream offset version is less than min read versionstamp")
+                    .tag("stream_id", identity.stream_id())
+                    .tag("partition_id", partition_id)
+                    .tag("previous_version", previous_version.to_string())
+                    .tag("min_read_version", min_read_versionstamp_.version());
+        }
+        std::string offset_key = versioned::table_stream_offset_key(
+                {instance_id_, identity.base_db_id(), identity.base_table_id(),
+                 identity.stream_db_id(), identity.stream_id(), partition_id});
+        versioned_remove(txn_.get(), offset_key, previous_version);
+        LOG_INFO("recycle table stream offset")
+                .tag("stream_id", identity.stream_id())
+                .tag("partition_id", partition_id)
+                .tag("previous_version", previous_version.to_string());
+        return 0;
+    }
+    if (err != TxnErrorCode::TXN_KEY_NOT_FOUND) {
+        LOG_WARNING("failed to get table stream offset for recycling operation log")
+                .tag("stream_id", identity.stream_id())
+                .tag("partition_id", partition_id)
+                .tag("error_code", err);
+        return -1;
+    }
+    VLOG_DEBUG << "No previous table stream offset found for recycling"
+               << " stream_id=" << identity.stream_id() << " partition_id=" << partition_id;
+    return 0;
+}
+
 int OperationLogRecycler::recycle_rowset_meta(int64_t tablet_id, int64_t end_version,
                                               const std::string& rowset_id) {
     // Remove rowset compact key and rowset load key for input rowsets
@@ -640,6 +705,50 @@ static TxnErrorCode get_txn_info(TxnKv* txn_kv, std::string_view instance_id, in
     return TxnErrorCode::TXN_OK;
 }
 
+static void report_oplog_recycle_stats(const std::string& instance_id,
+                                       const OplogRecycleStats& stats) {
+    g_bvar_recycler_oplog_last_round_total_num.put({instance_id}, stats.total_num.load());
+    g_bvar_recycler_oplog_last_round_not_recycled_num.put({instance_id},
+                                                          stats.not_recycled_num.load());
+    if (stats.failed_num.load() > 0) {
+        g_bvar_recycler_oplog_recycle_failed_num.put({instance_id}, stats.failed_num.load());
+    }
+    // Per-type last round counts (mBvarStatus, overwritten each round)
+    g_bvar_recycler_oplog_last_round_recycled_commit_partition_num.put(
+            {instance_id}, stats.recycled_commit_partition.load());
+    g_bvar_recycler_oplog_last_round_recycled_drop_partition_num.put(
+            {instance_id}, stats.recycled_drop_partition.load());
+    g_bvar_recycler_oplog_last_round_recycled_commit_index_num.put(
+            {instance_id}, stats.recycled_commit_index.load());
+    g_bvar_recycler_oplog_last_round_recycled_drop_index_num.put({instance_id},
+                                                                 stats.recycled_drop_index.load());
+    g_bvar_recycler_oplog_last_round_recycled_update_tablet_num.put(
+            {instance_id}, stats.recycled_update_tablet.load());
+    g_bvar_recycler_oplog_last_round_recycled_compaction_num.put({instance_id},
+                                                                 stats.recycled_compaction.load());
+    g_bvar_recycler_oplog_last_round_recycled_schema_change_num.put(
+            {instance_id}, stats.recycled_schema_change.load());
+    g_bvar_recycler_oplog_last_round_recycled_commit_txn_num.put({instance_id},
+                                                                 stats.recycled_commit_txn.load());
+    // Per-type cumulative counts (mBvarIntAdder, accumulated across rounds)
+    g_bvar_recycler_oplog_recycled_commit_partition_num.put({instance_id},
+                                                            stats.recycled_commit_partition.load());
+    g_bvar_recycler_oplog_recycled_drop_partition_num.put({instance_id},
+                                                          stats.recycled_drop_partition.load());
+    g_bvar_recycler_oplog_recycled_commit_index_num.put({instance_id},
+                                                        stats.recycled_commit_index.load());
+    g_bvar_recycler_oplog_recycled_drop_index_num.put({instance_id},
+                                                      stats.recycled_drop_index.load());
+    g_bvar_recycler_oplog_recycled_update_tablet_num.put({instance_id},
+                                                         stats.recycled_update_tablet.load());
+    g_bvar_recycler_oplog_recycled_compaction_num.put({instance_id},
+                                                      stats.recycled_compaction.load());
+    g_bvar_recycler_oplog_recycled_schema_change_num.put({instance_id},
+                                                         stats.recycled_schema_change.load());
+    g_bvar_recycler_oplog_recycled_commit_txn_num.put({instance_id},
+                                                      stats.recycled_commit_txn.load());
+}
+
 int InstanceRecycler::recycle_operation_logs() {
     if (!should_recycle_versioned_keys()) {
         VLOG_DEBUG << "instance " << instance_id_
@@ -654,6 +763,18 @@ int InstanceRecycler::recycle_operation_logs() {
     AnnotateTag tag("instance_id", instance_id_);
     LOG_WARNING("begin to recycle operation logs");
 
+    const std::string task_name = "recycle_operation_logs";
+    RecyclerMetricsContext metrics_context(instance_id_, task_name);
+    OplogRecycleStats oplog_stats;
+
+    // scan_and_statistics_operation_logs() is expensive (scans lots of KVs),
+    // so it's controlled by enable_recycler_stats_metrics.
+    // The other stats (counting what was actually recycled) are lightweight
+    // and always collected.
+    if (config::enable_recycler_stats_metrics) {
+        scan_and_statistics_operation_logs();
+    }
+
     StopWatch stop_watch;
     size_t total_operation_logs = 0;
     size_t recycled_operation_logs = 0;
@@ -662,6 +783,9 @@ int InstanceRecycler::recycle_operation_logs() {
     size_t recycled_operation_log_data_size = 0;
 
     DORIS_CLOUD_DEFER {
+        metrics_context.finish_report();
+        report_oplog_recycle_stats(instance_id_, oplog_stats);
+
         int64_t cost = stop_watch.elapsed_us() / 1000'000;
         LOG_WARNING("recycle operation logs, cost={}s", cost)
                 .tag("total_operation_logs", total_operation_logs)
@@ -677,6 +801,8 @@ int InstanceRecycler::recycle_operation_logs() {
         LOG_WARNING("failed to initialize recycle checker").tag("error_code", init_res);
         return init_res;
     }
+    SnapshotDataSizeCalculator calculator(instance_id_, txn_kv_);
+    calculator.init(recycle_checker.get_snapshots());
 
     auto scan_and_recycle_operation_log = [&](const std::string_view& key,
                                               const std::vector<std::string>& raw_keys,
@@ -690,21 +816,40 @@ int InstanceRecycler::recycle_operation_logs() {
         }
 
         size_t value_size = operation_log.ByteSizeLong();
-        if (recycle_checker.can_recycle(log_versionstamp, operation_log.min_timestamp())) {
+        OperationLogReferenceInfo reference_info;
+        if (recycle_checker.can_recycle(log_versionstamp, operation_log.min_timestamp(),
+                                        &reference_info)) {
+            metrics_context.total_need_recycle_num++;
+            metrics_context.total_need_recycle_data_size += value_size;
+
             AnnotateTag tag("log_key", hex(key));
-            int res = recycle_operation_log(log_versionstamp, raw_keys, std::move(operation_log));
+            int res = recycle_operation_log(log_versionstamp, raw_keys, std::move(operation_log),
+                                            &oplog_stats);
             if (res != 0) {
                 LOG_WARNING("failed to recycle operation log").tag("error_code", res);
+                oplog_stats.failed_num.fetch_add(1, std::memory_order_relaxed);
                 return res;
             }
 
             recycled_operation_logs++;
             recycled_operation_log_data_size += value_size;
+            metrics_context.total_recycled_num++;
+            metrics_context.total_recycled_data_size += value_size;
+        } else {
+            oplog_stats.not_recycled_num.fetch_add(1, std::memory_order_relaxed);
+            int res = calculator.calculate_operation_log_data_size(key, operation_log,
+                                                                   reference_info);
+            if (res != 0) {
+                LOG_WARNING("failed to calculate operation log data size").tag("error_code", res);
+                return res;
+            }
         }
 
         total_operation_logs++;
         operation_log_data_size += value_size;
         max_operation_log_data_size = std::max(max_operation_log_data_size, value_size);
+        oplog_stats.total_num.fetch_add(1, std::memory_order_relaxed);
+        metrics_context.report();
         return 0;
     };
 
@@ -769,13 +914,21 @@ int InstanceRecycler::recycle_operation_logs() {
                 .tag("error_code", iter->error_code());
         return -1;
     }
+    int res = calculator.save_snapshot_data_size_with_retry();
+    if (res != 0) {
+        LOG_WARNING("failed to save snapshot data size").tag("error_code", res);
+        return res;
+    }
     return 0;
 }
 
 int InstanceRecycler::recycle_operation_log(Versionstamp log_version,
                                             const std::vector<std::string>& raw_keys,
-                                            OperationLogPB operation_log) {
+                                            OperationLogPB operation_log,
+                                            OplogRecycleStats* oplog_stats) {
     int recycle_log_count = 0;
+    // Track which oplog type was recycled (only one per log entry)
+    std::atomic<int64_t>* recycled_counter = nullptr;
     OperationLogRecycler log_recycler(instance_id_, txn_kv_.get(), log_version,
                                       operation_log.min_timestamp(), raw_keys);
     RETURN_ON_FAILURE(log_recycler.begin());
@@ -791,6 +944,9 @@ int InstanceRecycler::recycle_operation_log(Versionstamp log_version,
                 return res;                                               \
             }                                                             \
             recycle_log_count++;                                          \
+            if (oplog_stats) {                                            \
+                recycled_counter = &oplog_stats->recycled_##log_type;     \
+            }                                                             \
         }                                                                 \
     } while (0)
 
@@ -832,6 +988,9 @@ int InstanceRecycler::recycle_operation_log(Versionstamp log_version,
         }
 
         recycle_log_count++;
+        if (oplog_stats) {
+            recycled_counter = &oplog_stats->recycled_commit_txn;
+        }
     }
 
     if (recycle_log_count > 1) {
@@ -842,7 +1001,11 @@ int InstanceRecycler::recycle_operation_log(Versionstamp log_version,
         return -1; // This is an unexpected condition, should not happen
     }
 
-    return log_recycler.commit();
+    int ret = log_recycler.commit();
+    if (ret == 0 && recycled_counter) {
+        recycled_counter->fetch_add(1, std::memory_order_relaxed);
+    }
+    return ret;
 }
 
 } // namespace doris::cloud

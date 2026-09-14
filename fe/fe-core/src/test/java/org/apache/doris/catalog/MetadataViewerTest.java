@@ -20,17 +20,18 @@ package org.apache.doris.catalog;
 import org.apache.doris.analysis.BinaryPredicate.Operator;
 import org.apache.doris.backup.CatalogMocker;
 import org.apache.doris.catalog.Replica.ReplicaStatus;
+import org.apache.doris.catalog.info.PartitionNamesInfo;
 import org.apache.doris.datasource.InternalCatalog;
-import org.apache.doris.info.PartitionNamesInfo;
 import org.apache.doris.system.SystemInfoService;
 
 import com.google.common.collect.Lists;
-import mockit.Expectations;
-import mockit.Mocked;
-import org.junit.Assert;
-import org.junit.Before;
-import org.junit.BeforeClass;
-import org.junit.Test;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.MockedStatic;
+import org.mockito.Mockito;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -41,18 +42,17 @@ public class MetadataViewerTest {
     private static Method getTabletStatusMethod;
     private static Method getTabletDistributionMethod;
 
-    @Mocked
-    private Env env;
+    private Env env = Mockito.mock(Env.class);
 
-    @Mocked
-    private InternalCatalog internalCatalog;
+    private InternalCatalog internalCatalog = Mockito.mock(InternalCatalog.class);
 
-    @Mocked
-    private SystemInfoService infoService;
+    private SystemInfoService infoService = Mockito.mock(SystemInfoService.class);
+
+    private MockedStatic<Env> mockedEnvStatic;
 
     private static Database db;
 
-    @BeforeClass
+    @BeforeAll
     public static void setUp() throws Exception {
         Class[] argTypes = new Class[] {String.class, String.class, List.class, ReplicaStatus.class, Operator.class};
         getTabletStatusMethod = MetadataViewer.class.getDeclaredMethod("getTabletStatus", argTypes);
@@ -65,40 +65,23 @@ public class MetadataViewerTest {
         db = CatalogMocker.mockDb();
     }
 
-    @Before
+    @BeforeEach
     public void before() throws Exception {
+        mockedEnvStatic = Mockito.mockStatic(Env.class);
 
-        new Expectations() {
-            {
-                internalCatalog.getDbOrDdlException(anyString);
-                minTimes = 0;
-                result = db;
-            }
-        };
+        Mockito.when(internalCatalog.getDbOrDdlException(Mockito.anyString())).thenReturn(db);
 
-        new Expectations() {
-            {
-                Env.getCurrentEnv();
-                minTimes = 0;
-                result = env;
+        mockedEnvStatic.when(Env::getCurrentEnv).thenReturn(env);
+        Mockito.when(env.getInternalCatalog()).thenReturn(internalCatalog);
 
-                env.getInternalCatalog();
-                minTimes = 0;
-                result = internalCatalog;
-            }
-        };
+        mockedEnvStatic.when(Env::getCurrentSystemInfo).thenReturn(infoService);
+        Mockito.when(infoService.getAllBackendIds(Mockito.anyBoolean()))
+                .thenReturn(Lists.newArrayList(10000L, 10001L, 10002L));
+    }
 
-        new Expectations() {
-            {
-                Env.getCurrentSystemInfo();
-                minTimes = 0;
-                result = infoService;
-
-                infoService.getAllBackendIds(anyBoolean);
-                minTimes = 0;
-                result = Lists.newArrayList(10000L, 10001L, 10002L);
-            }
-        };
+    @AfterEach
+    public void after() {
+        mockedEnvStatic.close();
     }
 
     @Test
@@ -108,17 +91,17 @@ public class MetadataViewerTest {
         Object[] args = new Object[] { CatalogMocker.TEST_DB_NAME, CatalogMocker.TEST_TBL_NAME, partitions, null,
                 null };
         List<List<String>> result = (List<List<String>>) getTabletStatusMethod.invoke(null, args);
-        Assert.assertEquals(3, result.size());
+        Assertions.assertEquals(3, result.size());
 
         args = new Object[] { CatalogMocker.TEST_DB_NAME, CatalogMocker.TEST_TBL_NAME, partitions, ReplicaStatus.DEAD,
                 Operator.EQ };
         result = (List<List<String>>) getTabletStatusMethod.invoke(null, args);
-        Assert.assertEquals(3, result.size());
+        Assertions.assertEquals(3, result.size());
 
         args = new Object[] { CatalogMocker.TEST_DB_NAME, CatalogMocker.TEST_TBL_NAME, partitions, ReplicaStatus.DEAD,
                 Operator.NE };
         result = (List<List<String>>) getTabletStatusMethod.invoke(null, args);
-        Assert.assertEquals(0, result.size());
+        Assertions.assertEquals(0, result.size());
     }
 
     @Test
@@ -126,7 +109,7 @@ public class MetadataViewerTest {
             throws IllegalAccessException, IllegalArgumentException, InvocationTargetException {
         Object[] args = new Object[] { CatalogMocker.TEST_DB_NAME, CatalogMocker.TEST_TBL_NAME, null };
         List<List<String>> result = (List<List<String>>) getTabletDistributionMethod.invoke(null, args);
-        Assert.assertEquals(3, result.size());
+        Assertions.assertEquals(3, result.size());
     }
 
 }

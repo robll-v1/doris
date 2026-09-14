@@ -60,6 +60,7 @@ import org.apache.doris.nereids.trees.plans.algebra.Limit;
 import org.apache.doris.nereids.trees.plans.algebra.OlapScan;
 import org.apache.doris.nereids.trees.plans.algebra.PartitionTopN;
 import org.apache.doris.nereids.trees.plans.algebra.Project;
+import org.apache.doris.nereids.trees.plans.algebra.RecursiveCte;
 import org.apache.doris.nereids.trees.plans.algebra.Relation;
 import org.apache.doris.nereids.trees.plans.algebra.Repeat;
 import org.apache.doris.nereids.trees.plans.algebra.SetOperation;
@@ -72,24 +73,23 @@ import org.apache.doris.nereids.trees.plans.logical.LogicalCTEAnchor;
 import org.apache.doris.nereids.trees.plans.logical.LogicalCTEConsumer;
 import org.apache.doris.nereids.trees.plans.logical.LogicalCTEProducer;
 import org.apache.doris.nereids.trees.plans.logical.LogicalCatalogRelation;
-import org.apache.doris.nereids.trees.plans.logical.LogicalDeferMaterializeOlapScan;
-import org.apache.doris.nereids.trees.plans.logical.LogicalDeferMaterializeTopN;
 import org.apache.doris.nereids.trees.plans.logical.LogicalEmptyRelation;
-import org.apache.doris.nereids.trees.plans.logical.LogicalEsScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalExcept;
 import org.apache.doris.nereids.trees.plans.logical.LogicalFileScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalFilter;
 import org.apache.doris.nereids.trees.plans.logical.LogicalGenerate;
-import org.apache.doris.nereids.trees.plans.logical.LogicalHudiScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalIntersect;
-import org.apache.doris.nereids.trees.plans.logical.LogicalJdbcScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalJoin;
 import org.apache.doris.nereids.trees.plans.logical.LogicalLimit;
 import org.apache.doris.nereids.trees.plans.logical.LogicalOdbcScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalOlapScan;
+import org.apache.doris.nereids.trees.plans.logical.LogicalOlapTableStreamScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalOneRowRelation;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPartitionTopN;
 import org.apache.doris.nereids.trees.plans.logical.LogicalProject;
+import org.apache.doris.nereids.trees.plans.logical.LogicalRecursiveUnion;
+import org.apache.doris.nereids.trees.plans.logical.LogicalRecursiveUnionAnchor;
+import org.apache.doris.nereids.trees.plans.logical.LogicalRecursiveUnionProducer;
 import org.apache.doris.nereids.trees.plans.logical.LogicalRepeat;
 import org.apache.doris.nereids.trees.plans.logical.LogicalSchemaScan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalSink;
@@ -98,15 +98,13 @@ import org.apache.doris.nereids.trees.plans.logical.LogicalTVFRelation;
 import org.apache.doris.nereids.trees.plans.logical.LogicalTopN;
 import org.apache.doris.nereids.trees.plans.logical.LogicalUnion;
 import org.apache.doris.nereids.trees.plans.logical.LogicalWindow;
+import org.apache.doris.nereids.trees.plans.logical.LogicalWorkTableReference;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalAssertNumRows;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalCTEAnchor;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalCTEConsumer;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalCTEProducer;
-import org.apache.doris.nereids.trees.plans.physical.PhysicalDeferMaterializeOlapScan;
-import org.apache.doris.nereids.trees.plans.physical.PhysicalDeferMaterializeTopN;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalDistribute;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalEmptyRelation;
-import org.apache.doris.nereids.trees.plans.physical.PhysicalEsScan;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalExcept;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalFileScan;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalFilter;
@@ -114,7 +112,6 @@ import org.apache.doris.nereids.trees.plans.physical.PhysicalGenerate;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalHashAggregate;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalHashJoin;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalIntersect;
-import org.apache.doris.nereids.trees.plans.physical.PhysicalJdbcScan;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalLimit;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalNestedLoopJoin;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalOdbcScan;
@@ -123,6 +120,9 @@ import org.apache.doris.nereids.trees.plans.physical.PhysicalOneRowRelation;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalPartitionTopN;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalProject;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalQuickSort;
+import org.apache.doris.nereids.trees.plans.physical.PhysicalRecursiveUnion;
+import org.apache.doris.nereids.trees.plans.physical.PhysicalRecursiveUnionAnchor;
+import org.apache.doris.nereids.trees.plans.physical.PhysicalRecursiveUnionProducer;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalRelation;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalRepeat;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalSchemaScan;
@@ -132,22 +132,23 @@ import org.apache.doris.nereids.trees.plans.physical.PhysicalTVFRelation;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalTopN;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalUnion;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalWindow;
+import org.apache.doris.nereids.trees.plans.physical.PhysicalWorkTableReference;
 import org.apache.doris.nereids.trees.plans.visitor.DefaultPlanVisitor;
 import org.apache.doris.nereids.types.DataType;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.SessionVariable;
-import org.apache.doris.statistics.AnalysisManager;
-import org.apache.doris.statistics.ColumnStatistic;
-import org.apache.doris.statistics.ColumnStatisticBuilder;
-import org.apache.doris.statistics.Histogram;
-import org.apache.doris.statistics.PartitionColumnStatistic;
-import org.apache.doris.statistics.PartitionColumnStatisticBuilder;
 import org.apache.doris.statistics.StatisticConstants;
-import org.apache.doris.statistics.StatisticRange;
-import org.apache.doris.statistics.Statistics;
-import org.apache.doris.statistics.StatisticsBuilder;
-import org.apache.doris.statistics.StatisticsCache.OlapTableStatistics;
-import org.apache.doris.statistics.TableStatsMeta;
+import org.apache.doris.statistics.analysis.AnalysisManager;
+import org.apache.doris.statistics.analysis.TableStatsMeta;
+import org.apache.doris.statistics.cache.StatisticsCache.OlapTableStatistics;
+import org.apache.doris.statistics.model.ColumnStatistic;
+import org.apache.doris.statistics.model.ColumnStatisticBuilder;
+import org.apache.doris.statistics.model.Histogram;
+import org.apache.doris.statistics.model.PartitionColumnStatistic;
+import org.apache.doris.statistics.model.PartitionColumnStatisticBuilder;
+import org.apache.doris.statistics.model.StatisticRange;
+import org.apache.doris.statistics.model.Statistics;
+import org.apache.doris.statistics.model.StatisticsBuilder;
 import org.apache.doris.statistics.util.StatisticsUtil;
 
 import com.google.common.base.Preconditions;
@@ -176,6 +177,7 @@ public class StatsCalculator extends DefaultPlanVisitor<Statistics, Void> {
     public static double DEFAULT_AGGREGATE_RATIO = 1 / 3.0;
     public static double AGGREGATE_COLUMN_CORRELATION_COEFFICIENT = 0.75;
     public static double DEFAULT_COLUMN_NDV_RATIO = 0.5;
+    public static double RECURSIVE_CTE_EXPAND_RATIO = 5.0;
 
     protected static final Logger LOG = LogManager.getLogger(StatsCalculator.class);
     protected final GroupExpression groupExpression;
@@ -423,14 +425,6 @@ public class StatsCalculator extends DefaultPlanVisitor<Statistics, Void> {
         return getColumnStatistic(catalogRelation.getTable(), slot.getName(), idxId);
     }
 
-    /**
-     * if get partition col stats failed, then return table level col stats
-     */
-    private ColumnStatistic getColumnStatsFromPartitionCacheOrTableCache(
-            OlapTableStatistics olapTableStats, SlotReference slot, List<String> partitionNames) {
-        return getColumnStatistic(olapTableStats, slot.getName(), partitionNames);
-    }
-
     private double getSelectedPartitionRowCount(OlapScan olapScan, double tableRowCount) {
         // the number of partitions whose row count is not available
         double unknownPartitionCount = 0;
@@ -619,8 +613,7 @@ public class StatsCalculator extends DefaultPlanVisitor<Statistics, Void> {
             for (SlotReference slot : visibleOutputSlots) {
                 ColumnStatistic cache;
                 if (enablePartitionStatics) {
-                    cache = getColumnStatsFromPartitionCacheOrTableCache(
-                            olapTableStats, slot, selectedPartitionNames);
+                    cache = getColumnStatistic(olapTableStats, slot.getName(), selectedPartitionNames);
                 } else {
                     cache = olapTableStats.getColumnStatistics(slot.getName(), connectContext);
                 }
@@ -629,7 +622,10 @@ public class StatsCalculator extends DefaultPlanVisitor<Statistics, Void> {
                 }
                 ColumnStatisticBuilder colStatsBuilder = new ColumnStatisticBuilder(cache,
                         selectedPartitionsRowCount);
-                colStatsBuilder.normalizeAvgSizeByte(slot);
+                colStatsBuilder.normalizeAvgSizeByte(slot.getDataType());
+                //scale null_num
+                double scale = tableRowCount == 0 ? 1 : selectedPartitionsRowCount / tableRowCount;
+                colStatsBuilder.setNumNulls(colStatsBuilder.getNumNulls() * scale);
                 builder.putColumnStatistics(slot, colStatsBuilder.build());
             }
             checkIfUnknownStatsUsedAsKey(builder);
@@ -639,7 +635,7 @@ public class StatsCalculator extends DefaultPlanVisitor<Statistics, Void> {
             for (SlotReference slot : visibleOutputSlots) {
                 ColumnStatistic cache = olapTableStats.getColumnStatistics(slot.getName(), connectContext);
                 ColumnStatisticBuilder colStatsBuilder = new ColumnStatisticBuilder(cache, tableRowCount);
-                colStatsBuilder.normalizeAvgSizeByte(slot);
+                colStatsBuilder.normalizeAvgSizeByte(slot.getDataType());
                 builder.putColumnStatistics(slot, colStatsBuilder.build());
             }
             checkIfUnknownStatsUsedAsKey(builder);
@@ -822,6 +818,11 @@ public class StatsCalculator extends DefaultPlanVisitor<Statistics, Void> {
         return computeOlapScan(olapScan);
     }
 
+    @Override
+    public Statistics visitLogicalOlapTableStreamScan(LogicalOlapTableStreamScan olapScan, Void context) {
+        return computeOlapScan(olapScan);
+    }
+
     private boolean isVisibleSlotReference(Slot slot) {
         if (slot instanceof SlotReference) {
             Optional<Column> colOpt = ((SlotReference) slot).getOriginalColumn();
@@ -830,12 +831,6 @@ public class StatsCalculator extends DefaultPlanVisitor<Statistics, Void> {
             }
         }
         return false;
-    }
-
-    @Override
-    public Statistics visitLogicalDeferMaterializeOlapScan(LogicalDeferMaterializeOlapScan deferMaterializeOlapScan,
-            Void context) {
-        return computeOlapScan(deferMaterializeOlapScan.getLogicalOlapScan());
     }
 
     @Override
@@ -849,19 +844,8 @@ public class StatsCalculator extends DefaultPlanVisitor<Statistics, Void> {
     }
 
     @Override
-    public Statistics visitLogicalHudiScan(LogicalHudiScan fileScan, Void context) {
-        return computeCatalogRelation(fileScan);
-    }
-
-    @Override
     public Statistics visitLogicalTVFRelation(LogicalTVFRelation tvfRelation, Void context) {
         return tvfRelation.getFunction().computeStats(tvfRelation.getOutput());
-    }
-
-    @Override
-    public Statistics visitLogicalJdbcScan(LogicalJdbcScan jdbcScan, Void context) {
-        jdbcScan.getExpressions();
-        return computeCatalogRelation(jdbcScan);
     }
 
     @Override
@@ -871,9 +855,27 @@ public class StatsCalculator extends DefaultPlanVisitor<Statistics, Void> {
     }
 
     @Override
-    public Statistics visitLogicalEsScan(LogicalEsScan esScan, Void context) {
-        esScan.getExpressions();
-        return computeCatalogRelation(esScan);
+    public Statistics visitLogicalWorkTableReference(LogicalWorkTableReference workTableReference, Void context) {
+        CTEId cteId = workTableReference.getCteId();
+        Statistics prodStats = cteIdToStats.get(cteId);
+        Preconditions.checkArgument(prodStats != null, String.format("Stats for CTE: %s not found", cteId));
+        Statistics consumerStats = new Statistics(prodStats.getRowCount(), 1, new HashMap<>());
+        // because recursive cte's anchor outputs are same as worktable's output, we compare slot name for simplicity
+        Map<String, ColumnStatistic> columnStats = new HashMap<>();
+        for (Map.Entry<Expression, ColumnStatistic> entry : prodStats.columnStatistics().entrySet()) {
+            columnStats.put(entry.getKey().getExpressionName(), entry.getValue());
+        }
+        for (Slot slot : workTableReference.getOutput()) {
+            ColumnStatistic colStats = columnStats.get(slot.getName());
+            if (colStats == null) {
+                continue;
+            }
+            consumerStats.addColumnStats(slot, colStats);
+        }
+        return new StatisticsBuilder()
+                .setRowCount(Math.max(1, consumerStats.getRowCount()) * RECURSIVE_CTE_EXPAND_RATIO)
+                .putColumnStatistics(consumerStats.columnStatistics())
+                .build();
     }
 
     @Override
@@ -889,11 +891,6 @@ public class StatsCalculator extends DefaultPlanVisitor<Statistics, Void> {
     @Override
     public Statistics visitLogicalTopN(LogicalTopN<? extends Plan> topN, Void context) {
         return computeTopN(topN, groupExpression.childStatistics(0));
-    }
-
-    @Override
-    public Statistics visitLogicalDeferMaterializeTopN(LogicalDeferMaterializeTopN<? extends Plan> topN, Void context) {
-        return computeTopN(topN.getLogicalTopN(), groupExpression.childStatistics(0));
     }
 
     @Override
@@ -917,6 +914,29 @@ public class StatsCalculator extends DefaultPlanVisitor<Statistics, Void> {
     public Statistics visitLogicalAssertNumRows(
             LogicalAssertNumRows<? extends Plan> assertNumRows, Void context) {
         return computeAssertNumRows(assertNumRows.getAssertNumRowsElement(), groupExpression.childStatistics(0));
+    }
+
+    @Override
+    public Statistics visitLogicalRecursiveUnion(
+            LogicalRecursiveUnion<? extends Plan, ? extends Plan> recursiveCte, Void context) {
+        return computeRecursiveCte(recursiveCte,
+                groupExpression.children()
+                        .stream().map(Group::getStatistics).collect(Collectors.toList()));
+    }
+
+    @Override
+    public Statistics visitLogicalRecursiveUnionAnchor(LogicalRecursiveUnionAnchor recursiveAnchor,
+            Void context) {
+        StatisticsBuilder builder = new StatisticsBuilder(groupExpression.childStatistics(0));
+        Statistics statistics = builder.setWidthInJoinCluster(1).build();
+        cteIdToStats.put(recursiveAnchor.getCteId(), statistics);
+        return statistics;
+    }
+
+    @Override
+    public Statistics visitLogicalRecursiveUnionProducer(LogicalRecursiveUnionProducer recursiveProducer,
+            Void context) {
+        return groupExpression.childStatistics(0);
     }
 
     @Override
@@ -994,14 +1014,32 @@ public class StatsCalculator extends DefaultPlanVisitor<Statistics, Void> {
     }
 
     @Override
-    public Statistics visitPhysicalDeferMaterializeOlapScan(PhysicalDeferMaterializeOlapScan deferMaterializeOlapScan,
-            Void context) {
-        return computeCatalogRelation(deferMaterializeOlapScan.getPhysicalOlapScan());
+    public Statistics visitPhysicalSchemaScan(PhysicalSchemaScan schemaScan, Void context) {
+        return computeCatalogRelation(schemaScan);
     }
 
     @Override
-    public Statistics visitPhysicalSchemaScan(PhysicalSchemaScan schemaScan, Void context) {
-        return computeCatalogRelation(schemaScan);
+    public Statistics visitPhysicalWorkTableReference(PhysicalWorkTableReference workTableReference, Void context) {
+        CTEId cteId = workTableReference.getCteId();
+        Statistics prodStats = cteIdToStats.get(cteId);
+        Preconditions.checkArgument(prodStats != null, String.format("Stats for CTE: %s not found", cteId));
+        Statistics consumerStats = new Statistics(prodStats.getRowCount(), 1, new HashMap<>());
+        // because recursive cte's anchor outputs are same as worktable's output, we compare slot name for simplicity
+        Map<String, ColumnStatistic> columnStats = new HashMap<>();
+        for (Map.Entry<Expression, ColumnStatistic> entry : prodStats.columnStatistics().entrySet()) {
+            columnStats.put(entry.getKey().getExpressionName(), entry.getValue());
+        }
+        for (Slot slot : workTableReference.getOutput()) {
+            ColumnStatistic colStats = columnStats.get(slot.getName());
+            if (colStats == null) {
+                continue;
+            }
+            consumerStats.addColumnStats(slot, colStats);
+        }
+        return new StatisticsBuilder()
+                .setRowCount(Math.max(1, consumerStats.getRowCount()) * RECURSIVE_CTE_EXPAND_RATIO)
+                .putColumnStatistics(consumerStats.columnStatistics())
+                .build();
     }
 
     @Override
@@ -1023,18 +1061,8 @@ public class StatsCalculator extends DefaultPlanVisitor<Statistics, Void> {
     }
 
     @Override
-    public Statistics visitPhysicalJdbcScan(PhysicalJdbcScan jdbcScan, Void context) {
-        return computeCatalogRelation(jdbcScan);
-    }
-
-    @Override
     public Statistics visitPhysicalOdbcScan(PhysicalOdbcScan odbcScan, Void context) {
         return computeCatalogRelation(odbcScan);
-    }
-
-    @Override
-    public Statistics visitPhysicalEsScan(PhysicalEsScan esScan, Void context) {
-        return computeCatalogRelation(esScan);
     }
 
     @Override
@@ -1045,12 +1073,6 @@ public class StatsCalculator extends DefaultPlanVisitor<Statistics, Void> {
     @Override
     public Statistics visitPhysicalTopN(PhysicalTopN<? extends Plan> topN, Void context) {
         return computeTopN(topN, groupExpression.childStatistics(0));
-    }
-
-    @Override
-    public Statistics visitPhysicalDeferMaterializeTopN(PhysicalDeferMaterializeTopN<? extends Plan> topN,
-            Void context) {
-        return computeTopN(topN.getPhysicalTopN(), groupExpression.childStatistics(0));
     }
 
     @Override
@@ -1088,6 +1110,28 @@ public class StatsCalculator extends DefaultPlanVisitor<Statistics, Void> {
     public Statistics visitPhysicalAssertNumRows(PhysicalAssertNumRows<? extends Plan> assertNumRows,
             Void context) {
         return computeAssertNumRows(assertNumRows.getAssertNumRowsElement(), groupExpression.childStatistics(0));
+    }
+
+    @Override
+    public Statistics visitPhysicalRecursiveUnion(PhysicalRecursiveUnion<? extends Plan, ? extends Plan> recursiveUnion,
+            Void context) {
+        return computeRecursiveCte(recursiveUnion, groupExpression.children()
+                .stream().map(Group::getStatistics).collect(Collectors.toList()));
+    }
+
+    @Override
+    public Statistics visitPhysicalRecursiveUnionAnchor(PhysicalRecursiveUnionAnchor recursiveUnionAnchor,
+            Void context) {
+        StatisticsBuilder builder = new StatisticsBuilder(groupExpression.childStatistics(0));
+        Statistics statistics = builder.setWidthInJoinCluster(1).build();
+        cteIdToStats.put(recursiveUnionAnchor.getCteId(), statistics);
+        return statistics;
+    }
+
+    @Override
+    public Statistics visitPhysicalRecursiveUnionProducer(PhysicalRecursiveUnionProducer recursiveUnionProducer,
+            Void context) {
+        return groupExpression.childStatistics(0);
     }
 
     @Override
@@ -1185,6 +1229,10 @@ public class StatsCalculator extends DefaultPlanVisitor<Statistics, Void> {
         return columnStatistics;
     }
 
+    /**
+     * - partition pruned: try to get partition col stats, if failed, then fall back to table level col stats
+     * - no partition pruned: get table level col stats
+     */
     private ColumnStatistic getColumnStatistic(
             OlapTableStatistics olapTableStatistics, String colName, List<String> partitionNames) {
         if (connectContext != null && connectContext.getState().isPlanWithUnKnownColumnStats()) {
@@ -1394,7 +1442,9 @@ public class StatsCalculator extends DefaultPlanVisitor<Statistics, Void> {
         //       2. Handle alias, literal in the output expression list
         for (NamedExpression outputExpression : outputExpressions) {
             ColumnStatistic columnStat = ExpressionEstimation.estimate(outputExpression, childStats);
-            if (columnStat.getHotValues() != null) {
+            Map<Literal, Float> hotValues = columnStat.getHotValues();
+            // Hot values from child cannot be propagated through aggregate: aggregation (group by, sum, etc.)
+            if (hotValues != null && !hotValues.isEmpty()) {
                 ColumnStatisticBuilder builder = new ColumnStatisticBuilder(columnStat);
                 builder.setHotValues(null);
                 columnStat = builder.build();
@@ -1472,6 +1522,69 @@ public class StatsCalculator extends DefaultPlanVisitor<Statistics, Void> {
     }
 
     /**
+     * computeRecursiveCte
+     */
+    public Statistics computeRecursiveCte(RecursiveCte recursiveCte, List<Statistics> childStats) {
+        // similar as computeUnion
+        List<SlotReference> head;
+        Statistics headStats;
+        List<List<SlotReference>> childOutputs = Lists.newArrayList(recursiveCte.getRegularChildrenOutputs());
+
+        head = childOutputs.get(0);
+        headStats = new StatisticsBuilder(childStats.get(0)).build();
+
+        StatisticsBuilder statisticsBuilder = new StatisticsBuilder();
+        List<NamedExpression> unionOutput = recursiveCte.getOutputs();
+        double unionRowCount = childStats.stream().mapToDouble(Statistics::getRowCount).sum();
+        statisticsBuilder.setRowCount(unionRowCount);
+
+        for (int i = 0; i < head.size(); i++) {
+            Slot headSlot = head.get(i);
+            ColumnStatisticBuilder colStatsBuilder = new ColumnStatisticBuilder(
+                    headStats.findColumnStatistics(headSlot));
+            for (int j = 1; j < childOutputs.size(); j++) {
+                Slot slot = childOutputs.get(j).get(i);
+                ColumnStatistic rightStatistic = childStats.get(j).findColumnStatistics(slot);
+                double rightRowCount = childStats.get(j).getRowCount();
+                colStatsBuilder = unionColumn(colStatsBuilder,
+                        headStats.getRowCount(), rightStatistic, rightRowCount, headSlot.getDataType());
+            }
+
+            //update hot values
+            Map<Literal, Float> unionHotValues = new HashMap<>();
+            for (int j = 0; j < childOutputs.size(); j++) {
+                Slot slot = childOutputs.get(j).get(i);
+                ColumnStatistic slotStats = childStats.get(j).findColumnStatistics(slot);
+                if (slotStats.getHotValues() != null) {
+                    for (Map.Entry<Literal, Float> entry : slotStats.getHotValues().entrySet()) {
+                        Float value = unionHotValues.get(entry.getKey());
+                        if (value == null) {
+                            unionHotValues.put(entry.getKey(),
+                                    (float) (entry.getValue() * childStats.get(j).getRowCount()));
+                        } else {
+                            unionHotValues.put(entry.getKey(),
+                                    (float) (value + entry.getValue() * childStats.get(j).getRowCount()));
+                        }
+                    }
+                }
+            }
+
+            int maxHotValueCount = SessionVariable.getHotValueCollectCount();
+            Map<Literal, Float> resultHotValues = new LinkedHashMap<>();
+            unionHotValues.entrySet().stream()
+                    .sorted((a, b) -> Float.compare(b.getValue(), a.getValue()))
+                    .limit(maxHotValueCount)
+                    .forEach(e -> resultHotValues.put(e.getKey(), (float) (e.getValue() / unionRowCount)));
+            if (!resultHotValues.isEmpty()) {
+                colStatsBuilder.setHotValues(resultHotValues);
+            }
+            statisticsBuilder.putColumnStatistics(unionOutput.get(i), colStatsBuilder.build());
+        }
+
+        return statisticsBuilder.setWidthInJoinCluster(1).build();
+    }
+
+    /**
      * computeUnion
      */
     public Statistics computeUnion(Union union, List<Statistics> childStats) {
@@ -1530,14 +1643,15 @@ public class StatsCalculator extends DefaultPlanVisitor<Statistics, Void> {
                 }
             }
 
-            Map<Literal, Float> resultHotValues = new LinkedHashMap<>();
-            for (Literal hot : unionHotValues.keySet()) {
-                float ratio = (float) (unionHotValues.get(hot) / unionRowCount);
-                if (ratio * colStatsBuilder.getNdv() >= SessionVariable.getSkewValueThreshold()
-                        || ratio >= SessionVariable.getHotValueThreshold()) {
-                    resultHotValues.put(hot, ratio);
-                }
+            int maxHotValueCount = SessionVariable.getHotValueCollectCount();
+            if (maxHotValueCount <= 0) {
+                maxHotValueCount = 10;
             }
+            Map<Literal, Float> resultHotValues = new LinkedHashMap<>();
+            unionHotValues.entrySet().stream()
+                    .sorted((a, b) -> Float.compare(b.getValue(), a.getValue()))
+                    .limit(maxHotValueCount)
+                    .forEach(e -> resultHotValues.put(e.getKey(), (float) (e.getValue() / unionRowCount)));
             if (!resultHotValues.isEmpty()) {
                 colStatsBuilder.setHotValues(resultHotValues);
             }

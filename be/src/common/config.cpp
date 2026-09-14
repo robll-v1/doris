@@ -30,11 +30,14 @@
 #include <fstream> // IWYU pragma: keep
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <random>
+#include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -44,7 +47,12 @@
 #include "common/status.h"
 #include "io/fs/file_writer.h"
 #include "io/fs/local_file_system.h"
+#include "load/memtable/memtable_flush_executor.h"
+#include "runtime/exec_env.h"
+#include "runtime/workload_group/workload_group_manager.h"
+#include "storage/storage_engine.h"
 #include "util/cpu_info.h"
+#include "util/string_util.h"
 
 namespace doris::config {
 #include "common/compile_check_avoid_begin.h"
@@ -64,6 +72,13 @@ DEFINE_Int32(be_port, "9060");
 DEFINE_Int32(brpc_port, "8060");
 
 DEFINE_Int32(arrow_flight_sql_port, "8050");
+
+// Validate Arrow input buffers in opted-in Arrow readers before converting them to Doris columns.
+DEFINE_Bool(enable_arrow_input_validation, "true");
+
+DEFINE_Int32(cdc_client_port, "9096");
+
+DEFINE_String(cdc_client_java_opts, "");
 
 // If the external client cannot directly access priority_networks, set public_host to be accessible
 // to external client.
@@ -243,6 +258,8 @@ DEFINE_Int32(num_query_ctx_map_partitions, "128");
 DEFINE_Int32(make_snapshot_worker_count, "5");
 // the count of thread to release snapshot
 DEFINE_Int32(release_snapshot_worker_count, "5");
+// the count of thread to make committed rowsets visible in cloud mode
+DEFINE_Int32(cloud_make_committed_rs_visible_worker_count, "16");
 // report random wait a little time to avoid FE receiving multiple be reports at the same time.
 // do not set it to false for production environment
 DEFINE_mBool(report_random_wait, "true");
@@ -260,12 +277,22 @@ DEFINE_mInt32(download_low_speed_limit_kbps, "50");
 DEFINE_mInt32(download_low_speed_time, "300");
 // whether to download small files in batch
 DEFINE_mBool(enable_batch_download, "true");
+// whether to enable stream load forward endpoint for cloud group commit
+DEFINE_mBool(enable_group_commit_streamload_be_forward, "false");
 // whether to check md5sum when download
 DEFINE_mBool(enable_download_md5sum_check, "false");
 // download binlog meta timeout, default 30s
 DEFINE_mInt32(download_binlog_meta_timeout_ms, "30000");
 // the interval time(seconds) for agent report index policy to FE
 DEFINE_mInt32(report_index_policy_interval_seconds, "10");
+
+// DNS cache: throttle "use cached ip" warning to once per N failures per host.
+DEFINE_mInt32(dns_cache_log_every_n_failures, "10");
+// DNS cache: evict a hostname after this many consecutive resolution failures.
+DEFINE_mInt32(dns_cache_max_consecutive_failures, "30");
+// DNS cache: after eviction, block re-resolve attempts for this many seconds.
+// Set <= 0 to disable the negative cache (legacy behavior).
+DEFINE_mInt32(dns_cache_negative_ttl_seconds, "60");
 
 DEFINE_String(sys_log_dir, "");
 DEFINE_String(user_function_dir, "${DORIS_HOME}/lib/udf");
@@ -306,7 +333,7 @@ DEFINE_Int32(task_executor_max_concurrency_per_task, "-1");
 DEFINE_Int32(task_executor_initial_max_concurrency_per_task, "-1");
 
 // Enable task executor in internal table scan.
-DEFINE_Bool(enable_task_executor_in_internal_table, "false");
+DEFINE_Bool(enable_task_executor_in_internal_table, "true");
 // Enable task executor in external table scan.
 DEFINE_Bool(enable_task_executor_in_external_table, "true");
 
@@ -326,15 +353,14 @@ DEFINE_mInt32(thrift_connect_timeout_seconds, "3");
 DEFINE_mInt64(thrift_client_retry_interval_ms, "1000");
 // max message size of thrift request
 // default: 100 * 1024 * 1024
-DEFINE_mInt64(thrift_max_message_size, "104857600");
+DEFINE_mInt32(thrift_max_message_size, "104857600");
 // max bytes number for single scan range, used in segmentv2
 DEFINE_mInt32(doris_scan_range_max_mb, "1024");
 // single read execute fragment row number
 DEFINE_mInt32(doris_scanner_row_num, "16384");
 // single read execute fragment row bytes
 DEFINE_mInt32(doris_scanner_row_bytes, "10485760");
-// single read execute fragment max run time millseconds
-DEFINE_mInt32(doris_scanner_max_run_time_ms, "1000");
+DEFINE_mInt32(doris_scanner_dynamic_interval_ms, "100");
 // (Advanced) Maximum size of per-query receive-side buffer
 DEFINE_mInt32(exchg_node_buffer_size_bytes, "20485760");
 DEFINE_mInt32(exchg_buffer_queue_capacity_factor, "64");
@@ -349,6 +375,7 @@ DEFINE_mInt32(tablet_lookup_cache_stale_sweep_time_sec, "30");
 DEFINE_mInt32(point_query_row_cache_stale_sweep_time_sec, "300");
 DEFINE_mInt32(disk_stat_monitor_interval, "5");
 DEFINE_mInt32(unused_rowset_monitor_interval, "30");
+// Legacy name retained for compatibility; controls GLOBAL_ROWID_COL file-map GC.
 DEFINE_mInt32(quering_rowsets_evict_interval, "30");
 DEFINE_String(storage_root_path, "${DORIS_HOME}/storage");
 DEFINE_mString(broken_storage_path, "");
@@ -382,6 +409,12 @@ DEFINE_mInt32(trash_file_expire_time_sec, "0");
 // modify them upon necessity
 DEFINE_Int32(min_file_descriptor_number, "60000");
 DEFINE_mBool(disable_segment_cache, "false");
+// Enable checking segment rows consistency between rowset meta and segment footer
+DEFINE_mBool(enable_segment_rows_consistency_check, "false");
+DEFINE_mBool(enable_segment_rows_check_core, "false");
+// ATTENTION: For test only. In test environment, there are no historical data,
+// so all rowset meta should have segment rows info.
+DEFINE_mBool(fail_when_segment_rows_not_in_rowset_meta, "false");
 DEFINE_String(row_cache_mem_limit, "20%");
 
 // Cache for storage page size
@@ -389,6 +422,7 @@ DEFINE_String(storage_page_cache_limit, "20%");
 // Shard size for page cache, the value must be power of two.
 // It's recommended to set it to a value close to the number of BE cores in order to reduce lock contentions.
 DEFINE_Int32(storage_page_cache_shard_size, "256");
+DEFINE_mInt32(file_cache_mem_storage_shard_num, "1024");
 // Percentage for index page cache
 // all storage page cache will be divided into data_page_cache and index_page_cache
 DEFINE_Int32(index_page_cache_percentage, "10");
@@ -396,6 +430,12 @@ DEFINE_Int32(index_page_cache_percentage, "10");
 DEFINE_mBool(disable_storage_page_cache, "false");
 // whether to disable row cache feature in storage
 DEFINE_mBool(disable_storage_row_cache, "true");
+// Parquet page cache: threshold ratio for caching decompressed vs compressed pages
+// If uncompressed_size / compressed_size <= threshold, cache decompressed;
+// otherwise cache compressed if enable_parquet_cache_compressed_pages = true
+DEFINE_Double(parquet_page_cache_decompress_threshold, "1.5");
+// Parquet page cache: whether to enable caching compressed pages (when ratio exceeds threshold)
+DEFINE_Bool(enable_parquet_cache_compressed_pages, "false");
 // whether to disable pk page cache feature in storage
 DEFINE_Bool(disable_pk_storage_page_cache, "false");
 
@@ -410,6 +450,8 @@ DEFINE_mInt32(pk_index_page_cache_stale_sweep_time_sec, "600");
 
 DEFINE_mBool(enable_low_cardinality_optimize, "true");
 DEFINE_Bool(enable_low_cardinality_cache_code, "true");
+
+DEFINE_mBool(enable_adaptive_batch_size, "true");
 
 // be policy
 // whether check compaction checksum
@@ -426,9 +468,18 @@ DEFINE_mInt32(vertical_compaction_num_columns_per_group, "5");
 DEFINE_Int32(vertical_compaction_max_row_source_memory_mb, "1024");
 // In vertical compaction, max dest segment file size
 DEFINE_mInt64(vertical_compaction_max_segment_size, "1073741824");
+// Density threshold for sparse column compaction optimization
+// density = (total_cells - null_cells) / total_cells, smaller means more sparse
+// When density <= threshold, enable sparse optimization
+// 0 = disable optimization, 1 = always enable
+// Default 0.05 means enable sparse optimization when desity <= 5%
+DEFINE_mDouble(sparse_column_compaction_threshold_percent, "0.05");
+// Enable RLE batch Put optimization for compaction
+DEFINE_mBool(enable_rle_batch_put_optimization, "true");
 
-// If enabled, segments will be flushed column by column
-DEFINE_mBool(enable_vertical_segment_writer, "true");
+// Enable PDEP-based bit unpacking. Disable it on CPUs where PDEP is microcoded and slower than
+// the scalar implementation, such as AMD Zen+ and Zen 2.
+DEFINE_Bool(enable_bmi2_optimizations, "true");
 
 // In ordered data compaction, min segment size for input rowset
 DEFINE_mInt32(ordered_data_compaction_min_segment_size, "10485760");
@@ -436,7 +487,15 @@ DEFINE_mInt32(ordered_data_compaction_min_segment_size, "10485760");
 // This config can be set to limit thread number in compaction thread pool.
 DEFINE_mInt32(max_base_compaction_threads, "4");
 DEFINE_mInt32(max_cumu_compaction_threads, "-1");
-DEFINE_mInt32(max_single_replica_compaction_threads, "-1");
+
+// Binlog Compaction
+DEFINE_mInt64(binlog_compaction_wait_timesec_after_visible, "600");
+DEFINE_mInt64(binlog_compaction_goal_size_mbytes, "128");
+DEFINE_mInt32(binlog_compaction_task_num_per_disk, "4");
+DEFINE_mInt32(binlog_compaction_file_count_threshold, "100");
+DEFINE_mInt32(binlog_level_compaction_max_deltas, "2000");
+DEFINE_mInt64(binlog_compaction_time_threshold_seconds, "3600");
+DEFINE_mInt32(max_binlog_compaction_threads, "-1");
 
 DEFINE_Bool(enable_base_compaction_idle_sched, "true");
 DEFINE_mInt64(base_compaction_min_rowset_num, "5");
@@ -476,17 +535,11 @@ DEFINE_mInt64(cumulative_compaction_min_deltas, "5");
 DEFINE_mInt64(cumulative_compaction_max_deltas, "1000");
 DEFINE_mInt32(cumulative_compaction_max_deltas_factor, "10");
 
-// This config can be set to limit thread number in  multiget thread pool.
-DEFINE_mInt32(multi_get_max_threads, "10");
-
 // The upper limit of "permits" held by all compaction tasks. This config can be set to limit memory consumption for compaction.
 DEFINE_mInt64(total_permits_for_compaction_score, "1000000");
 
 // sleep interval in ms after generated compaction tasks
 DEFINE_mInt32(generate_compaction_tasks_interval_ms, "100");
-
-// sleep interval in second after update replica infos
-DEFINE_mInt32(update_replica_infos_interval_seconds, "60");
 
 // Compaction task number per disk.
 // Must be greater than 2, because Base compaction and Cumulative compaction have at least one thread each.
@@ -525,6 +578,9 @@ DEFINE_mInt32(base_compaction_trace_threshold, "60");
 DEFINE_mInt32(cumulative_compaction_trace_threshold, "10");
 DEFINE_mBool(disable_compaction_trace_log, "true");
 
+DEFINE_mBool(enable_compaction_task_tracker, "true");
+DEFINE_mInt32(compaction_task_tracker_max_records, "10000");
+
 // Interval to picking rowset to compact, in seconds
 DEFINE_mInt64(pick_rowset_to_compact_interval_sec, "86400");
 
@@ -554,6 +610,26 @@ DEFINE_Int64(migration_lock_timeout_ms, "1000");
 
 // Port to start debug webserver on
 DEFINE_Int32(webserver_port, "8040");
+// TLS module enable flag
+DEFINE_Bool(enable_tls, "false");
+// Path of TLS certificate
+DEFINE_String(tls_certificate_path, "");
+// Path of TLS private key
+DEFINE_String(tls_private_key_path, "");
+// Password for encrypted TLS private key
+DEFINE_String(tls_private_key_password, "");
+// TLS peer verification mode
+DEFINE_String(tls_verify_mode, "verify_peer");
+// Path of TLS CA certificate
+DEFINE_String(tls_ca_certificate_path, "");
+// TLS certificate reload interval, in seconds
+DEFINE_Int32(tls_cert_refresh_interval_seconds, "3600");
+// Comma-separated excluded server protocols: brpc,thrift,http,arrowflight
+DEFINE_String(tls_excluded_protocols, "");
+// Required peer certificate DNS SAN allowlist for private protocols, syntax: brpc=a.com;thrift=b.com.
+// Empty means allow all peers. Once configured, the list acts as an allowlist and only peers whose
+// DNS SAN matches at least one configured entry for that protocol are allowed.
+DEFINE_String(tls_peer_cert_required_san_dns, "");
 // Https enable flag
 DEFINE_Bool(enable_https, "false");
 // Path of certificate
@@ -565,9 +641,13 @@ DEFINE_Bool(enable_all_http_auth, "false");
 // Number of webserver workers
 DEFINE_Int32(webserver_num_workers, "128");
 
-DEFINE_Bool(enable_single_replica_load, "true");
-// Number of download workers for single replica load
-DEFINE_Int32(single_replica_load_download_num_workers, "64");
+// Async replies: stream load only now
+// reply wait timeout only happens if:
+// 1. Stream load fragment execution times out
+//    HTTP request freed → stream load canceled
+// 2. Client disconnects
+DEFINE_mInt32(async_reply_timeout_s, "60");
+DEFINE_Validator(async_reply_timeout_s, [](const int config) -> bool { return config >= 3; });
 
 // Used for mini Load. mini load data file will be removed after this time.
 DEFINE_Int64(load_data_reserve_hours, "4");
@@ -577,8 +657,10 @@ DEFINE_mInt64(load_error_log_reserve_hours, "48");
 DEFINE_mInt64(load_error_log_limit_bytes, "209715200");
 
 DEFINE_Int32(brpc_heavy_work_pool_threads, "-1");
+DEFINE_Int32(brpc_peer_fetch_pool_threads, "-1");
 DEFINE_Int32(brpc_light_work_pool_threads, "-1");
 DEFINE_Int32(brpc_heavy_work_pool_max_queue_size, "-1");
+DEFINE_Int32(brpc_peer_fetch_pool_max_queue_size, "-1");
 DEFINE_Int32(brpc_light_work_pool_max_queue_size, "-1");
 DEFINE_mBool(enable_bthread_transmit_block, "true");
 DEFINE_Int32(brpc_arrow_flight_work_pool_threads, "-1");
@@ -608,7 +690,6 @@ DEFINE_mInt32(streaming_load_rpc_max_alive_time_sec, "1200");
 DEFINE_Int32(tablet_writer_open_rpc_timeout_sec, "60");
 // You can ignore brpc error '[E1011]The server is overcrowded' when writing data.
 DEFINE_mBool(tablet_writer_ignore_eovercrowded, "true");
-DEFINE_mInt32(slave_replica_writer_rpc_timeout_sec, "60");
 // Whether to enable stream load record function, the default is false.
 // False: disable stream load record
 DEFINE_mBool(enable_stream_load_record, "false");
@@ -629,6 +710,9 @@ DEFINE_mBool(enable_stream_load_commit_txn_on_be, "false");
 // The buffer size to store stream table function schema info
 DEFINE_Int64(stream_tvf_buffer_size, "1048576"); // 1MB
 
+// request cdc client timeout
+DEFINE_mInt32(request_cdc_client_timeout_ms, "120000");
+
 // OlapTableSink sender's send interval, should be less than the real response time of a tablet writer rpc.
 // You may need to lower the speed when the sink receiver bes are too busy.
 DEFINE_mInt32(olap_table_sink_send_interval_microseconds, "1000");
@@ -639,13 +723,10 @@ DEFINE_Int32(fragment_mgr_async_work_pool_thread_num_min, "16");
 DEFINE_Int32(fragment_mgr_async_work_pool_thread_num_max, "2048");
 DEFINE_Int32(fragment_mgr_async_work_pool_queue_size, "4096");
 
-// Control the number of disks on the machine.  If 0, this comes from the system settings.
-DEFINE_Int32(num_disks, "0");
 // The read size is the size of the reads sent to os.
 // There is a trade off of latency and throughout, trying to keep disks busy but
-// not introduce seeks.  The literature seems to agree that with 8 MB reads, random
+// not introduce seeks. The literature seems to agree that with 8 MB reads, random
 // io and sequential io perform similarly.
-DEFINE_Int32(read_size, "8388608");    // 8 * 1024 * 1024, Read Size (in bytes)
 DEFINE_Int32(min_buffer_size, "1024"); // 1024, The minimum read buffer size (in bytes)
 
 // for pprof
@@ -700,9 +781,6 @@ DEFINE_Int32(load_process_soft_mem_limit_percent, "80");
 // If load memory consumption is within load_process_safe_mem_permit_percent,
 // memtable memory limiter will do nothing.
 DEFINE_Int32(load_process_safe_mem_permit_percent, "5");
-
-// If there are a lot of memtable memory, then wait them flush finished.
-DEFINE_mDouble(load_max_wg_active_memtable_percent, "0.6");
 
 // result buffer cancelled time (unit: second)
 DEFINE_mInt32(result_buffer_cancelled_interval_time, "300");
@@ -778,12 +856,23 @@ DEFINE_mInt32(storage_flood_stage_usage_percent, "90"); // 90%
 // The min bytes that should be left of a data dir
 DEFINE_mInt64(storage_flood_stage_left_capacity_bytes, "1073741824"); // 1GB
 // number of thread for flushing memtable per store
-DEFINE_Int32(flush_thread_num_per_store, "6");
+DEFINE_mInt32(flush_thread_num_per_store, "6");
 // number of thread for flushing memtable per store, for high priority load task
-DEFINE_Int32(high_priority_flush_thread_num_per_store, "6");
+DEFINE_mInt32(high_priority_flush_thread_num_per_store, "6");
 // number of threads = min(flush_thread_num_per_store * num_store,
 //                         max_flush_thread_num_per_cpu * num_cpu)
-DEFINE_Int32(max_flush_thread_num_per_cpu, "4");
+DEFINE_mInt32(max_flush_thread_num_per_cpu, "4");
+
+// minimum flush threads per cpu when adaptive flush is enabled (default 0.5)
+DEFINE_mDouble(min_flush_thread_num_per_cpu, "0.5");
+
+// Whether to enable adaptive flush thread adjustment
+DEFINE_mBool(enable_adaptive_flush_threads, "true");
+
+// Whether to block writes when one table has too many pending flush memtables on this BE.
+DEFINE_mBool(enable_table_memtable_flush_backpressure, "true");
+// Max pending flush memtables for one table on this BE before blocking new writes.
+DEFINE_mInt32(table_memtable_flush_pending_count_limit, "10");
 
 // config for tablet meta checkpoint
 DEFINE_mInt32(tablet_meta_checkpoint_min_new_rowsets_num, "10");
@@ -855,6 +944,10 @@ DEFINE_String(thrift_server_type_of_fe, "THREAD_POOL");
 // disable zone map index when page row is too few
 DEFINE_mInt32(zone_map_row_num_threshold, "20");
 
+// Maximum number of IN values checked exactly against a zone map. For larger sets, only the
+// IN-set min/max range is checked.
+DEFINE_mInt32(in_zonemap_point_check_threshold, "8192");
+
 // aws sdk log level
 //    Off = 0,
 //    Fatal = 1,
@@ -925,9 +1018,6 @@ DEFINE_Int32(send_batch_thread_pool_queue_size, "102400");
 DEFINE_mInt32(max_segment_num_per_rowset, "1000");
 DEFINE_mInt32(segment_compression_threshold_kb, "256");
 
-// Time to clean up useless JDBC connection pool cache
-DEFINE_mInt32(jdbc_connection_pool_cache_clear_time_sec, "28800");
-
 // Global bitmap cache capacity for aggregation cache, size in bytes
 DEFINE_Int64(delete_bitmap_agg_cache_capacity, "104857600");
 // The default delete bitmap cache is set to 100MB,
@@ -991,6 +1081,10 @@ DEFINE_mInt32(in_memory_file_size, "1048576"); // 1MB
 
 // Max size of parquet page header in bytes
 DEFINE_mInt32(parquet_header_max_size_mb, "1");
+// Max size of parquet file metadata in bytes
+DEFINE_mInt64(parquet_metadata_size_limit, "268435456");
+DEFINE_Validator(parquet_metadata_size_limit,
+                 [](const int64_t config) -> bool { return config > 0; });
 // Max buffer size for parquet row group
 DEFINE_mInt32(parquet_rowgroup_max_buffer_mb, "128");
 // Max buffer size for parquet chunk column
@@ -1001,11 +1095,10 @@ DEFINE_mInt32(merged_hdfs_min_io_size, "8192");
 
 // OrcReader
 DEFINE_mInt32(orc_natural_read_size_mb, "8");
-DEFINE_mInt64(big_column_size_buffer, "65535");
-DEFINE_mInt64(small_column_size_buffer, "100");
-
+DEFINE_Validator(orc_natural_read_size_mb,
+                 [](const int config) -> bool { return config > 0 && config <= 1024; });
 // Perform the always_true check at intervals determined by runtime_filter_sampling_frequency
-DEFINE_mInt32(runtime_filter_sampling_frequency, "64");
+DEFINE_mInt32(runtime_filter_sampling_frequency, "32");
 DEFINE_mInt32(execution_max_rpc_timeout_sec, "3600");
 DEFINE_mBool(execution_ignore_eovercrowded, "true");
 // cooldown task configs
@@ -1022,6 +1115,9 @@ DEFINE_String(tmp_file_dir, "tmp");
 DEFINE_Int32(min_s3_file_system_thread_num, "16");
 DEFINE_Int32(max_s3_file_system_thread_num, "64");
 
+DEFINE_Int32(min_peer_race_s3_thread_num, "0");
+DEFINE_Int32(max_peer_race_s3_thread_num, "32"); // aligned with default max_concurrent_peer_races
+
 DEFINE_Bool(enable_time_lut, "true");
 
 DEFINE_mBool(enable_query_like_bloom_filter, "true");
@@ -1036,13 +1132,6 @@ DEFINE_mInt64(nodechannel_pending_queue_max_bytes, "67108864");
 
 // The batch size for sending data by brpc streaming client
 DEFINE_mInt64(brpc_streaming_client_batch_bytes, "262144");
-
-// Max waiting time to wait the "plan fragment start" rpc.
-// If timeout, the fragment will be cancelled.
-// This parameter is usually only used when the FE loses connection,
-// and the BE can automatically cancel the relevant fragment after the timeout,
-// so as to avoid occupying the execution thread for a long time.
-DEFINE_mInt32(max_fragment_start_wait_time_seconds, "30");
 
 DEFINE_mInt32(fragment_mgr_cancel_worker_interval_seconds, "1");
 
@@ -1077,6 +1166,23 @@ DEFINE_mInt32(segcompaction_num_threads, "5");
 // enable java udf and jdbc scannode
 DEFINE_Bool(enable_java_support, "true");
 
+// enable python udf
+DEFINE_Bool(enable_python_udf_support, "false");
+// python env mode, options: conda, venv
+DEFINE_String(python_env_mode, "");
+// root path of conda runtime, python_env_mode should be conda
+DEFINE_String(python_conda_root_path, "");
+// root path of venv runtime, python_env_mode should be venv
+DEFINE_String(python_venv_root_path, "${DORIS_HOME}/lib/udf/python");
+// python interpreter paths used by venv, e.g. /usr/bin/python3.7:/usr/bin/python3.6
+DEFINE_String(python_venv_interpreter_paths, "");
+// max python processes in global shared pool, each version can have up to this many processes
+// 0 means use CPU core count as default, otherwise use the specified value
+DEFINE_mInt32(max_python_process_num, "0");
+// Memory limit in bytes for all Python UDF processes; warning is logged when exceeded
+// default is 10GB
+DEFINE_mInt64(python_udf_processes_memory_limit_bytes, "10737418240");
+
 // Set config randomly to check more issues in github workflow
 DEFINE_Bool(enable_fuzzy_mode, "false");
 
@@ -1086,17 +1192,33 @@ DEFINE_Bool(enable_debug_points, "false");
 
 DEFINE_Int32(pipeline_executor_size, "0");
 DEFINE_Int32(blocking_pipeline_executor_size, "0");
-DEFINE_Bool(enable_workload_group_for_scan, "false");
-DEFINE_mInt64(workload_group_scan_task_wait_timeout_ms, "10000");
-
-// Whether use schema dict in backend side instead of MetaService side(cloud mode)
-DEFINE_mBool(variant_use_cloud_schema_dict_cache, "true");
-DEFINE_mInt64(variant_threshold_rows_to_estimate_sparse_column, "2048");
+DEFINE_mInt32(variant_max_json_key_length, "255");
 DEFINE_mBool(variant_throw_exeception_on_invalid_json, "false");
+DEFINE_mBool(variant_enable_duplicate_json_path_check, "false");
+// Controls storage-layer parse target for plain non-doc VARIANT columns:
+// 0 = auto, 1 = force parse-time subcolumns, 2 = force doc-value KV staging.
+// NestedGroup, deprecated flatten-nested, and persistent doc mode keep their required paths.
+DEFINE_mInt32(variant_storage_parse_mode, "0");
 DEFINE_mBool(enable_vertical_compact_variant_subcolumns, "true");
+DEFINE_mBool(enable_variant_doc_sparse_write_subcolumns, "true");
+// Maximum depth of nested arrays to track with NestedGroup
+// Reserved for future use when NestedGroup expansion moves to storage layer
+// Deeper arrays will be stored as JSONB
+DEFINE_mInt32(variant_nested_group_max_depth, "10");
+DEFINE_mBool(variant_nested_group_discard_scalar_on_conflict, "true");
+
+DEFINE_Validator(variant_max_json_key_length,
+                 [](const int config) -> bool { return config > 0 && config <= 65535; });
+DEFINE_Validator(variant_storage_parse_mode,
+                 [](const int config) -> bool { return config >= 0 && config <= 2; });
 
 // block file cache
 DEFINE_Bool(enable_file_cache, "false");
+// ATTENTION: For test only. Keep this enabled in production.
+// Whether S3 storage write paths populate file cache while writing data to object storage.
+// Disable this for tests that need load and compaction output to bypass file cache while keeping
+// query-side file cache writes enabled.
+DEFINE_mBool(enable_file_cache_write_from_s3_file_writer, "true");
 // format: [{"path":"/path/to/file_cache","total_size":21474836480,"query_limit":10737418240}]
 // format: [{"path":"/path/to/file_cache","total_size":21474836480,"query_limit":10737418240},{"path":"/path/to/file_cache2","total_size":21474836480,"query_limit":10737418240}]
 // format: {"path": "/path/to/file_cache", "total_size":53687091200, "ttl_percent":50, "normal_percent":40, "disposable_percent":5, "index_percent":5}
@@ -1114,7 +1236,9 @@ DEFINE_String(file_cache_path, "[{\"path\":\"${DORIS_HOME}/file_cache\"}]");
 DEFINE_Int64(file_cache_each_block_size, "1048576"); // 1MB
 
 DEFINE_Bool(clear_file_cache, "false");
-DEFINE_Bool(enable_file_cache_query_limit, "false");
+DEFINE_mBool(enable_file_cache_query_limit, "false");
+// Whether segment footer and segment metadata count toward file cache query limit.
+DEFINE_mBool(enable_file_cache_query_limit_segment_meta, "false");
 DEFINE_mInt32(file_cache_enter_disk_resource_limit_mode_percent, "90");
 DEFINE_mInt32(file_cache_exit_disk_resource_limit_mode_percent, "88");
 DEFINE_mBool(enable_evict_file_cache_in_advance, "true");
@@ -1124,11 +1248,8 @@ DEFINE_mInt32(file_cache_evict_in_advance_interval_ms, "1000");
 DEFINE_mInt64(file_cache_evict_in_advance_batch_bytes, "31457280"); // 30MB
 DEFINE_mInt64(file_cache_evict_in_advance_recycle_keys_num_threshold, "1000");
 
-DEFINE_mBool(enable_read_cache_file_directly, "false");
+DEFINE_mBool(enable_read_cache_file_directly, "true");
 DEFINE_mBool(file_cache_enable_evict_from_other_queue_by_size, "true");
-// If true, evict the ttl cache using LRU when full.
-// Otherwise, only expiration can evict ttl and new data won't add to cache when full.
-DEFINE_Bool(enable_ttl_cache_evict_using_lru, "true");
 DEFINE_mBool(enbale_dump_error_file, "false");
 // limit the max size of error log on disk
 DEFINE_mInt64(file_cache_error_log_limit_bytes, "209715200"); // 200MB
@@ -1144,24 +1265,51 @@ DEFINE_mDouble(file_cache_keep_base_compaction_output_min_hit_ratio, "0.7");
 // if difference below this threshold, we consider cache's progressive upgrading (2.0->3.0) successful
 DEFINE_mDouble(file_cache_meta_store_vs_file_system_diff_num_threshold, "0.3");
 DEFINE_mDouble(file_cache_keep_schema_change_output_min_hit_ratio, "0.7");
+DEFINE_mDouble(file_cache_leak_fs_to_meta_ratio_threshold, "1.3");
+DEFINE_mInt64(file_cache_leak_scan_interval_seconds, "86400");
+DEFINE_mInt32(file_cache_leak_scan_batch_files, "2048");
+DEFINE_mInt32(file_cache_leak_scan_pause_ms, "500");
+DEFINE_mInt64(file_cache_leak_grace_seconds, "3600");
 
 DEFINE_mInt64(file_cache_remove_block_qps_limit, "1000");
 DEFINE_mInt64(file_cache_background_gc_interval_ms, "100");
 DEFINE_mInt64(file_cache_background_block_lru_update_interval_ms, "5000");
 DEFINE_mInt64(file_cache_background_block_lru_update_qps_limit, "1000");
+DEFINE_mInt64(file_cache_background_block_lru_update_queue_max_size, "500000");
+DEFINE_mBool(enable_file_cache_async_touch_on_get_or_set, "false");
 DEFINE_mBool(enable_reader_dryrun_when_download_file_cache, "true");
 DEFINE_mInt64(file_cache_background_monitor_interval_ms, "5000");
-DEFINE_mInt64(file_cache_background_ttl_gc_interval_ms, "3000");
-DEFINE_mInt64(file_cache_background_ttl_gc_batch, "1000");
+DEFINE_mInt64(file_cache_background_ttl_gc_interval_ms, "180000");
+DEFINE_mInt64(file_cache_background_ttl_info_update_interval_ms, "180000");
+DEFINE_mInt64(file_cache_background_tablet_id_flush_interval_ms, "1000");
 DEFINE_mInt64(file_cache_background_lru_dump_interval_ms, "60000");
 // dump queue only if the queue update specific times through several dump intervals
 DEFINE_mInt64(file_cache_background_lru_dump_update_cnt_threshold, "1000");
 DEFINE_mInt64(file_cache_background_lru_dump_tail_record_num, "5000000");
-DEFINE_mInt64(file_cache_background_lru_log_replay_interval_ms, "1000");
+DEFINE_mInt64(file_cache_background_lru_log_queue_max_size, "500000");
+DEFINE_mInt64(file_cache_background_lru_log_replay_interval_ms, "1");
 DEFINE_mBool(enable_evaluate_shadow_queue_diff, "false");
+
+DEFINE_mBool(file_cache_enable_only_warm_up_idx, "false");
 
 DEFINE_Int32(file_cache_downloader_thread_num_min, "32");
 DEFINE_Int32(file_cache_downloader_thread_num_max, "32");
+
+// async file cache write
+DEFINE_mBool(enable_async_file_cache_write, "false");
+DEFINE_mInt32(async_file_cache_write_workers_per_disk, "16");
+// A positive value is the BE-wide queued+active task ownership limit. The successfully initialized
+// cache instances receive equal shares. -1 selects max(1 GiB, 1% of the BE memory limit) before
+// that split.
+DEFINE_mInt64(async_file_cache_write_max_pending_bytes, "-1");
+DEFINE_mBool(enable_async_file_cache_write_inflight_write_buffer_index, "true");
+DEFINE_Int32(async_file_cache_write_inflight_write_buffer_index_shard_count, "64");
+DEFINE_Validator(async_file_cache_write_workers_per_disk,
+                 [](int32_t value) { return value > 0 && value <= 128; });
+DEFINE_Validator(async_file_cache_write_max_pending_bytes,
+                 [](int64_t value) { return value == -1 || value > 0; });
+DEFINE_Validator(async_file_cache_write_inflight_write_buffer_index_shard_count,
+                 [](int32_t value) { return value > 0; });
 
 DEFINE_mInt32(index_cache_entry_stay_time_after_lookup_s, "1800");
 DEFINE_mInt32(inverted_index_cache_stale_sweep_time_sec, "600");
@@ -1179,13 +1327,76 @@ DEFINE_String(inverted_index_query_cache_limit, "10%");
 // condition cache limit
 DEFINE_Int16(condition_cache_limit, "512");
 
+// ANN index topn result cache
+DEFINE_String(ann_index_result_cache_limit, "10%");
+DEFINE_Int32(ann_index_result_cache_shards, "16");
+DEFINE_Int32(ann_index_result_cache_stale_sweep_time_sec, "1800");
+
 // inverted index
 DEFINE_mDouble(inverted_index_ram_buffer_size, "512");
 // -1 indicates not working.
 // Normally we should not change this, it's useful for testing.
 DEFINE_mInt32(inverted_index_max_buffered_docs, "-1");
+// G16-h: zstd levels for the SNII dict-block compression and the .prx window
+// auto mode. Level 9 (vs the historical 3) shrinks the two largest compressed
+// sections -- textbench: index -457 MB (0.918x -> 0.891x V3) -- for an import
+// CPU cost inside the run-to-run variance band; zstd decode speed does not
+// depend on the level, and warm/cold benches measured no query change.
+// Write side only; segments self-describe their compression.
+// Default 3 since the all-level-3 evaluation (2026-07-11, 4 corpora): vs
+// level 9 the settled index grows only +0.6%..+6.3% (whole table
+// +0.3%..+1.9%) while import index CPU drops 17-24% and full-compaction CPU
+// 8-24%; settled cold-query latency is unchanged (interleaved A/B). The
+// delta+varint-encoded payloads are high-entropy, so level 9's extra search
+// buys almost no ratio. Raise only for size-critical deployments.
+DEFINE_mInt32(snii_dict_block_zstd_level, "3");
+DEFINE_mInt32(snii_prx_zstd_level, "3");
+// Patch C prx tiering: zstd level for the prx region of DIRECT-LOAD segments
+// only (stream/broker load, see IndexColumnWriter::set_direct_load). Inert at
+// the defaults (both levels 3); it exists for size-critical deployments that
+// RAISE snii_prx_zstd_level (e.g. 9) and still want cheap loads: compaction
+// rewrites every segment at snii_prx_zstd_level, so SETTLED data (and the
+// cold-query path over it) is unaffected by the load tier -- measured -290s
+// (httplogs) / -204s (agentlogs) of import index CPU at 3 vs 9. Same clamp
+// [3, 19]. Read at index flush like snii_prx_zstd_level (a mid-load change
+// lands on in-flight segments); the direct-load BIT itself is captured once.
+DEFINE_mInt32(snii_prx_zstd_level_direct_load, "3");
+// G16-d: target SNII dict block size in bytes; 0 uses the format default
+// (64 KiB). Larger blocks compress better under the per-block zstd (the dict
+// is the dominant physical section on high-cardinality corpora) at the cost
+// of a larger fetch+decompress unit per cold dict-block miss. Write side
+// only; the block size is self-described by the on-disk directory.
+DEFINE_mInt32(snii_target_dict_block_bytes, "0");
+// SNII's index-build share of the process memory limit, as a percent -- the
+// index-build analogue of load_process_max_memory_limit_percent. Once live SNII
+// index-build memory crosses this share, the largest reclaimable posting arenas
+// are asked to spill early. Derived from the process limit rather than an
+// absolute number so it scales with the BE. Only the RECLAIMABLE population
+// counts against it: index-merge compaction charges the same observation
+// tracker but registers no spillable writer, so its bytes are excluded from the
+// comparison (its own hard reservation cap bounds them instead).
+//
+// 0 disables SNII's OWN share trigger; the process-level backstops (system
+// available memory below its warning water mark, process usage above the soft
+// limit) still apply. The share is deliberately well below those backstops so
+// SNII sheds its own memory before the global valve -- the global valve trips
+// late by design and would be a worse trigger than none. The derived share is
+// floored at four times inverted_index_ram_buffer_size so a small BE is not
+// permanently over it the moment two writers exist.
+DEFINE_mInt32(snii_index_build_max_memory_limit_percent, "10");
+// Minimum reclaimable posting-arena bytes before a G09 forced spill is honored
+// (and before a writer is eligible as a spill victim): forced spills reclaim
+// ONLY the arena, so smaller triggers cut tiny runs for near-zero relief.
+// Default 64 MiB.
+DEFINE_mInt64(snii_forced_spill_min_arena_bytes, "67108864");
+// Max spill-run files one SNII writer accumulates before its runs are
+// merge-compacted into one (bounds the k-way merge fan-in and its open fds;
+// every run is held open for the whole merge). 0 = uncapped. Default 64.
+DEFINE_mInt32(snii_spill_max_run_files_per_buffer, "64");
 // dict path for chinese analyzer
 DEFINE_String(inverted_index_dict_path, "${DORIS_HOME}/dict");
+// The kuromoji (Japanese) analyzer
+DEFINE_mBool(enable_kuromoji_analyzer, "false");
 DEFINE_Int32(inverted_index_read_buffer_size, "4096");
 // tree depth for bkd index
 DEFINE_Int32(max_depth_in_bkd_tree, "32");
@@ -1215,25 +1426,29 @@ DEFINE_mInt64(s3_write_buffer_size, "5242880");
 // Log interval when doing s3 upload task
 DEFINE_mInt32(s3_file_writer_log_interval_second, "60");
 DEFINE_mInt64(file_cache_max_file_reader_cache_size, "1000000");
+// When file cache is enabled, the configured bytes must be divisible by
+// file_cache_each_block_size so every non-EOF HDFS cache block is canonical.
 DEFINE_mInt64(hdfs_write_batch_buffer_size_mb, "1"); // 1MB
 
 //disable shrink memory by default
 DEFINE_mBool(enable_shrink_memory, "false");
-DEFINE_mInt32(schema_cache_capacity, "1024");
-DEFINE_mInt32(schema_cache_sweep_time_sec, "100");
 
 // max number of segment cache, default -1 for backward compatibility fd_number*2/5
 DEFINE_Int32(segment_cache_capacity, "-1");
 DEFINE_Int32(segment_cache_fd_percentage, "20");
 DEFINE_mInt32(estimated_mem_per_column_reader, "512");
 DEFINE_Int32(segment_cache_memory_percentage, "5");
-DEFINE_Bool(enable_segment_cache_prune, "true");
+DEFINE_Bool(enable_segment_cache_prune, "false");
 
 // enable feature binlog, default false
 DEFINE_Bool(enable_feature_binlog, "false");
 
 // enable set in BitmapValue
 DEFINE_Bool(enable_set_in_bitmap_value, "true");
+
+// Enable compact integer tags in row-store JSONB. Once enabled and compact data is written,
+// rollback to code without compact row-store JSONB reader support is not safe.
+DEFINE_Bool(enable_row_store_compact_jsonb, "false");
 
 DEFINE_Int64(max_hdfs_file_handle_cache_num, "20000");
 DEFINE_Int32(max_hdfs_file_handle_cache_time_sec, "28800");
@@ -1249,13 +1464,9 @@ DEFINE_mBool(allow_zero_date, "false");
 DEFINE_Bool(allow_invalid_decimalv2_literal, "false");
 DEFINE_mString(kerberos_ccache_path, "/tmp/");
 DEFINE_mString(kerberos_krb5_conf_path, "/etc/krb5.conf");
-// Deprecated
-DEFINE_mInt32(kerberos_refresh_interval_second, "43200");
-
 // JDK-8153057: avoid StackOverflowError thrown from the UncaughtExceptionHandler in thread "process reaper"
 DEFINE_mBool(jdk_process_reaper_use_default_stack_size, "true");
 
-DEFINE_mString(get_stack_trace_tool, "libunwind");
 DEFINE_mString(dwarf_location_info_mode, "FAST");
 DEFINE_mBool(enable_address_sanitizers_with_stack_trace, "true");
 
@@ -1300,6 +1511,12 @@ DEFINE_mBool(enable_mow_get_agg_by_cache, "true");
 DEFINE_mBool(enable_mow_get_agg_correctness_check_core, "false");
 DEFINE_mBool(enable_agg_and_remove_pre_rowsets_delete_bitmap, "true");
 DEFINE_mBool(enable_check_agg_and_remove_pre_rowsets_delete_bitmap, "false");
+// Remove pre-rowset delete bitmaps in [end_version, end_version] before writing aggregated delete
+// bitmaps. True: point delete; false: range delete.
+DEFINE_mBool(enable_remove_agg_pre_rowsets_delete_bitmap_by_keys, "true");
+// Remove pre-rowset delete bitmaps in [start_version, end_version). True: point delete; false:
+// range delete.
+DEFINE_mBool(enable_remove_pre_rowsets_delete_bitmap_by_keys, "true");
 
 // The secure path with user files, used in the `local` table function.
 DEFINE_String(user_files_secure_path, "${DORIS_HOME}");
@@ -1327,6 +1544,12 @@ DEFINE_mInt32(group_commit_queue_mem_limit, "67108864");
 // group_commit_wal_max_disk_limit=1024 or group_commit_wal_max_disk_limit=10% can be automatically identified.
 DEFINE_String(group_commit_wal_max_disk_limit, "10%");
 DEFINE_Bool(group_commit_wait_replay_wal_finish, "false");
+// Max WAL count for one table before rejecting async group commit loads.
+// 0 means no limit.
+DEFINE_mInt32(group_commit_max_wal_num_per_table, "10");
+// Max time(ms) to wait for creating group commit plan fragment.
+// 0 means no timeout, default 2min.
+DEFINE_mInt32(group_commit_create_plan_timeout_ms, "120000");
 
 DEFINE_mInt32(scan_thread_nice_value, "0");
 DEFINE_mInt32(tablet_schema_cache_recycle_interval, "3600");
@@ -1343,6 +1566,7 @@ DEFINE_mBool(enable_be_proc_monitor, "false");
 DEFINE_mInt32(be_proc_monitor_interval_ms, "10000");
 
 DEFINE_Int32(workload_group_metrics_interval_ms, "5000");
+DEFINE_Int32(workload_policy_check_interval_ms, "500");
 
 // Ingest binlog work pool size, -1 is disable, 0 is hardware concurrency
 DEFINE_Int32(ingest_binlog_work_pool_size, "-1");
@@ -1366,9 +1590,6 @@ DEFINE_mBool(enable_column_type_check, "true");
 // 128 MB
 DEFINE_mInt64(local_exchange_buffer_mem_limit, "134217728");
 
-// Default 300s, if its value <= 0, then log is disabled
-DEFINE_mInt64(enable_debug_log_timeout_secs, "0");
-
 // Tolerance for the number of partition id 0 in rowset, default 0
 DEFINE_Int32(ignore_invalid_partition_id_rowset_num, "0");
 
@@ -1385,9 +1606,10 @@ DEFINE_mDouble(high_disk_avail_level_diff_usages, "0.15");
 DEFINE_Int32(partition_disk_index_lru_size, "10000");
 // limit the storage space that query spill files can use
 DEFINE_String(spill_storage_root_path, "");
-DEFINE_String(spill_storage_limit, "20%");    // 20%
-DEFINE_mInt32(spill_gc_interval_ms, "2000");  // 2s
-DEFINE_mInt32(spill_gc_work_time_ms, "2000"); // 2s
+DEFINE_String(spill_storage_limit, "20%");               // 20%
+DEFINE_mInt32(spill_gc_interval_ms, "2000");             // 2s
+DEFINE_mInt32(spill_gc_work_time_ms, "2000");            // 2s
+DEFINE_mInt64(spill_file_part_size_bytes, "1073741824"); // 1GB
 
 // paused query in queue timeout(ms) will be resumed or canceled
 DEFINE_Int64(spill_in_paused_queue_timeout_ms, "60000");
@@ -1396,12 +1618,11 @@ DEFINE_Int64(wait_cancel_release_memory_ms, "5000");
 
 DEFINE_mBool(check_segment_when_build_rowset_meta, "false");
 
-DEFINE_mBool(force_azure_blob_global_endpoint, "false");
-
 DEFINE_mInt32(max_s3_client_retry, "10");
 DEFINE_mInt32(s3_read_base_wait_time_ms, "100");
 DEFINE_mInt32(s3_read_max_wait_time_ms, "800");
 DEFINE_mBool(enable_s3_object_check_after_upload, "true");
+DEFINE_mInt32(aws_client_request_timeout_ms, "30000");
 
 DEFINE_mBool(enable_s3_rate_limiter, "false");
 DEFINE_mInt64(s3_get_bucket_tokens, "1000000000000000000");
@@ -1419,8 +1640,42 @@ DEFINE_mInt64(s3_put_token_per_second, "1000000000000000000");
 DEFINE_Validator(s3_put_token_per_second, [](int64_t config) -> bool { return config > 0; });
 
 DEFINE_mInt64(s3_put_token_limit, "0");
+// Log active S3 rate limiter every N throttled/rejected requests, 0 means no log.
+DEFINE_mInt64(s3_rate_limiter_log_interval, "1000");
+DEFINE_Validator(s3_rate_limiter_log_interval, [](int64_t config) -> bool { return config >= 0; });
 
-DEFINE_String(trino_connector_plugin_dir, "${DORIS_HOME}/plugins/connectors");
+// CPU-aware S3 rate limiter. Effective GET/PUT requests per second =
+// requests_per_second_per_core * BE cpu cores, capped by the corresponding
+// requests_per_second_max. A negative value means unset: fall back to the legacy absolute
+// s3_{get,put}_token_* configs above. 0 disables request-rate limiting for that operation.
+DEFINE_mInt64(s3_get_requests_per_second_per_core, "-1");
+DEFINE_mInt64(s3_put_requests_per_second_per_core, "-1");
+// Hard caps for the CPU-derived GET/PUT QPS. A non-positive value means no cap.
+DEFINE_mInt64(s3_get_requests_per_second_max, "0");
+DEFINE_mInt64(s3_put_requests_per_second_max, "0");
+
+// CPU-aware S3 bandwidth limiter. Effective GET/PUT bytes/s = bytes_per_second_per_core *
+// BE cpu cores, capped by the corresponding bytes_per_second_max. A non-positive value disables
+// byte-rate limiting for that operation (there is no legacy fallback for bandwidth).
+// Note: the derived per-BE bytes/s should not be set below the single IO upper bound
+// per second (s3_write_buffer_size, 5MB by default). A single IO larger than 1 second
+// of quota only reserves 1 second worth of tokens; the excess bytes are not accounted
+// (reservation clamp in S3RateLimitGuard).
+DEFINE_mInt64(s3_get_bytes_per_second_per_core, "-1");
+DEFINE_mInt64(s3_put_bytes_per_second_per_core, "-1");
+// Hard caps for the CPU-derived GET/PUT bytes/s. A non-positive value means no cap.
+DEFINE_mInt64(s3_get_bytes_per_second_max, "0");
+DEFINE_mInt64(s3_put_bytes_per_second_max, "0");
+
+// Override the CPU cores used to derive the effective S3 rate limits. A non-positive value
+// means auto-detect from the cgroup cpu quota (fall back to physical cores); the control plane
+// can push a positive value via /api/update_config when resizing a serverless BE.
+DEFINE_mInt32(s3_rate_limiter_cpu_cores_override, "0");
+
+// The dir TrinoConnectorPluginLoader loads Trino's own plugins from, used verbatim. Keep the default
+// in sync with FE Config.trino_connector_plugin_dir: FE and BE load the same plugins and an operator
+// who leaves both untouched expects both to find them.
+DEFINE_String(trino_connector_plugin_dir, "${DORIS_HOME}/plugins/trino_plugins");
 
 // ca_cert_file is in this path by default, Normally no modification is required
 // ca cert default path is different from different OS
@@ -1447,24 +1702,40 @@ DEFINE_mInt64(hive_sink_max_file_size, "1073741824"); // 1GB
 /** Iceberg sink configurations **/
 DEFINE_mInt64(iceberg_sink_max_file_size, "1073741824"); // 1GB
 
+/** Paimon sink configurations **/
+DEFINE_mInt64(paimon_jni_writer_memory_pool_limit_bytes, "536870912"); // 512MB
+DEFINE_Validator(paimon_jni_writer_memory_pool_limit_bytes,
+                 [](int64_t bytes) -> bool { return bytes > 0; });
+
 DEFINE_mInt32(thrift_client_open_num_tries, "1");
 
-DEFINE_Bool(enable_index_compaction, "false");
-
-// http scheme in S3Client to use. E.g. http or https
-DEFINE_String(s3_client_http_scheme, "http");
+// Default HTTP scheme used by S3Client when the endpoint has no scheme.
+DEFINE_String(s3_client_http_scheme, "https");
 DEFINE_Validator(s3_client_http_scheme, [](const std::string& config) -> bool {
     return config == "http" || config == "https";
 });
 
 DEFINE_mBool(ignore_schema_change_check, "false");
 
-DEFINE_mInt64(string_overflow_size, "4294967295"); // std::numic_limits<uint32_t>::max()
-
 // The min thread num for BufferedReaderPrefetchThreadPool
 DEFINE_Int64(num_buffered_reader_prefetch_thread_pool_min_thread, "16");
 // The max thread num for BufferedReaderPrefetchThreadPool
 DEFINE_Int64(num_buffered_reader_prefetch_thread_pool_max_thread, "64");
+
+DEFINE_mBool(enable_segment_prefetch_verbose_log, "false");
+// The thread num for SegmentPrefetchThreadPool
+DEFINE_Int64(segment_prefetch_thread_pool_thread_num_min, "32");
+DEFINE_Int64(segment_prefetch_thread_pool_thread_num_max, "2000");
+
+DEFINE_mInt32(segment_file_cache_consume_rowids_batch_size, "8000");
+// Enable segment file cache block prefetch for query
+DEFINE_mBool(enable_query_segment_file_cache_prefetch, "false");
+// Number of blocks to prefetch ahead in segment iterator for query
+DEFINE_mInt32(query_segment_file_cache_prefetch_block_size, "2");
+// Enable segment file cache block prefetch for compaction
+DEFINE_mBool(enable_compaction_segment_file_cache_prefetch, "false");
+// Number of blocks to prefetch ahead in segment iterator for compaction
+DEFINE_mInt32(compaction_segment_file_cache_prefetch_block_size, "2");
 // The min thread num for S3FileUploadThreadPool
 DEFINE_Int64(num_s3_file_upload_thread_pool_min_thread, "16");
 // The max thread num for S3FileUploadThreadPool
@@ -1489,7 +1760,7 @@ DEFINE_mInt64(fetch_remote_schema_rpc_timeout_ms, "60000");
 DEFINE_Int64(s3_file_system_local_upload_buffer_size, "5242880");
 
 //JVM monitoring enable. To prevent be from crashing due to jvm compatibility issues. The default setting is off.
-DEFINE_Bool(enable_jvm_monitor, "false");
+DEFINE_Bool(enable_jvm_monitor, "true");
 
 DEFINE_Int32(load_data_dirs_threads, "-1");
 
@@ -1535,6 +1806,12 @@ DEFINE_mBool(enable_pipeline_task_leakage_detect, "false");
 DEFINE_mInt32(check_score_rounds_num, "1000");
 
 DEFINE_Int32(query_cache_size, "512");
+// Max number of incremental merges accumulated on one query cache entry before
+// a full recompute is forced. Each incremental merge appends the delta partial
+// blocks to the entry, so the entry gets more fragmented (and the upstream merge
+// aggregation does more work) as deltas accumulate; a periodic full recompute
+// compacts the entry back to a minimal set of blocks.
+DEFINE_mInt32(query_cache_max_incremental_merge_count, "8");
 
 // Enable validation to check the correctness of table size.
 DEFINE_Bool(enable_table_size_correctness_check, "false");
@@ -1551,8 +1828,6 @@ DEFINE_mInt32(max_automatic_compaction_num_per_round, "64");
 DEFINE_mInt32(check_tablet_delete_bitmap_interval_seconds, "300");
 DEFINE_mInt32(check_tablet_delete_bitmap_score_top_n, "10");
 DEFINE_mBool(enable_check_tablet_delete_bitmap_score, "true");
-DEFINE_mInt32(schema_dict_cache_capacity, "4096");
-
 // whether to prune rows with delete sign = 1 in base compaction
 // ATTN: this config is only for test
 DEFINE_mBool(enable_prune_delete_sign_when_base_compaction, "true");
@@ -1562,7 +1837,7 @@ DEFINE_mBool(enable_mow_verbose_log, "false");
 DEFINE_mInt32(tablet_sched_delay_time_ms, "5000");
 DEFINE_mInt32(load_trigger_compaction_version_percent, "66");
 DEFINE_mInt64(base_compaction_interval_seconds_since_last_operation, "86400");
-DEFINE_mBool(enable_compaction_pause_on_high_memory, "true");
+DEFINE_mBool(enable_compaction_pause_on_high_memory, "false");
 
 DEFINE_mBool(enable_quorum_success_write, "true");
 DEFINE_mDouble(quorum_success_max_wait_multiplier, "0.2");
@@ -1576,9 +1851,13 @@ DEFINE_mBool(enable_update_delete_bitmap_kv_check_core, "false");
 DEFINE_mBool(enable_fetch_rowsets_from_peer_replicas, "false");
 // the max length of segments key bounds, in bytes
 // ATTENTION: as long as this conf has ever been enabled, cluster downgrade and backup recovery will no longer be supported.
-DEFINE_mInt32(segments_key_bounds_truncation_threshold, "-1");
+DEFINE_mInt32(segments_key_bounds_truncation_threshold, "36");
 // ATTENTION: for test only, use random segments key bounds truncation threshold every time
 DEFINE_mBool(random_segments_key_bounds_truncation, "false");
+
+// If true, non-MOW rowsets store a single aggregated [rowset_min, rowset_max]
+// key-bounds entry instead of per-segment bounds, to reduce meta size on cloud FDB.
+DEFINE_mBool(enable_aggregate_non_mow_key_bounds, "true");
 // p0, daily, rqg, external
 DEFINE_String(fuzzy_test_type, "");
 
@@ -1589,32 +1868,31 @@ DEFINE_mBool(enable_auto_clone_on_mow_publish_missing_version, "false");
 // The maximum csv line reader output buffer size
 DEFINE_mInt64(max_csv_line_reader_output_buffer_size, "4294967296");
 
+// The maximum bytes of a single block returned by load file readers (CsvReader, NewJsonReader,
+// ParquetReader, OrcReader). Default is 64MB. Set to 0 to disable the limit.
+DEFINE_mInt64(load_reader_max_block_bytes, "67108864");
+
 // Maximum number of OpenMP threads allowed for concurrent vector index builds.
 // -1 means auto: use 80% of the available CPU cores.
 DEFINE_Int32(omp_threads_limit, "-1");
-DEFINE_Validator(omp_threads_limit, [](const int config) -> bool {
-    if (config > 0) {
-        omp_threads_limit = config;
-        return true;
-    }
-    CpuInfo::init();
-    int core_cap = config::num_cores > 0 ? config::num_cores : CpuInfo::num_cores();
-    core_cap = std::max(1, core_cap);
-    // Use at most 80% of the available CPU cores.
-    omp_threads_limit = std::max(1, core_cap * 4 / 5);
-    return true;
-});
+
 // The capacity of segment partial column cache, used to cache column readers for each segment.
 DEFINE_mInt32(max_segment_partial_column_cache_size, "100");
 
 DEFINE_mBool(enable_prefill_output_dbm_agg_cache_after_compaction, "true");
 DEFINE_mBool(enable_prefill_all_dbm_agg_cache_after_compaction, "true");
 
-// Chunk size for ANN/vector index building per training/adding batch
-// 1M By default.
-DEFINE_mInt64(ann_index_build_chunk_size, "1000000");
-DEFINE_Validator(ann_index_build_chunk_size,
-                 [](const int64_t config) -> bool { return config > 0; });
+// Cache for ANN index IVF on-disk list data.
+// "70%" means 70% of the process available memory, not 70% of total machine memory.
+// With default mem_limit="90%", this is effectively about 63% (90% * 70%) of physical memory
+// visible to the process (considering cgroup limits).
+DEFINE_String(ann_index_ivf_list_cache_limit, "70%");
+// Stale sweep time for ANN index IVF list cache in seconds. 3600s is 1 hour.
+DEFINE_mInt32(ann_index_ivf_list_cache_stale_sweep_time_sec, "3600");
+// Minimum segment rows required to persist an ANN index. 0 keeps the default behavior.
+DEFINE_mInt64(ann_index_build_min_segment_rows, "0");
+DEFINE_Validator(ann_index_build_min_segment_rows,
+                 [](const int64_t config) -> bool { return config >= 0; });
 
 DEFINE_mBool(enable_wal_tde, "false");
 
@@ -1627,10 +1905,20 @@ DEFINE_Validator(aws_credentials_provider_version, [](const std::string& config)
     return config == "v1" || config == "v2";
 });
 
+// Concurrency stats dump configuration
+DEFINE_mBool(enable_concurrency_stats_dump, "false");
+DEFINE_mInt32(concurrency_stats_dump_interval_ms, "100");
+DEFINE_Validator(concurrency_stats_dump_interval_ms,
+                 [](const int32_t config) -> bool { return config >= 10; });
+
+DEFINE_mBool(cloud_mow_sync_rowsets_when_load_txn_begin, "true");
+
+DEFINE_mBool(enable_cloud_make_rs_visible_on_be, "false");
+DEFINE_mBool(enable_cloud_random_segment_id, "false");
+DEFINE_mInt32(file_handles_deplenish_frequency_times, "3");
+
 // clang-format off
 #ifdef BE_TEST
-// test s3
-DEFINE_String(test_s3_resource, "resource");
 DEFINE_String(test_s3_ak, "ak");
 DEFINE_String(test_s3_sk, "sk");
 DEFINE_String(test_s3_endpoint, "endpoint");
@@ -1642,6 +1930,8 @@ DEFINE_String(test_s3_prefix, "prefix");
 
 std::map<std::string, Register::Field>* Register::_s_field_map = nullptr;
 std::map<std::string, std::function<bool()>>* RegisterConfValidator::_s_field_validator = nullptr;
+std::map<std::string, RegisterConfUpdateCallback::CallbackFunc>*
+        RegisterConfUpdateCallback::_s_field_update_callback = nullptr;
 std::map<std::string, std::string>* full_conf_map = nullptr;
 
 std::mutex custom_conf_lock;
@@ -1935,6 +2225,22 @@ std::ostream& operator<<(std::ostream& out, const std::vector<T>& v) {
         continue;                                                                              \
     }
 
+// Keys that start with an uppercase letter and consist only of uppercase letters,
+// digits and underscores (e.g. JAVA_OPTS, LOG_DIR) are exported as environment
+// variables by bin/start_be.sh and are not BE config fields, so they must not be
+// reported as unknown.
+static bool is_env_style_key(const std::string& key) {
+    if (key.empty() || key[0] < 'A' || key[0] > 'Z') {
+        return false;
+    }
+    for (char c : key) {
+        if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // init conf fields
 bool init(const char* conf_file, bool fill_conf_map, bool must_exist, bool set_to_default) {
     Properties props;
@@ -1963,6 +2269,24 @@ bool init(const char* conf_file, bool fill_conf_map, bool must_exist, bool set_t
         SET_FIELD(it.second, std::vector<std::string>, fill_conf_map, set_to_default);
     }
 
+    // Emit a warning for every key present in the conf file that does not correspond to a
+    // registered BE config field. Such keys (typos or configs removed in a newer version)
+    // are silently ignored above, so without this warning operators would have no feedback
+    // that the value is not taking effect. BE startup is not affected.
+    for (const auto& kv : props.conf_map()) {
+        const std::string& key = kv.first;
+        if (Register::_s_field_map->find(key) != Register::_s_field_map->end()) {
+            continue;
+        }
+        if (is_env_style_key(key)) {
+            continue;
+        }
+        LOG(WARNING) << fmt::format(
+                "Unknown config '{}' in {} is ignored, please check whether it is a typo "
+                "or has been removed in this version.",
+                key, conf_file);
+    }
+
     if (config::is_cloud_mode()) {
         auto st = config::set_config("enable_file_cache", "true", true, true);
         LOG(INFO) << "set config enable_file_cache "
@@ -1982,6 +2306,7 @@ bool init(const char* conf_file, bool fill_conf_map, bool must_exist, bool set_t
         }                                                                                          \
         TYPE& ref_conf_value = *reinterpret_cast<TYPE*>((FIELD).storage);                          \
         TYPE old_value = ref_conf_value;                                                           \
+        ref_conf_value = new_value;                                                                \
         if (RegisterConfValidator::_s_field_validator != nullptr) {                                \
             auto validator = RegisterConfValidator::_s_field_validator->find((FIELD).name);        \
             if (validator != RegisterConfValidator::_s_field_validator->end() &&                   \
@@ -1991,7 +2316,6 @@ bool init(const char* conf_file, bool fill_conf_map, bool must_exist, bool set_t
                                                                          (FIELD).name, new_value); \
             }                                                                                      \
         }                                                                                          \
-        ref_conf_value = new_value;                                                                \
         if (full_conf_map != nullptr) {                                                            \
             std::ostringstream oss;                                                                \
             oss << new_value;                                                                      \
@@ -1999,6 +2323,13 @@ bool init(const char* conf_file, bool fill_conf_map, bool must_exist, bool set_t
         }                                                                                          \
         if (PERSIST) {                                                                             \
             RETURN_IF_ERROR(persist_config(std::string((FIELD).name), VALUE));                     \
+        }                                                                                          \
+        if (RegisterConfUpdateCallback::_s_field_update_callback != nullptr) {                     \
+            auto callback_it =                                                                     \
+                    RegisterConfUpdateCallback::_s_field_update_callback->find((FIELD).name);      \
+            if (callback_it != RegisterConfUpdateCallback::_s_field_update_callback->end()) {      \
+                callback_it->second(&old_value, &new_value);                                       \
+            }                                                                                      \
         }                                                                                          \
         update_config(std::string((FIELD).name), VALUE);                                           \
         return Status::OK();                                                                       \
@@ -2054,6 +2385,22 @@ void update_config(const std::string& field, const std::string& value) {
     if ("sys_log_level" == field) {
         // update log level
         update_logging(field, value);
+    } else if ("flush_thread_num_per_store" == field ||
+               "high_priority_flush_thread_num_per_store" == field ||
+               "max_flush_thread_num_per_cpu" == field) {
+        // update memtable flush thread pool size
+        auto* exec_env = ExecEnv::GetInstance();
+        if (exec_env != nullptr) {
+            auto* flush_executor = exec_env->storage_engine().memtable_flush_executor();
+            if (flush_executor != nullptr) {
+                flush_executor->update_memtable_flush_threads();
+            }
+            // update workload groups' memtable flush thread pools
+            auto* wg_mgr = exec_env->workload_group_mgr();
+            if (wg_mgr != nullptr) {
+                wg_mgr->update_memtable_flush_threads();
+            }
+        }
     }
 }
 
@@ -2074,9 +2421,9 @@ Status set_fuzzy_configs() {
             ((distribution(*generator) % 2) == 0) ? "true" : "false";
     fuzzy_field_and_value["enable_shrink_memory"] =
             ((distribution(*generator) % 2) == 0) ? "true" : "false";
-    fuzzy_field_and_value["string_overflow_size"] =
-            ((distribution(*generator) % 2) == 0) ? "10" : "4294967295";
     fuzzy_field_and_value["skip_writing_empty_rowset_metadata"] =
+            ((distribution(*generator) % 2) == 0) ? "true" : "false";
+    fuzzy_field_and_value["enable_packed_file"] =
             ((distribution(*generator) % 2) == 0) ? "true" : "false";
     fuzzy_field_and_value["max_segment_partial_column_cache_size"] =
             ((distribution(*generator) % 2) == 0) ? "5" : "10";
@@ -2084,6 +2431,11 @@ Status set_fuzzy_configs() {
     std::uniform_int_distribution<int64_t> distribution2(-2, 10);
     fuzzy_field_and_value["segments_key_bounds_truncation_threshold"] =
             std::to_string(distribution2(*generator));
+
+    fuzzy_field_and_value["enable_query_segment_file_cache_prefetch"] =
+            ((distribution(*generator) % 2) == 0) ? "true" : "false";
+    fuzzy_field_and_value["enable_compaction_segment_file_cache_prefetch"] =
+            ((distribution(*generator) % 2) == 0) ? "true" : "false";
 
     // external
     if (config::fuzzy_test_type == "external") {
@@ -2151,6 +2503,9 @@ std::vector<std::vector<std::string>> get_config_info() {
         // and deprecate the `sys_log_dir` config.
         if (it.first == "sys_log_dir" && config_val == "") {
             config_val = fmt::format("{}/log", std::getenv("DORIS_HOME"));
+        }
+        if (it.first == "tls_private_key_password") {
+            config_val = "******";
         }
 
         _config.emplace_back(field_it->second.type);

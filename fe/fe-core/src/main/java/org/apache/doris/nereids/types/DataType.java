@@ -77,6 +77,7 @@ public abstract class DataType {
                     .put(Type.DATEV2.getPrimitiveType(), DateType.INSTANCE)
                     .put(Type.DATETIME.getPrimitiveType(), DateTimeType.INSTANCE)
                     .put(Type.DATETIMEV2.getPrimitiveType(), DateTimeV2Type.SYSTEM_DEFAULT)
+                    .put(Type.TIMESTAMP_NS.getPrimitiveType(), TimeStampNsType.INSTANCE)
                     .put(Type.TIMESTAMPTZ.getPrimitiveType(), TimeStampTzType.SYSTEM_DEFAULT)
                     .put(Type.DECIMALV2.getPrimitiveType(), DecimalV2Type.SYSTEM_DEFAULT)
                     .put(Type.DECIMAL32.getPrimitiveType(), DecimalV3Type.SYSTEM_DEFAULT)
@@ -118,7 +119,8 @@ public abstract class DataType {
             .add(DateType.class, () -> ImmutableList.of(
                     DateTimeType.INSTANCE, DateV2Type.INSTANCE, StringType.INSTANCE))
             .add(DateV2Type.class, () -> ImmutableList.of(DateTimeV2Type.SYSTEM_DEFAULT, StringType.INSTANCE))
-            .add(TimeV2Type.class, () -> ImmutableList.of(DateTimeV2Type.MAX, StringType.INSTANCE))
+            .add(TimeV2Type.class, () -> ImmutableList.of(
+                    DateTimeV2Type.MAX, StringType.INSTANCE))
             .build();
 
     public static Map<org.apache.doris.catalog.PrimitiveType, DataType> legacyTypeToNereidsType() {
@@ -351,6 +353,12 @@ public abstract class DataType {
                         throw new AnalysisException("Nereids do not support type: " + type);
                 }
                 break;
+            case "timestamp_ns":
+                if (types.size() != 1) {
+                    throw new AnalysisException("timestamp_ns does not support precision");
+                }
+                dataType = TimeStampNsType.INSTANCE;
+                break;
             case "timestamptz":
                 switch (types.size()) {
                     case 1:
@@ -424,6 +432,7 @@ public abstract class DataType {
             case DOUBLE: return DoubleType.INSTANCE;
             case NULL_TYPE: return NullType.INSTANCE;
             case DATETIMEV2: return DateTimeV2Type.of(((ScalarType) type).getScalarScale());
+            case TIMESTAMP_NS: return TimeStampNsType.INSTANCE;
             case DATETIME: return DateTimeType.INSTANCE;
             case DATEV2: return DateV2Type.INSTANCE;
             case DATE: return DateType.INSTANCE;
@@ -443,7 +452,8 @@ public abstract class DataType {
                 org.apache.doris.catalog.AggStateType catalogType = ((org.apache.doris.catalog.AggStateType) type);
                 List<DataType> types = catalogType.getSubTypes().stream().map(DataType::fromCatalogType)
                         .collect(Collectors.toList());
-                return new AggStateType(catalogType.getFunctionName(), types, catalogType.getSubTypeNullables());
+                return new AggStateType(catalogType.getFunctionName(), types,
+                        catalogType.getSubTypeNullables(), catalogType.getResultIsNullable());
             }
             case DECIMALV2: {
                 ScalarType scalarType = (ScalarType) type;
@@ -466,8 +476,9 @@ public abstract class DataType {
 
         if (type.isStructType()) {
             List<StructField> structFields = ((org.apache.doris.catalog.StructType) (type)).getFields().stream()
-                    .map(cf -> new StructField(cf.getName(), fromCatalogType(cf.getType()),
-                            cf.getContainsNull(), cf.getComment() == null ? "" : cf.getComment()))
+                    .map(cf -> new StructField(cf.getName(), cf.getOriginalName(), fromCatalogType(cf.getType()),
+                            cf.getContainsNull(), cf.getComment() == null ? "" : cf.getComment(),
+                            cf.isCommentSpecified(), !cf.hasOriginalName()))
                     .collect(ImmutableList.toImmutableList());
             return new StructType(structFields);
         } else if (type.isMapType()) {
@@ -475,10 +486,15 @@ public abstract class DataType {
             return MapType.of(fromCatalogType(mapType.getKeyType()), fromCatalogType(mapType.getValueType()));
         } else if (type.isArrayType()) {
             org.apache.doris.catalog.ArrayType arrayType = (org.apache.doris.catalog.ArrayType) type;
-            return ArrayType.of(fromCatalogType(arrayType.getItemType()), arrayType.getContainsNull());
+            return ArrayType.of(fromCatalogType(arrayType.getItemType()));
         } else if (type.isVariantType()) {
             // In the past, variant metadata used the ScalarType type.
             // Now, we use VariantType, which inherits from ScalarType, as the new metadata storage.
+            if (type instanceof org.apache.doris.datasource.connector.converter.ConnectorComputeVariantType) {
+                // The execution marker is recursive through complex-type conversion and must survive
+                // catalog -> Nereids -> tuple translation independently of the storage format default.
+                return ConnectorComputeVariantType.INSTANCE;
+            }
             if (type instanceof org.apache.doris.catalog.VariantType) {
                 List<VariantField> variantFields = ((org.apache.doris.catalog.VariantType) type)
                         .getPredefinedFields().stream()
@@ -489,7 +505,11 @@ public abstract class DataType {
                         ((org.apache.doris.catalog.VariantType) type).getVariantMaxSubcolumnsCount(),
                         ((org.apache.doris.catalog.VariantType) type).getEnableTypedPathsToSparse(),
                         ((org.apache.doris.catalog.VariantType) type).getVariantMaxSparseColumnStatisticsSize(),
-                        ((org.apache.doris.catalog.VariantType) type).getVariantSparseHashShardCount());
+                        ((org.apache.doris.catalog.VariantType) type).getVariantSparseHashShardCount(),
+                        ((org.apache.doris.catalog.VariantType) type).getEnableVariantDocMode(),
+                        ((org.apache.doris.catalog.VariantType) type).getvariantDocMaterializationMinRows(),
+                        ((org.apache.doris.catalog.VariantType) type).getVariantDocShardCount(),
+                        ((org.apache.doris.catalog.VariantType) type).getEnableNestedGroup());
             }
             return VariantType.INSTANCE;
         } else {
@@ -545,6 +565,10 @@ public abstract class DataType {
             return false;
         }
         return true;
+    }
+
+    public boolean equalsForRecursiveCte(Object o) {
+        return equals(o);
     }
 
     @Override
@@ -613,7 +637,8 @@ public abstract class DataType {
     }
 
     public boolean isDateLikeType() {
-        return isDateType() || isDateTimeType() || isDateV2Type() || isDateTimeV2Type() || isTimeStampTzType();
+        return isDateType() || isDateTimeType() || isDateV2Type() || isDateTimeV2Type()
+                || isTimeStampNsType() || isTimeStampTzType();
     }
 
     public boolean isTimeType() {
@@ -622,6 +647,10 @@ public abstract class DataType {
 
     public boolean isTimeStampTzType() {
         return this instanceof TimeStampTzType;
+    }
+
+    public boolean isTimeStampNsType() {
+        return this instanceof TimeStampNsType;
     }
 
     public boolean isNullType() {
@@ -794,7 +823,7 @@ public abstract class DataType {
             return arrayType.getItemType()
                     .getAllPromotions()
                     .stream()
-                    .map(promotionType -> ArrayType.of(promotionType, arrayType.containsNull()))
+                    .map(promotionType -> ArrayType.of(promotionType))
                     .collect(ImmutableList.toImmutableList());
         }
 
@@ -803,6 +832,10 @@ public abstract class DataType {
     }
 
     public abstract int width();
+
+    public boolean isInjectiveCastTo(DataType target) {
+        return this.equals(target);
+    }
 
     public static List<DataType> trivialTypes() {
         return Type.getTrivialTypes()
@@ -889,22 +922,20 @@ public abstract class DataType {
         if (catalogType.isScalarType()) {
             validateScalarType((ScalarType) catalogType);
         } else if (catalogType.isComplexType()) {
-            // now we not support array / map / struct nesting complex type
             if (catalogType.isArrayType()) {
                 Type itemType = ((org.apache.doris.catalog.ArrayType) catalogType).getItemType();
-                if (itemType instanceof ScalarType) {
-                    validateNestedType(catalogType, (ScalarType) itemType);
-                }
+                validateNestedType(catalogType, itemType);
             }
             if (catalogType.isMapType()) {
                 org.apache.doris.catalog.MapType mt =
                         (org.apache.doris.catalog.MapType) catalogType;
-                if (mt.getKeyType() instanceof ScalarType) {
-                    validateNestedType(catalogType, (ScalarType) mt.getKeyType());
+                Type mapKeyType = mt.getKeyType();
+                if (mapKeyType.isComplexType()) {
+                    throw new AnalysisException(
+                            "MAP key type must be a primitive type but get " + mapKeyType.toSql());
                 }
-                if (mt.getValueType() instanceof ScalarType) {
-                    validateNestedType(catalogType, (ScalarType) mt.getValueType());
-                }
+                validateNestedType(catalogType, mapKeyType);
+                validateNestedType(catalogType, mt.getValueType());
             }
             if (catalogType.isStructType()) {
                 ArrayList<org.apache.doris.catalog.StructField> fields =
@@ -912,12 +943,10 @@ public abstract class DataType {
                 Set<String> fieldNames = new HashSet<>();
                 for (org.apache.doris.catalog.StructField field : fields) {
                     Type fieldType = field.getType();
-                    if (fieldType instanceof ScalarType) {
-                        validateNestedType(catalogType, (ScalarType) fieldType);
-                        if (!fieldNames.add(field.getName())) {
-                            throw new AnalysisException("Duplicate field name " + field.getName()
-                                    + " in struct " + catalogType.toSql());
-                        }
+                    validateNestedType(catalogType, fieldType);
+                    if (!fieldNames.add(field.getName())) {
+                        throw new AnalysisException("Duplicate field name " + field.getName()
+                                + " in struct " + catalogType.toSql());
                     }
                 }
             }
@@ -1087,20 +1116,35 @@ public abstract class DataType {
                             + precision + " in not supported.");
                 }
             }
+            case TIMESTAMP_NS:
+                // TIMESTAMP_NS has fixed nanosecond precision and carries no variable precision/scale metadata.
+                break;
+            case DATETIMEV2: {
+                int precision = scalarType.decimalPrecision();
+                int scale = scalarType.decimalScale();
+                if (precision != ScalarType.DATETIME_PRECISION) {
+                    throw new AnalysisException(
+                            "Precision of Datetime must be " + ScalarType.DATETIME_PRECISION
+                                    + "." + " Precision was set to: " + precision + ".");
+                }
+                if (scale < 0 || scale > ScalarType.MAX_DATETIMEV2_SCALE) {
+                    throw new AnalysisException("Scale of Datetime must between 0 and "
+                            + ScalarType.MAX_DATETIMEV2_SCALE + "."
+                            + " Scale was set to: " + scale + ".");
+                }
+                break;
+            }
             case TIMEV2:
-            case DATETIMEV2:
             case TIMESTAMPTZ: {
                 int precision = scalarType.decimalPrecision();
                 int scale = scalarType.decimalScale();
-                // precision: 18
                 if (precision != ScalarType.DATETIME_PRECISION) {
                     throw new AnalysisException(
-                            "Precision of Datetime/Time must be " + ScalarType.DATETIME_PRECISION
+                            "Precision of Time must be " + ScalarType.DATETIME_PRECISION
                                     + "." + " Precision was set to: " + precision + ".");
                 }
-                // scale: [0, 6]
                 if (scale < 0 || scale > 6) {
-                    throw new AnalysisException("Scale of Datetime/Time must between 0 and 6."
+                    throw new AnalysisException("Scale of Time must between 0 and 6."
                             + " Scale was set to: " + scale + ".");
                 }
                 break;

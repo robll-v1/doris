@@ -25,21 +25,21 @@ import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.PartitionType;
 import org.apache.doris.catalog.TableIf;
+import org.apache.doris.catalog.info.PartitionNamesInfo;
+import org.apache.doris.catalog.info.TableNameInfo;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.UserException;
 import org.apache.doris.datasource.CatalogIf;
-import org.apache.doris.info.PartitionNamesInfo;
-import org.apache.doris.info.TableNameInfo;
 import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.nereids.trees.plans.PlanType;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.StmtExecutor;
-import org.apache.doris.statistics.ColumnStatistic;
-import org.apache.doris.statistics.StatisticsRepository;
-import org.apache.doris.statistics.StatsType;
+import org.apache.doris.statistics.model.ColumnStatistic;
+import org.apache.doris.statistics.model.StatsType;
+import org.apache.doris.statistics.repository.StatisticsRepository;
 
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
@@ -133,7 +133,7 @@ public class AlterColumnStatsCommand extends AlterCommand {
         }
 
         // check table name
-        tableNameInfo.analyze(ctx);
+        tableNameInfo.analyze(ctx.getNameSpaceContext());
 
         if (!Env.getCurrentEnv().getAccessManager()
                     .checkTblPriv(ConnectContext.get(), tableNameInfo.getCtl(), tableNameInfo.getDb(),
